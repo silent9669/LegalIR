@@ -1,0 +1,24 @@
+# Python virtual environments
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# OS files
+.DS_Store
+
+# Large data and index artifacts (> 100MB)
+chunks_output.jsonl
+data/processed_chunks.jsonl
+data/bm25_index.pkl
+data/temp_train_fold.json
+selected-contexts.zip
+selected-contexts/
+logs/
+
+# Model checkpoints / weights cache
+models/
+checkpoints/
+*.pt
+*.bin
+*.safetensors
