@@ -1,11 +1,15 @@
 import os
-import json
 import numpy as np
 
 class CrossEncoderReranker:
     def __init__(self, model_name: str = "BAAI/bge-reranker-v2-m3", device: str = None):
         self.model_name = model_name
-        if device is None:
+        self.device = device
+        self.tokenizer = None
+        self.model = None
+
+    def _init_device(self):
+        if self.device is None:
             import torch
             if torch.cuda.is_available():
                 self.device = "cuda"
@@ -13,24 +17,23 @@ class CrossEncoderReranker:
                 self.device = "mps"
             else:
                 self.device = "cpu"
-        else:
-            self.device = device
-
-        self.tokenizer = None
-        self.model = None
 
     def _load_model(self):
         if self.model is None:
+            self._init_device()
             import torch
             from transformers import AutoTokenizer, AutoModelForSequenceClassification
-            print(f"Loading cross-encoder model {self.model_name} on {self.device}...")
+            print(f"Loading reranker model {self.model_name} on {self.device}...")
             self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
             self.model = AutoModelForSequenceClassification.from_pretrained(self.model_name)
             self.model.to(self.device)
             self.model.eval()
 
-    def score_pairs(self, pairs: list, batch_size: int = 32) -> list:
-        """Score (query, chunk_text) pairs and return logits."""
+    def score_pairs(self, pairs: list, batch_size: int = 16, max_length: int = 512) -> list:
+        """
+        pairs: list of (query, passage_text) tuples
+        Returns: list of float scores
+        """
         if not pairs:
             return []
 
@@ -48,12 +51,13 @@ class CrossEncoderReranker:
                 passages,
                 padding=True,
                 truncation=True,
-                max_length=512,
+                max_length=max_length,
                 return_tensors="pt"
             ).to(self.device)
 
             with torch.no_grad():
-                scores = self.model(**inputs, return_dict=True).logits.view(-1).float()
-                all_scores.extend(scores.cpu().tolist())
+                outputs = self.model(**inputs)
+                logits = outputs.logits.view(-1).float().cpu().numpy()
+                all_scores.extend(logits.tolist())
 
         return all_scores

@@ -1,0 +1,11 @@
+fusion:
+  strategy: "rrf_lightgbm"
+  weights:
+    bm25: 1.0
+    exact: 2.5
+    memory: 2.0
+    dense: 1.2
+    rerank: 1.8
+  selection:
+    policy: "top_5_unique"
+    max_k: 5

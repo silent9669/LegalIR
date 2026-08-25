@@ -1,0 +1,20 @@
+retrieval:
+  bm25_micro:
+    k1: 1.5
+    b: 0.75
+    top_k: 100
+  exact_matcher:
+    boost_legal_num: 1.0
+    boost_year_title: 0.95
+    boost_title: 0.85
+  question_memory:
+    min_sim: 0.70
+    top_k: 5
+    weight: 2.0
+  dense_macro:
+    model_name: "BAAI/bge-m3"
+    max_length: 512
+    top_k: 50
+  candidate_union:
+    top_k: 50
+    rrf_k: 60
