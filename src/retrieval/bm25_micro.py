@@ -2,7 +2,6 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 import math
-import os
 import pickle
 import re
 import unicodedata
@@ -20,9 +19,21 @@ def tokenize_vietnamese(text: str) -> list[str]:
 
 
 class BM25MicroRetriever:
-    def __init__(self, k1: float = 1.5, b: float = 0.75):
+    def __init__(
+        self,
+        k1: float = 1.5,
+        b: float = 0.75,
+        field_weights: dict[str, float] | None = None,
+    ):
         self.k1 = k1
         self.b = b
+        self.field_weights = field_weights or {
+            "legal_number": 5.0,
+            "title": 3.0,
+            "article": 2.0,
+            "body": 1.0,
+            "url_slug": 1.5,
+        }
         self.chunk_ids: list[str] = []
         self.doc_ids: list[str] = []
         self.chunk_lens: np.ndarray | None = None
@@ -31,7 +42,7 @@ class BM25MicroRetriever:
         self.postings: dict[str, tuple[np.ndarray, np.ndarray]] = {}
 
     def fit(self, chunks: list[dict[str, Any]], show_progress: bool = False) -> "BM25MicroRetriever":
-        """Fit BM25 inverted index on a list of chunk dicts (chunk_id, doc_id, text_norm)."""
+        """Fit BM25 inverted index on a list of chunk dicts."""
         self.chunk_ids = []
         self.doc_ids = []
         lens = []
@@ -45,15 +56,41 @@ class BM25MicroRetriever:
         for idx, c in iterator:
             cid = str(c["chunk_id"])
             did = str(c["doc_id"])
-            text = c.get("text_norm", "")
 
-            tokens = tokenize_vietnamese(text)
-            doc_len = len(tokens)
+            # Field-weighted tokens
+            weighted_tokens = []
+
+            body_text = c.get("text_norm") or c.get("text_raw", "")
+            body_toks = tokenize_vietnamese(body_text)
+            weighted_tokens.extend(body_toks * int(self.field_weights.get("body", 1.0)))
+
+            legal_num = c.get("legal_number") or ""
+            if legal_num:
+                num_toks = tokenize_vietnamese(legal_num)
+                weighted_tokens.extend(num_toks * int(self.field_weights.get("legal_number", 5.0)))
+
+            title = c.get("title") or ""
+            if title:
+                title_toks = tokenize_vietnamese(title)
+                weighted_tokens.extend(title_toks * int(self.field_weights.get("title", 3.0)))
+
+            article = c.get("article") or ""
+            if article:
+                article_toks = tokenize_vietnamese(article)
+                weighted_tokens.extend(article_toks * int(self.field_weights.get("article", 2.0)))
+
+            link = c.get("link") or ""
+            if link:
+                slug = link.rstrip("/").split("/")[-1].replace("-", " ")
+                slug_toks = tokenize_vietnamese(slug)
+                weighted_tokens.extend(slug_toks * int(self.field_weights.get("url_slug", 1.5)))
+
+            doc_len = len(weighted_tokens)
             lens.append(doc_len)
             self.chunk_ids.append(cid)
             self.doc_ids.append(did)
 
-            tf = Counter(tokens)
+            tf = Counter(weighted_tokens)
             for term, freq in tf.items():
                 term_df[term] += 1
                 term_postings[term].append((idx, freq))
@@ -76,10 +113,10 @@ class BM25MicroRetriever:
 
         return self
 
-    def retrieve(self, query: str, top_k: int = 100) -> list[tuple[str, float]]:
+    def retrieve(self, query: str, top_k: int = 100) -> list[dict[str, Any]]:
         """
-        Returns list of (doc_id, score) sorted by descending score.
-        Aggregates micro-chunk scores to document level using max + 0.1 * mean.
+        Returns list of candidate dicts with:
+        doc_id, score, bm25_score, bm25_best_score, bm25_second_score, bm25_mean_score, bm25_best_chunk_id
         """
         if not query or self.chunk_lens is None:
             return []
@@ -120,16 +157,30 @@ class BM25MicroRetriever:
         doc_chunk_scores = defaultdict(list)
         for c_idx in top_chunk_indices:
             did = self.doc_ids[c_idx]
-            doc_chunk_scores[did].append(float(scores_arr[c_idx]))
+            cid = self.chunk_ids[c_idx]
+            doc_chunk_scores[did].append((cid, float(scores_arr[c_idx])))
 
-        doc_scores = {}
-        for did, s_list in doc_chunk_scores.items():
-            max_s = max(s_list)
-            mean_s = sum(s_list) / len(s_list)
-            doc_scores[did] = max_s + 0.1 * mean_s
+        doc_records = []
+        for did, items in doc_chunk_scores.items():
+            sorted_items = sorted(items, key=lambda x: -x[1])
+            best_cid, best_s = sorted_items[0]
+            second_s = sorted_items[1][1] if len(sorted_items) > 1 else 0.0
+            mean_s = sum(x[1] for x in items) / len(items)
+            agg_score = best_s + 0.1 * second_s
 
-        sorted_docs = sorted(doc_scores.items(), key=lambda x: (-x[1], x[0]))[:top_k]
-        return sorted_docs
+            doc_records.append({
+                "doc_id": did,
+                "score": agg_score,
+                "bm25_score": agg_score,
+                "bm25_best_score": best_s,
+                "bm25_second_score": second_s,
+                "bm25_mean_score": mean_s,
+                "bm25_best_chunk_id": best_cid,
+            })
+
+        # Stable sort: descending score, ascending doc_id
+        doc_records.sort(key=lambda x: (-x["score"], x["doc_id"]))
+        return doc_records[:top_k]
 
     def save(self, file_path: str | Path):
         file_path = Path(file_path)

@@ -1,6 +1,7 @@
+from collections import defaultdict
+from typing import Any
 import re
 import unicodedata
-from collections import defaultdict
 import pandas as pd
 
 LEGAL_NUM_REGEX = re.compile(
@@ -8,10 +9,11 @@ LEGAL_NUM_REGEX = re.compile(
     re.IGNORECASE
 )
 YEAR_REGEX = re.compile(r'\b(19[89]\d|20[012]\d)\b')
-LAW_TITLE_REGEX = re.compile(
-    r'\b((?:Luật|Bộ luật|Nghị định|Thông tư|Quyết định|Nghị quyết)\s+[A-ZĐa-z0-9\sàáảãạăằắẳẵặâầấẩẫậèéẻẽẹêềếểễệìíỉĩịòóỏõọôồốổỗộơờớởỡợùúủũụưừứửữựỳýỷỹỵđ]+?)(?=\s+(?:năm|số|\d+|Điều|Khoản|được|có|quy|về|$))',
+DOC_TYPE_REGEX = re.compile(
+    r'\b(Luật|Bộ luật|Nghị định|Thông tư liên tịch|Thông tư|Quyết định|Chỉ thị|Nghị quyết|Tiêu chuẩn|Công văn|Pháp lệnh)\b',
     re.IGNORECASE
 )
+
 
 def normalize_text(text: str) -> str:
     if text is None or (isinstance(text, float) and pd.isna(text)):
@@ -21,8 +23,9 @@ def normalize_text(text: str) -> str:
     text = re.sub(r'[ \t]+', ' ', text)
     return text.strip().lower()
 
+
 class ExactMatcher:
-    def __init__(self, documents: list):
+    def __init__(self, documents: list[dict[str, Any]]):
         self.doc_by_num = defaultdict(list)
         self.doc_by_title = defaultdict(list)
         self.doc_metadata = {}
@@ -51,33 +54,47 @@ class ExactMatcher:
                 if len(title_no_year) > 6 and title_no_year != norm_title:
                     self.doc_by_title[title_no_year].append(doc_id)
 
-    def match(self, query: str) -> dict:
-        """Returns {doc_id: match_confidence_score} based on exact legal identifiers."""
+    def match(self, query: str) -> dict[str, dict[str, Any]]:
+        """Returns {doc_id: {score, exact_score, exact_legal_number, exact_title, exact_year, exact_doc_type}}."""
         if not query:
             return {}
 
         norm_query = normalize_text(query)
-        scores = {}
+        matches: dict[str, dict[str, Any]] = defaultdict(lambda: {
+            "score": 0.0,
+            "exact_score": 0.0,
+            "exact_legal_number": False,
+            "exact_title": False,
+            "exact_year": False,
+            "exact_doc_type": False,
+        })
 
         # 1. Match legal numbers
         found_nums = LEGAL_NUM_REGEX.findall(query)
         for num in found_nums:
             clean_num = normalize_text(num).replace('-', '/')
+            matched_dids = []
             if clean_num in self.doc_by_num:
-                for did in self.doc_by_num[clean_num]:
-                    scores[did] = max(scores.get(did, 0.0), 1.0)
+                matched_dids = self.doc_by_num[clean_num]
+                score_val = 1.0
             else:
-                # Partial match on number suffix
                 sub_num = re.sub(r'^[^\d]*', '', clean_num)
                 if sub_num and sub_num in self.doc_by_num:
-                    for did in self.doc_by_num[sub_num]:
-                        scores[did] = max(scores.get(did, 0.0), 0.9)
+                    matched_dids = self.doc_by_num[sub_num]
+                    score_val = 0.9
+
+            for did in matched_dids:
+                matches[did]["exact_legal_number"] = True
+                matches[did]["score"] = max(matches[did]["score"], score_val)
+                matches[did]["exact_score"] = matches[did]["score"]
 
         # 2. Match exact law titles
         for title, dids in self.doc_by_title.items():
             if len(title) > 6 and title in norm_query:
                 for did in dids:
-                    scores[did] = max(scores.get(did, 0.0), 0.85)
+                    matches[did]["exact_title"] = True
+                    matches[did]["score"] = max(matches[did]["score"], 0.85)
+                    matches[did]["exact_score"] = matches[did]["score"]
 
         # 3. Match law title + year co-occurrence
         years = YEAR_REGEX.findall(query)
@@ -88,6 +105,18 @@ class ExactMatcher:
                     doc_title = normalize_text(meta.get("title", ""))
                     doc_title_no_year = re.sub(r'\b(19[89]\d|20[012]\d)\b', '', doc_title).strip()
                     if doc_title_no_year and len(doc_title_no_year) > 6 and doc_title_no_year in norm_query:
-                        scores[did] = max(scores.get(did, 0.0), 0.95)
+                        matches[did]["exact_title"] = True
+                        matches[did]["exact_year"] = True
+                        matches[did]["score"] = max(matches[did]["score"], 0.95)
+                        matches[did]["exact_score"] = matches[did]["score"]
 
-        return scores
+        # 4. Match document type if matched on title or number
+        doc_types = DOC_TYPE_REGEX.findall(query)
+        if doc_types:
+            q_types = {normalize_text(t) for t in doc_types}
+            for did in list(matches.keys()):
+                d_type = normalize_text(self.doc_metadata.get(did, {}).get("doc_type", ""))
+                if d_type in q_types:
+                    matches[did]["exact_doc_type"] = True
+
+        return dict(matches)
