@@ -1,0 +1,11 @@
+{
+  "is_valid": true,
+  "total_documents": 8532,
+  "total_chunks": 1153876,
+  "total_micro_chunks": 934416,
+  "total_macro_chunks": 219460,
+  "total_queries": 7000,
+  "total_qrels": 7637,
+  "empty_documents_count": 20,
+  "errors": []
+}

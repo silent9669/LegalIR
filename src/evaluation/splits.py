@@ -1,11 +1,13 @@
-import os
-import json
-import argparse
-import random
 from collections import defaultdict
+from pathlib import Path
+from typing import Any
+import argparse
+import json
+import random
 import pandas as pd
 
-def generate_random_5fold_split(queries: list, seed: int = 42) -> list:
+
+def generate_random_5fold_split(queries: list, seed: int = 42) -> list[dict[str, Any]]:
     """Generate 5-fold cross-validation query splits."""
     random.seed(seed)
     qids = sorted([str(q["query_id"]) if isinstance(q, dict) else str(q) for q in queries])
@@ -23,13 +25,16 @@ def generate_random_5fold_split(queries: list, seed: int = 42) -> list:
 
         folds.append({
             "fold": i,
+            "train": train_qids,
+            "val": val_qids,
             "train_query_ids": train_qids,
-            "val_query_ids": val_qids
+            "val_query_ids": val_qids,
         })
 
     return folds
 
-def generate_document_disjoint_split(queries: list, qrels: list, val_ratio: float = 0.2, seed: int = 42) -> dict:
+
+def generate_document_disjoint_split(queries: list, qrels: list, val_ratio: float = 0.2, seed: int = 42) -> dict[str, Any]:
     """Generate a document-disjoint split where validation gold documents never appear in the train set."""
     random.seed(seed)
 
@@ -91,38 +96,41 @@ def generate_document_disjoint_split(queries: list, qrels: list, val_ratio: floa
     assert len(overlap) == 0, f"Document-disjoint split violation! Overlap: {overlap}"
 
     return {
+        "train": sorted(train_qids),
+        "val": sorted(val_qids),
         "train_query_ids": sorted(train_qids),
         "val_query_ids": sorted(val_qids),
         "train_doc_count": len(train_docs),
-        "val_doc_count": len(val_docs)
+        "val_doc_count": len(val_docs),
     }
 
-def create_all_splits(canonical_dir: str):
-    splits_dir = os.path.join(canonical_dir, "splits")
-    os.makedirs(splits_dir, exist_ok=True)
 
-    queries_df = pd.read_parquet(os.path.join(canonical_dir, "queries_train.parquet"))
-    qrels_df = pd.read_parquet(os.path.join(canonical_dir, "qrels_train.parquet"))
+def create_all_splits(canonical_dir: str | Path):
+    canonical_dir = Path(canonical_dir)
+    splits_dir = canonical_dir / "splits"
+    splits_dir.mkdir(parents=True, exist_ok=True)
+
+    queries_df = pd.read_parquet(canonical_dir / "queries_train.parquet")
+    qrels_df = pd.read_parquet(canonical_dir / "qrels_train.parquet")
 
     queries = queries_df.to_dict(orient="records")
     qrels = qrels_df.to_dict(orient="records")
 
     print(f"Generating 5-fold random CV splits for {len(queries)} queries...")
     random_5fold = generate_random_5fold_split(queries, seed=42)
-    with open(os.path.join(splits_dir, "random_5fold.json"), "w", encoding="utf-8") as f:
-        json.dump(random_5fold, f, indent=2)
+    (splits_dir / "random_5fold.json").write_text(json.dumps(random_5fold, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
-    print(f"Generating document-disjoint split...")
+    print("Generating document-disjoint split...")
     doc_disjoint = generate_document_disjoint_split(queries, qrels, val_ratio=0.2, seed=42)
-    with open(os.path.join(splits_dir, "doc_disjoint_split.json"), "w", encoding="utf-8") as f:
-        json.dump(doc_disjoint, f, indent=2)
+    (splits_dir / "doc_disjoint_split.json").write_text(json.dumps(doc_disjoint, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
     print(f"Splits successfully created in {splits_dir}!")
     print(f"  Random 5-fold: 5 folds x {len(random_5fold[0]['val_query_ids'])} val queries")
     print(f"  Doc-disjoint: {len(doc_disjoint['train_query_ids'])} train queries ({doc_disjoint['train_doc_count']} docs) | {len(doc_disjoint['val_query_ids'])} val queries ({doc_disjoint['val_doc_count']} docs)")
 
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--canonical_dir", type=str, default="data/task1_canonical/v1")
+    parser.add_argument("--canonical_dir", type=str, default="artifacts/shared/canonical/v2")
     args = parser.parse_args()
     create_all_splits(args.canonical_dir)

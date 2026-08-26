@@ -4,6 +4,7 @@ import pytest
 import pandas as pd
 from src.dataset.validator import validate_canonical_dataset
 
+
 def test_canonical_dataset_invariants(tmp_path):
     # Create mock canonical files
     docs_df = pd.DataFrame([
@@ -26,23 +27,31 @@ def test_canonical_dataset_invariants(tmp_path):
             "chunk_id": "740_macro_001",
             "doc_id": "740",
             "granularity": "macro",
+            "chapter": None,
+            "section": None,
             "article": "Điều 1",
             "clause": None,
+            "point": None,
             "text_raw": "Điều 1. Phạm vi",
             "text_norm": "điều 1. phạm vi",
             "parent_chunk_id": None,
-            "token_count": 10
+            "token_count": 10,
+            "is_empty": False
         },
         {
             "chunk_id": "740_micro_001",
             "doc_id": "740",
             "granularity": "micro",
+            "chapter": None,
+            "section": None,
             "article": "Điều 1",
             "clause": "Khoản 1",
+            "point": None,
             "text_raw": "Điều 1. Phạm vi",
             "text_norm": "điều 1. phạm vi",
             "parent_chunk_id": "740_macro_001",
-            "token_count": 5
+            "token_count": 5,
+            "is_empty": False
         }
     ])
 

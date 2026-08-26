@@ -48,6 +48,13 @@ checkpoints/
 *.safetensors
 *.npy
 
+# Raw BTC data
+artifacts/shared/raw/
+train.json
+public-official.json
+selected-contexts.zip
+selected-contexts/
+
 # Legacy local data, parquet, and pickle artifacts
 data/task1_canonical/
 artifacts/data/
