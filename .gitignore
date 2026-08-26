@@ -39,7 +39,16 @@ htmlcov/
 ehthumbs.db
 Thumbs.db
 
-# Large data, parquet, zip and index artifacts
+# Local models, checkpoints, embeddings, and training runs
+artifacts/local/
+models/
+checkpoints/
+*.pt
+*.bin
+*.safetensors
+*.npy
+
+# Legacy local data, parquet, and pickle artifacts
 data/task1_canonical/
 artifacts/data/
 artifacts/indexes/
@@ -50,8 +59,3 @@ indexes/
 chunks_output.jsonl
 selected-contexts.zip
 selected-contexts/
-models/
-checkpoints/
-*.pt
-*.bin
-*.safetensors
