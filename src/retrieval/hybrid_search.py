@@ -77,7 +77,7 @@ class HybridSearchEngine:
             all_candidates.update(list(mem_res.keys())[:10])
 
         # 4. Dense Macro Retriever (if enabled)
-        if self.dense and getattr(self.dense, "embeddings", None) is not None:
+        if self.dense is not None:
             dense_res = self.dense.retrieve(query, top_k=top_k * 2)
             dense_dict = {}
             for r, item in enumerate(dense_res, 1):
