@@ -4,9 +4,11 @@ import json
 import glob
 import unicodedata
 import argparse
+from pathlib import Path
 import pandas as pd
 from tqdm import tqdm
 from src.dataset.validator import validate_canonical_dataset
+from src.dataset.source_reader import iter_official_contexts
 
 LEGAL_NUM_PATTERN = re.compile(
     r'(?:Số|Số\s*:)\s*([0-9]+(?:\/[0-9]+)?(?:\/[A-ZĐ0-9\-\_]+)?)',
@@ -109,18 +111,26 @@ def build_canonical_package(raw_contexts_dir: str, train_json_path: str, output_
     os.makedirs(output_dir, exist_ok=True)
 
     # 1. Read all official contexts
-    context_files = sorted(glob.glob(os.path.join(raw_contexts_dir, "context_*.json")))
-    if not context_files:
-        raise FileNotFoundError(f"No context_*.json files found in {raw_contexts_dir}")
+    raw_path = Path(raw_contexts_dir)
+    if raw_path.is_file() and raw_path.suffix.lower() == ".zip":
+        contexts_iter = list(iter_official_contexts(raw_path))
+    else:
+        context_files = sorted(glob.glob(os.path.join(raw_contexts_dir, "context_*.json")))
+        if not context_files:
+            raise FileNotFoundError(f"No context_*.json files found in {raw_contexts_dir}")
+        contexts_iter = []
+        for fpath in context_files:
+            with open(fpath, "r", encoding="utf-8") as f:
+                row = json.load(f)
+                row["id"] = str(row["id"])
+                contexts_iter.append(row)
 
-    print(f"Reading {len(context_files)} official context files from {raw_contexts_dir}...")
+    print(f"Processing {len(contexts_iter)} official contexts...")
 
     docs_records = []
     chunks_records = []
 
-    for fpath in tqdm(context_files, desc="Parsing documents"):
-        with open(fpath, "r", encoding="utf-8") as f:
-            data = json.load(f)
+    for data in tqdm(contexts_iter, desc="Parsing documents"):
 
         doc_id = str(data["id"])
         name_raw = data.get("name") or ""
