@@ -41,8 +41,8 @@ Thumbs.db
 
 # Local models, checkpoints, embeddings, and training runs
 artifacts/local/
-models/
-checkpoints/
+/models/
+/checkpoints/
 *.pt
 *.bin
 *.safetensors
