@@ -1,0 +1,14 @@
+embedding:
+  name: "CODE4LIFEOFFICIAL/huydang-dek21-embedding-v2"
+  revision: "99a2963b2f51fa7a570a3e7f550d7993b9de90a8"
+  dimension: 768
+  normalize_embeddings: true
+  word_segmentation: "pyvi"
+  device: "auto"
+
+reranker:
+  name: "BAAI/bge-reranker-v2-m3"
+  revision: "953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e"
+  batch_size: 16
+  max_length: 512
+  device: "auto"
