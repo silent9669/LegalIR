@@ -1,9 +1,12 @@
 from collections import defaultdict
 from collections.abc import Callable, Mapping
+import json
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 
+from src.core.paths import ProjectPaths
 from src.models.device import resolve_device
 from src.ranking.evidence_pack import EvidencePackBuilder
 from src.retrieval.types import CandidateRecord
@@ -17,8 +20,18 @@ class CrossEncoderReranker:
         model_name: str = "BAAI/bge-reranker-v2-m3",
         device: str | None = None,
         score_fn: Callable[..., list[float]] | None = None,
+        *,
+        model_path: str | Path | None = None,
+        manifest_path: str | Path | None = None,
+        local_files_only: bool | None = None,
     ):
         self.model_name = str(model_name)
+        self.model_path = self._resolve_model_path(model_path, manifest_path)
+        self.local_files_only = (
+            self.model_path is not None
+            if local_files_only is None
+            else bool(local_files_only)
+        )
         self.device = (
             resolve_device(device or "auto")
             if device != "cpu" and self.model_name != "mock"
@@ -28,14 +41,48 @@ class CrossEncoderReranker:
         self.model = None
         self.score_fn = score_fn
 
+    def _resolve_model_path(
+        self,
+        model_path: str | Path | None,
+        manifest_path: str | Path | None,
+    ) -> Path | None:
+        """Resolve an explicit path or bootstrap manifest entry if present."""
+        if model_path is not None:
+            path = Path(model_path).expanduser()
+            return path if path.is_dir() else None
+
+        requested_path = Path(self.model_name).expanduser()
+        if requested_path.is_dir():
+            return requested_path
+
+        manifest = Path(manifest_path).expanduser() if manifest_path else (
+            ProjectPaths.from_repo().local_models / "huggingface" / "manifest.json"
+        )
+        if not manifest.is_file():
+            return None
+        try:
+            manifest_data = json.loads(manifest.read_text(encoding="utf-8"))
+            entry = manifest_data.get(self.model_name, {})
+            manifest_model_path = entry.get("path") if isinstance(entry, Mapping) else None
+        except (OSError, ValueError, TypeError):
+            return None
+        if not manifest_model_path:
+            return None
+        path = Path(manifest_model_path).expanduser()
+        if not path.is_absolute():
+            path = manifest.parent / path
+        return path if path.is_dir() else None
+
     def _load_model(self) -> None:
         if self.model is not None or self.score_fn is not None:
             return
         import torch
         from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-        self.model = AutoModelForSequenceClassification.from_pretrained(self.model_name)
+        model_source = str(self.model_path) if self.model_path is not None else self.model_name
+        load_kwargs = {"local_files_only": self.local_files_only}
+        self.tokenizer = AutoTokenizer.from_pretrained(model_source, **load_kwargs)
+        self.model = AutoModelForSequenceClassification.from_pretrained(model_source, **load_kwargs)
         self.model.to(self.device)
         self.model.eval()
 
@@ -213,10 +260,17 @@ class CrossEncoderReranker:
                     query,
                     doc_id,
                     candidate_record=candidate,
-                    max_chunks=evidence_builder.max_chunks,
                 )
-            for record in records:
-                passage = record.get("reranker_text") or record.get("text") or record.get("chunk_text", "")
+            for index, record in enumerate(records):
+                # The first pair is the complete multi-evidence document pack;
+                # additional pairs retain chunk-level evidence for aggregation.
+                passage = (
+                    record.get("pack")
+                    if index == 0 and record.get("pack")
+                    else record.get("reranker_text")
+                    or record.get("text")
+                    or record.get("chunk_text", "")
+                )
                 all_pairs.append((str(query), str(passage)))
                 pair_to_doc.append((doc_id, record))
 

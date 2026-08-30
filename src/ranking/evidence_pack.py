@@ -7,6 +7,29 @@ import unicodedata
 
 
 TOKEN_PATTERN = re.compile(r"\b\w+\b", re.UNICODE)
+CHUNK_COLUMNS = ("doc_id", "chunk_id", "granularity", "article", "text_norm", "text_raw")
+DOCUMENT_COLUMNS = ("doc_id", "title", "legal_number", "name_raw")
+MISSING_STRINGS = frozenset({"", "nan", "nat", "none", "null"})
+
+
+def _is_present(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return value.strip().lower() not in MISSING_STRINGS
+    try:
+        import pandas as pd
+
+        missing = pd.isna(value)
+        return not bool(missing)
+    except (TypeError, ValueError):
+        return True
+
+
+def _text_value(value: Any, default: str = "") -> str:
+    if not _is_present(value):
+        return default
+    return str(value).strip()
 
 
 def tokenize(text: str) -> list[str]:
@@ -49,7 +72,7 @@ class EvidencePackBuilder:
         self.max_chunks = self._validate_limit(max_chunks, "max_chunks")
         self.max_chars = self._validate_limit(max_chars, "max_chars")
 
-        chunk_records = self._records_from_source(macro_chunks)
+        chunk_records = self._records_from_source(macro_chunks, CHUNK_COLUMNS)
         # Canonical chunks contain both granularities. Prefer macro chunks when
         # a full chunks.parquet file is provided, matching reranker semantics.
         if any(record.get("granularity") == "macro" for record in chunk_records):
@@ -57,9 +80,9 @@ class EvidencePackBuilder:
 
         self.chunks_by_doc: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for chunk in chunk_records:
-            if "doc_id" not in chunk:
+            if not _is_present(chunk.get("doc_id")):
                 continue
-            self.chunks_by_doc[str(chunk["doc_id"])].append(dict(chunk))
+            self.chunks_by_doc[_text_value(chunk["doc_id"])].append(dict(chunk))
 
         self.doc_metadata = self._metadata_from_source(doc_metadata)
 
@@ -74,17 +97,24 @@ class EvidencePackBuilder:
         return parsed
 
     @staticmethod
-    def _records_from_source(source: Any) -> list[dict[str, Any]]:
+    def _records_from_source(
+        source: Any,
+        columns: tuple[str, ...] | None = None,
+    ) -> list[dict[str, Any]]:
         if source is None:
             return []
         if isinstance(source, (str, Path)):
             import pandas as pd
 
-            return [dict(row) for row in pd.read_parquet(source).to_dict(orient="records")]
+            frame = pd.read_parquet(source, columns=list(columns) if columns else None)
+            return [dict(row) for row in frame.to_dict(orient="records")]
         if hasattr(source, "to_dict"):
             try:
+                if columns and hasattr(source, "columns"):
+                    available = [column for column in columns if column in source.columns]
+                    source = source.loc[:, available]
                 return [dict(row) for row in source.to_dict(orient="records")]
-            except TypeError:
+            except (AttributeError, TypeError):
                 pass
         if isinstance(source, Mapping):
             return [dict(source)]
@@ -95,21 +125,34 @@ class EvidencePackBuilder:
         if source is None:
             return {}
         if isinstance(source, (str, Path)):
-            records = cls._records_from_source(source)
+            records = cls._records_from_source(source, DOCUMENT_COLUMNS)
         elif isinstance(source, Mapping):
             # Metadata is normally keyed by document ID. Also accept one row
             # supplied directly as a convenience.
             if "doc_id" in source or "title" in source or "legal_number" in source:
                 records = [dict(source)]
             else:
-                return {str(doc_id): dict(meta) for doc_id, meta in source.items()}
+                return {
+                    str(doc_id): {
+                        key: meta[key]
+                        for key in DOCUMENT_COLUMNS
+                        if key in meta and _is_present(meta[key])
+                    }
+                    for doc_id, meta in source.items()
+                    if _is_present(doc_id) and isinstance(meta, Mapping)
+                }
         else:
-            records = cls._records_from_source(source)
+            records = cls._records_from_source(source, DOCUMENT_COLUMNS)
 
         metadata: dict[str, dict[str, Any]] = {}
         for record in records:
-            if "doc_id" in record:
-                metadata[str(record["doc_id"])] = record
+            if not _is_present(record.get("doc_id")):
+                continue
+            metadata[str(record["doc_id"])] = {
+                key: record[key]
+                for key in DOCUMENT_COLUMNS
+                if key in record and _is_present(record[key])
+            }
         return metadata
 
     @staticmethod
@@ -122,30 +165,32 @@ class EvidencePackBuilder:
             if not candidate:
                 raise ValueError("candidate tuple must contain a document ID")
             candidate = candidate[0]
-        if candidate is None:
+        if not _is_present(candidate):
             raise ValueError("document ID cannot be null")
-        return str(candidate)
+        return _text_value(candidate)
 
     def _metadata_for(self, doc_id: str, candidate_record: Mapping[str, Any] | None = None) -> dict[str, Any]:
         metadata = dict(self.doc_metadata.get(str(doc_id), {}))
         if candidate_record:
             for key in ("title", "legal_number", "name_raw"):
-                if key in candidate_record and candidate_record[key] is not None:
+                if key in candidate_record and _is_present(candidate_record[key]):
                     metadata.setdefault(key, candidate_record[key])
         return metadata
 
     @staticmethod
     def _chunk_body(chunk: Mapping[str, Any]) -> str:
-        body = chunk.get("text_raw") or chunk.get("text_norm") or ""
-        return str(body).strip()
+        for key in ("text_raw", "text_norm"):
+            if _is_present(chunk.get(key)):
+                return _text_value(chunk[key])
+        return ""
 
     def format_evidence_text(self, chunk: Mapping[str, Any], doc_meta: Mapping[str, Any] | None = None) -> str:
         """Return the legacy per-chunk representation used by older callers."""
         did = str(chunk.get("doc_id", ""))
         meta = dict(doc_meta or self.doc_metadata.get(did, {}))
-        title = meta.get("title") or meta.get("name_raw") or f"Văn bản {did}"
-        legal_num = meta.get("legal_number") or ""
-        article = chunk.get("article") or "Thông tin văn bản"
+        title = _text_value(meta.get("title"), _text_value(meta.get("name_raw"), f"Văn bản {did}"))
+        legal_num = _text_value(meta.get("legal_number"))
+        article = _text_value(chunk.get("article"), "Thông tin văn bản")
         body = self._chunk_body(chunk)
 
         header = f"[VĂN BẢN]: {title}"
@@ -174,7 +219,7 @@ class EvidencePackBuilder:
 
         scored_chunks: list[tuple[float, int, dict[str, Any]]] = []
         for index, chunk in enumerate(doc_chunks):
-            chunk_terms = Counter(tokenize(chunk.get("text_norm") or chunk.get("text_raw") or ""))
+            chunk_terms = Counter(tokenize(self._chunk_body(chunk)))
             if not chunk_terms:
                 score = 0.0
             else:
@@ -196,9 +241,11 @@ class EvidencePackBuilder:
         self,
         query: str,
         doc_id: Any,
-        candidate_record: Mapping[str, Any] | None = None,
+        candidate_record: Mapping[str, Any] | Iterable[Mapping[str, Any]] | None = None,
         max_chunks: int | None = None,
         max_chars: int | None = None,
+        *,
+        candidate_chunks: Iterable[Mapping[str, Any]] | None = None,
     ) -> str:
         """Build one structured document pack in the canonical format."""
         if isinstance(doc_id, Mapping):
@@ -207,6 +254,9 @@ class EvidencePackBuilder:
             doc_id = self._candidate_doc_id(doc_id)
         else:
             doc_id = self._candidate_doc_id(doc_id)
+        if candidate_chunks is None and candidate_record is not None and not isinstance(candidate_record, Mapping):
+            candidate_chunks = candidate_record
+            candidate_record = None
         max_chunks = self._validate_limit(
             self.max_chunks if max_chunks is None else max_chunks,
             "max_chunks",
@@ -216,10 +266,17 @@ class EvidencePackBuilder:
             "max_chars",
         )
 
-        selected_chunks = self._select_chunks(query, doc_id, candidate_record, max_chunks)
+        selected_chunks = (
+            [dict(chunk) for chunk in candidate_chunks][:max_chunks]
+            if candidate_chunks is not None
+            else self._select_chunks(query, doc_id, candidate_record, max_chunks)
+        )
         metadata = self._metadata_for(doc_id, candidate_record)
-        title = str(metadata.get("title") or metadata.get("name_raw") or f"Văn bản {doc_id}").strip()
-        legal_number = str(metadata.get("legal_number") or "").strip()
+        title = _text_value(
+            metadata.get("title"),
+            _text_value(metadata.get("name_raw"), f"Văn bản {doc_id}"),
+        )
+        legal_number = _text_value(metadata.get("legal_number"))
         document_label = f"{title} {legal_number}".strip()
 
         sections = [f"[QUESTION] {str(query).strip()}", f"[DOCUMENT] {document_label}"]
@@ -234,9 +291,11 @@ class EvidencePackBuilder:
         self,
         query: str,
         doc_id: Any,
-        candidate_record: Mapping[str, Any] | None = None,
+        candidate_record: Mapping[str, Any] | Iterable[Mapping[str, Any]] | None = None,
         max_chunks: int | None = None,
         max_chars: int | None = None,
+        *,
+        candidate_chunks: Iterable[Mapping[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
         """Build evidence records for a candidate document.
 
@@ -251,6 +310,9 @@ class EvidencePackBuilder:
             doc_id = self._candidate_doc_id(doc_id)
         else:
             doc_id = self._candidate_doc_id(doc_id)
+        if candidate_chunks is None and candidate_record is not None and not isinstance(candidate_record, Mapping):
+            candidate_chunks = candidate_record
+            candidate_record = None
         max_chunks = self._validate_limit(
             self.max_chunks if max_chunks is None else max_chunks,
             "max_chunks",
@@ -260,11 +322,25 @@ class EvidencePackBuilder:
             "max_chars",
         )
 
-        selected_chunks = self._select_chunks(query, doc_id, candidate_record, max_chunks)
-        pack = self.build_pack(query, doc_id, candidate_record, max_chunks=max_chunks, max_chars=max_chars)
+        selected_chunks = (
+            [dict(chunk) for chunk in candidate_chunks][:max_chunks]
+            if candidate_chunks is not None
+            else self._select_chunks(query, doc_id, candidate_record, max_chunks)
+        )
+        pack = self.build_pack(
+            query,
+            doc_id,
+            candidate_record,
+            max_chunks=max_chunks,
+            max_chars=max_chars,
+            candidate_chunks=selected_chunks,
+        )
         metadata = self._metadata_for(doc_id, candidate_record)
-        title = str(metadata.get("title") or metadata.get("name_raw") or f"Văn bản {doc_id}").strip()
-        legal_number = str(metadata.get("legal_number") or "").strip()
+        title = _text_value(
+            metadata.get("title"),
+            _text_value(metadata.get("name_raw"), f"Văn bản {doc_id}"),
+        )
+        legal_number = _text_value(metadata.get("legal_number"))
         document_label = f"{title} {legal_number}".strip()
         header = f"[QUESTION] {str(query).strip()} [DOCUMENT] {document_label}"
 
@@ -281,13 +357,13 @@ class EvidencePackBuilder:
             text = f"{pack} {legacy_text}" if index == 1 else pack
             records.append({
                 "doc_id": doc_id,
-                "chunk_id": str(chunk.get("chunk_id", f"{doc_id}_{index}")),
+                "chunk_id": _text_value(chunk.get("chunk_id"), f"{doc_id}_{index}"),
                 "text": text,
                 "pack": pack,
                 "evidence_text": pack,
                 "reranker_text": reranker_text,
                 "chunk_text": body,
-                "article": chunk.get("article", ""),
+                "article": _text_value(chunk.get("article")),
             })
         return records
 

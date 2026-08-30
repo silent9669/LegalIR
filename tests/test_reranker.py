@@ -1,4 +1,7 @@
+import json
+
 import pytest
+
 from src.ranking.evidence_pack import EvidencePackBuilder
 from src.ranking.reranker import CrossEncoderReranker
 
@@ -30,10 +33,13 @@ def test_reranker_orders_scored_tuple_candidates_by_cross_encoder_score():
     chunks = [
         {"chunk_id": "low-c", "doc_id": "low", "text_norm": "low evidence"},
         {"chunk_id": "high-c", "doc_id": "high", "text_norm": "high evidence"},
+        {"chunk_id": "high-c2", "doc_id": "high", "text_norm": "more high evidence"},
     ]
     builder = EvidencePackBuilder(macro_chunks=chunks)
+    seen_passages = []
 
     def score_pairs(pairs, batch_size=16, max_length=512):
+        seen_passages.extend(passage for _, passage in pairs)
         return [10.0 if "high evidence" in passage else 1.0 for _, passage in pairs]
 
     reranker = CrossEncoderReranker(model_name="mock", score_fn=score_pairs)
@@ -45,3 +51,23 @@ def test_reranker_orders_scored_tuple_candidates_by_cross_encoder_score():
     )
 
     assert [candidate["doc_id"] for candidate in ranked] == ["high", "low"]
+    assert any("[EVIDENCE 2]" in passage for passage in seen_passages)
+
+
+def test_reranker_resolves_manifest_model_path_for_offline_inference(tmp_path):
+    model_dir = tmp_path / "bge-reranker"
+    model_dir.mkdir()
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps({"BAAI/bge-reranker-v2-m3": {"path": str(model_dir)}}),
+        encoding="utf-8",
+    )
+
+    reranker = CrossEncoderReranker(
+        model_name="BAAI/bge-reranker-v2-m3",
+        manifest_path=manifest_path,
+        local_files_only=True,
+    )
+
+    assert reranker.model_path == model_dir
+    assert reranker.local_files_only is True
