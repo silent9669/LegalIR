@@ -39,7 +39,7 @@ def test_dense_memory_votes_without_validation_rows():
 def test_question_memory_dual_signal():
     from src.retrieval.question_memory import TrainQuestionMemory
 
-    memory = TrainQuestionMemory(min_similarity=0.8)
+    memory = TrainQuestionMemory(min_similarity=0.8, use_dense=False)
     train_queries = {
         "q1": "thời hạn cấp đăng ký xe máy",
         "q2": "thủ tục đăng ký kinh doanh",
@@ -94,13 +94,13 @@ def test_train_question_memory_use_dense_lazily_loads_dek21(monkeypatch):
     memory = TrainQuestionMemory(
         min_similarity=0.95,
         dense_min_similarity=0.8,
-        use_dense=True,
     )
     memory.fit(
         {"q1": "quy định về đất đai", "q2": "thủ tục kinh doanh"},
         {"q1": ["doc_100"], "q2": ["doc_200"]},
     )
 
+    assert memory.use_dense is True
     assert memory.dense_embeddings is not None
     assert memory.dense_encoder.kwargs["model_name"] == memory.DEFAULT_MODEL_NAME
     hits = memory.search("không trùng từ", top_k=5)

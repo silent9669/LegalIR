@@ -14,7 +14,7 @@ def test_validation_queries_never_enter_question_memory():
 def test_train_question_memory_indexes_only_supplied_fold():
     from src.retrieval.question_memory import TrainQuestionMemory
 
-    memory = TrainQuestionMemory()
+    memory = TrainQuestionMemory(use_dense=False)
     memory.fit({"train": "câu hỏi train"}, {"train": ["1"]})
 
     assert memory.training_query_ids == frozenset({"train"})

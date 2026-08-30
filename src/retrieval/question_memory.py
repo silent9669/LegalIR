@@ -178,7 +178,7 @@ class TrainQuestionMemory:
         lexical_weight: float = 1.0,
         dense_weight: float = 1.0,
         model_name: str = DEFAULT_MODEL_NAME,
-        use_dense: bool = False,
+        use_dense: bool = True,
         dense_dimension: int = 768,
         dense_use_pyvi: bool = True,
         dense_device: str | None = None,
