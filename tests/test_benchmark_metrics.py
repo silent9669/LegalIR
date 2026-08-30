@@ -9,6 +9,7 @@ from src.evaluation.benchmark import aggregate_fold_metrics, run_benchmark, run_
 from src.evaluation.evaluator import (
     _normalize_ids,
     compute_candidate_cutoffs,
+    compute_candidate_recall,
     evaluate_predictions,
     normalize_candidate_cutoffs,
 )
@@ -84,6 +85,7 @@ def test_candidate_recall_accepts_candidate_records():
 
 def test_normalize_ids_handles_scalar_mapping_values():
     assert _normalize_ids({"answer": "doc_1"}) == ["doc_1"]
+    assert _normalize_ids({"answer": b"doc_3"}) == ["doc_3"]
     assert _normalize_ids({"doc_id": 7}) == ["7"]
     assert _normalize_ids({"answer": {"doc_id": "doc_2"}}) == ["doc_2"]
 
@@ -101,6 +103,14 @@ def test_candidate_recall_accepts_scalar_candidate_mapping():
     )
 
     assert metrics == {"candidate_recall@1": 1.0}
+
+
+def test_candidate_recall_accepts_scalar_candidate_string():
+    assert compute_candidate_recall(
+        {"q1": "doc_1"},
+        {"q1": ["doc_1"]},
+        k=1,
+    ) == 1.0
 
 
 def test_aggregate_fold_metrics_reports_all_final_metrics():

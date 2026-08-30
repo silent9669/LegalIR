@@ -9,6 +9,12 @@ DEFAULT_CANDIDATE_CUTOFFS = (20, 50, 100)
 FINAL_RANKING_METRICS = ("recall_at_1", "recall_at_3", "recall_at_5", "precision_at_5")
 
 
+def _stringify_id(value: Any) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
 def _normalize_ids(value: Any) -> list[str]:
     """Normalize a prediction or qrel value to an ordered list of IDs."""
     if isinstance(value, Mapping):
@@ -20,7 +26,7 @@ def _normalize_ids(value: Any) -> list[str]:
             return _normalize_ids(value["doc_id"])
         return []
     if isinstance(value, (str, bytes)):
-        return [str(value)]
+        return [_stringify_id(value)]
     if value is None:
         return []
 
@@ -28,7 +34,7 @@ def _normalize_ids(value: Any) -> list[str]:
         values = list(value)
     except TypeError:
         values = [value]
-    return [str(item) for item in values if item is not None]
+    return [_stringify_id(item) for item in values if item is not None]
 
 
 def _normalize_query_values(values: Mapping[Any, Any]) -> dict[str, list[str]]:
@@ -42,7 +48,7 @@ def _candidate_doc_id(candidate: Any) -> str | None:
         candidate = candidate[0] if candidate else None
     if candidate is None:
         return None
-    return str(candidate)
+    return _stringify_id(candidate)
 
 
 def normalize_candidate_cutoffs(cutoffs: Iterable[int] | int | str | None = None) -> list[int]:
@@ -155,15 +161,13 @@ def compute_candidate_recall(
             continue
 
         raw_candidates = normalized_candidates.get(qid, [])
-        if isinstance(raw_candidates, Mapping) and (
-            "doc_id" in raw_candidates or "document_id" in raw_candidates
-        ):
-            raw_candidates = [raw_candidates]
+        if isinstance(raw_candidates, (str, bytes, Mapping)):
+            raw_candidates = _normalize_ids(raw_candidates)
         else:
             try:
                 raw_candidates = list(raw_candidates)
             except TypeError:
-                raw_candidates = [raw_candidates]
+                raw_candidates = _normalize_ids(raw_candidates)
         candidate_ids = [
             doc_id
             for doc_id in (_candidate_doc_id(candidate) for candidate in raw_candidates[:k])
