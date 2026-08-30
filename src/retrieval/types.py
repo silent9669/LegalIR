@@ -27,3 +27,6 @@ class CandidateRecord(TypedDict, total=False):
     dense_best_chunk_id: Optional[str]
     rrf_score: float
     source_count: int
+    branch_ranks: dict[str, int]
+    branch_contributions: dict[str, float]
+    branch_metadata: dict[str, dict[str, object]]
