@@ -34,3 +34,43 @@ def test_dense_memory_votes_without_validation_rows():
     assert "100" in res
     assert res["100"]["dense_similarity"] >= 0.8
     assert res["100"]["vote_count"] >= 1
+
+
+def test_question_memory_dual_signal():
+    from src.retrieval.question_memory import TrainQuestionMemory
+
+    memory = TrainQuestionMemory(min_similarity=0.8)
+    train_queries = {
+        "q1": "thời hạn cấp đăng ký xe máy",
+        "q2": "thủ tục đăng ký kinh doanh",
+    }
+    train_qrels = {"q1": ["doc_100"], "q2": ["doc_200"]}
+    memory.fit(train_queries, train_qrels)
+
+    hits = memory.search("thời hạn cấp đăng ký xe máy của người nước ngoài", top_k=5)
+    assert any(hit["doc_id"] == "doc_100" for hit in hits)
+
+
+def test_train_question_memory_dense_signal_accepts_precomputed_query_embedding():
+    from src.retrieval.question_memory import TrainQuestionMemory
+
+    def encoder(texts):
+        return np.array(
+            [[1.0, 0.0] if "đất" in text else [0.0, 1.0] for text in texts],
+            dtype=np.float32,
+        )
+
+    memory = TrainQuestionMemory(
+        min_similarity=0.95,
+        dense_min_similarity=0.8,
+        dense_encoder=encoder,
+    )
+    memory.fit(
+        {"q1": "quy định về đất đai", "q2": "thủ tục kinh doanh"},
+        {"q1": ["doc_100"], "q2": ["doc_200"]},
+    )
+
+    hits = memory.query("không trùng từ", top_k=5, q_emb=np.array([1.0, 0.0]))
+    assert hits[0]["doc_id"] == "doc_100"
+    assert hits[0]["dense_similarity"] == 1.0
+    assert hits[0]["vote_count"] == 1
