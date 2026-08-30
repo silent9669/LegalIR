@@ -119,8 +119,16 @@ def run_split_eval(
         val_predictions[qid_str] = top5
 
     metrics = evaluate_predictions(val_predictions, val_ground_truth)
-    cand_metrics = compute_candidate_cutoffs(val_candidates, val_ground_truth, cutoffs=candidate_cutoffs)
+    cand_metrics = compute_candidate_cutoffs(
+        val_candidates,
+        val_ground_truth,
+        cutoffs=candidate_cutoffs,
+    )
     metrics.update(cand_metrics)
+    metrics.update({
+        key.replace("candidate_", "", 1): value
+        for key, value in cand_metrics.items()
+    })
 
     # Official scorer assertion
     assert_official_equivalence(val_predictions, val_ground_truth)
@@ -170,6 +178,10 @@ def aggregate_fold_metrics(
         "Recall@5": means["recall_at_5"],
         "Precision@5": means["precision_at_5"],
     }
+    candidate_aliases = {
+        key.replace("candidate_", "", 1): value
+        for key, value in candidate_recalls.items()
+    }
 
     return {
         "mean_recall_at_1": means["recall_at_1"],
@@ -179,6 +191,7 @@ def aggregate_fold_metrics(
         "mean_precision_at_5": means["precision_at_5"],
         "candidate_recalls": candidate_recalls,
         **candidate_recalls,
+        **candidate_aliases,
         "final_ranking_metrics": final_ranking_metrics,
         **final_ranking_metrics,
     }

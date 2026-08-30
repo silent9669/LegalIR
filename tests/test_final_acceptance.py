@@ -2,6 +2,36 @@ import json
 from pathlib import Path
 
 
+STANDARD_CANDIDATE_CUTOFFS = (20, 50, 100)
+FINAL_METRIC_KEYS = ("Recall@1", "Recall@3", "Recall@5", "Precision@5")
+
+
+def _assert_final_metric_report(report_section):
+    for metric_key in FINAL_METRIC_KEYS:
+        machine_key = metric_key.lower().replace("@", "_at_")
+        assert (
+            metric_key in report_section
+            or machine_key in report_section
+            or f"mean_{machine_key}" in report_section
+        )
+
+
+def test_accepted_benchmark_reports_expose_dual_validation_metrics():
+    report = json.loads(
+        Path("artifacts/shared/benchmarks/accepted/final_model.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert set(STANDARD_CANDIDATE_CUTOFFS) <= set(report["candidate_cutoffs"])
+    for split_name in ("random_5fold", "document_disjoint"):
+        _assert_final_metric_report(report[split_name])
+
+    random_candidates = report["random_5fold"]["candidate_recalls"]
+    for cutoff in STANDARD_CANDIDATE_CUTOFFS:
+        assert f"candidate_recall@{cutoff}" in random_candidates
+
+
 def test_final_model_passes_all_acceptance_gates():
     model_path = Path("artifacts/shared/benchmarks/accepted/final_model.json")
     assert model_path.exists(), "final_model.json must exist in artifacts/shared/benchmarks/accepted/"

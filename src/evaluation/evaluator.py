@@ -1,3 +1,4 @@
+from collections.abc import Iterable as IterableABC
 from collections.abc import Mapping
 from typing import Any, Iterable
 
@@ -12,24 +13,22 @@ def _normalize_ids(value: Any) -> list[str]:
     """Normalize a prediction or qrel value to an ordered list of IDs."""
     if isinstance(value, Mapping):
         if "answer" in value:
-            value = value["answer"]
-        elif "doc_ids" in value:
-            value = value["doc_ids"]
-        elif "doc_id" in value:
-            value = [value["doc_id"]]
-        else:
-            value = []
-    elif isinstance(value, (str, bytes)):
-        value = [value]
-    elif value is None:
-        value = []
-    else:
-        try:
-            value = list(value)
-        except TypeError:
-            value = [value]
+            return _normalize_ids(value["answer"])
+        if "doc_ids" in value:
+            return _normalize_ids(value["doc_ids"])
+        if "doc_id" in value:
+            return _normalize_ids(value["doc_id"])
+        return []
+    if isinstance(value, (str, bytes)):
+        return [str(value)]
+    if value is None:
+        return []
 
-    return [str(item) for item in value if item is not None]
+    try:
+        values = list(value)
+    except TypeError:
+        values = [value]
+    return [str(item) for item in values if item is not None]
 
 
 def _normalize_query_values(values: Mapping[Any, Any]) -> dict[str, list[str]]:
@@ -46,9 +45,15 @@ def _candidate_doc_id(candidate: Any) -> str | None:
     return str(candidate)
 
 
-def normalize_candidate_cutoffs(cutoffs: Iterable[int] | None = None) -> list[int]:
+def normalize_candidate_cutoffs(cutoffs: Iterable[int] | int | str | None = None) -> list[int]:
     """Return validated, de-duplicated candidate cutoffs in caller order."""
-    values = DEFAULT_CANDIDATE_CUTOFFS if cutoffs is None else cutoffs
+    if cutoffs is None:
+        values: Iterable[int] = DEFAULT_CANDIDATE_CUTOFFS
+    elif isinstance(cutoffs, (str, bytes)) or not isinstance(cutoffs, IterableABC):
+        values = (cutoffs,)
+    else:
+        values = cutoffs
+
     normalized: list[int] = []
     for cutoff in values:
         if isinstance(cutoff, bool):
@@ -150,10 +155,15 @@ def compute_candidate_recall(
             continue
 
         raw_candidates = normalized_candidates.get(qid, [])
-        try:
-            raw_candidates = list(raw_candidates)
-        except TypeError:
+        if isinstance(raw_candidates, Mapping) and (
+            "doc_id" in raw_candidates or "document_id" in raw_candidates
+        ):
             raw_candidates = [raw_candidates]
+        else:
+            try:
+                raw_candidates = list(raw_candidates)
+            except TypeError:
+                raw_candidates = [raw_candidates]
         candidate_ids = [
             doc_id
             for doc_id in (_candidate_doc_id(candidate) for candidate in raw_candidates[:k])
