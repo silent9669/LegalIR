@@ -1,7 +1,9 @@
 from pathlib import Path
+import sys
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 from src.retrieval.dense_macro import DenseMacroRetriever
@@ -19,6 +21,33 @@ def test_dense_macro_retriever_initialization():
     text = "Thời hạn cấp đăng ký xe máy là bao lâu?"
     norm = retriever.preprocess_text(text)
     assert len(norm) > 0
+
+
+def test_preprocess_text_calls_pyvi_and_segments_legal_phrases(monkeypatch):
+    from pyvi import ViTokenizer
+
+    calls = []
+    original_tokenize = ViTokenizer.tokenize
+
+    def recording_tokenize(text):
+        calls.append(text)
+        return original_tokenize(text)
+
+    monkeypatch.setattr(ViTokenizer, "tokenize", recording_tokenize)
+    retriever = DenseMacroRetriever(use_pyvi=True)
+
+    segmented = retriever.preprocess_text("Thời hạn cấp đăng ký xe máy là bao lâu?")
+
+    assert calls == ["Thời hạn cấp đăng ký xe máy là bao lâu?"]
+    assert "đăng_ký" in segmented
+
+
+def test_preprocess_text_requires_pyvi_when_enabled(monkeypatch):
+    retriever = DenseMacroRetriever(use_pyvi=True)
+    monkeypatch.setitem(sys.modules, "pyvi", None)
+
+    with pytest.raises(ImportError, match="PyVi is required"):
+        retriever.preprocess_text("đăng ký xe")
 
 
 def test_exact_dense_search_aggregates_chunks_to_documents(tmp_path: Path):
@@ -63,6 +92,24 @@ def test_encode_corpus_stores_macro_metadata_and_searches_documents():
     assert retriever.doc_ids == ["A", "A", "B"]
     assert np.allclose(np.linalg.norm(embeddings, axis=1), 1.0)
     assert retriever.search("alpha question", top_k=1)[0]["doc_id"] == "A"
+
+
+def test_encode_corpus_keeps_only_search_metadata():
+    retriever = DenseMacroRetriever.from_arrays(
+        query_encoder=lambda texts: np.ones((len(texts), 2), dtype=np.float32)
+    )
+    retriever.encode_corpus(
+        [
+            {
+                "chunk_id": "c1",
+                "doc_id": "d1",
+                "article": "Điều 1",
+                "text_norm": "nội dung không lưu lại",
+            }
+        ]
+    )
+
+    assert retriever.corpus == [{"chunk_id": "c1", "doc_id": "d1", "article": "Điều 1"}]
 
 
 def test_encode_texts_mean_pools_attention_mask_and_normalizes():

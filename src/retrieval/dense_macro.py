@@ -116,10 +116,10 @@ class DenseMacroRetriever:
 
         try:
             from pyvi import ViTokenizer
-        except ImportError:
-            # Keep local tests and cached-index loading usable when the optional
-            # tokenizer is absent; environments with PyVi always use it.
-            return normalized
+        except ImportError as exc:
+            raise ImportError(
+                "PyVi is required when use_pyvi=True; install it with `pip install pyvi`."
+            ) from exc
         return ViTokenizer.tokenize(normalized)
 
     def _load_model(self) -> None:
@@ -294,10 +294,17 @@ class DenseMacroRetriever:
         texts = [self._record_text(record) for record in records]
         embeddings = self.encode_texts(texts, batch_size=batch_size, max_length=max_length)
 
-        self.corpus = records
         self.chunk_ids = [str(record.get("chunk_id", index)) for index, record in enumerate(records)]
         self.doc_ids = [
             str(record.get("doc_id", record.get("document_id", self.chunk_ids[index])))
+            for index, record in enumerate(records)
+        ]
+        self.corpus = [
+            {
+                "chunk_id": self.chunk_ids[index],
+                "doc_id": self.doc_ids[index],
+                "article": record.get("article", record.get("article_id")),
+            }
             for index, record in enumerate(records)
         ]
         self._set_embeddings(embeddings)

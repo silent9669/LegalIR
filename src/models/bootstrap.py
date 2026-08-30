@@ -12,6 +12,11 @@ MODEL_REGISTRY = {
         "allow_patterns": ["*.json", "*.txt", "pytorch_model.bin", "*.safetensors", "sentencepiece.bpe.model", "tokenizer*"],
         "ignore_patterns": ["onnx/*", "openvino/*", "*.msgpack", "*.h5", "coreml/*"],
     },
+    "CODE4LIFEOFFICIAL/huydang-dek21-embedding-v2": {
+        "revision": "99a2963b2f51fa7a570a3e7f550d7993b9de90a8",
+        "allow_patterns": ["*.json", "*.txt", "pytorch_model.bin", "*.safetensors", "sentencepiece.bpe.model", "tokenizer*"],
+        "ignore_patterns": ["onnx/*", "openvino/*", "*.msgpack", "*.h5", "coreml/*"],
+    },
     "BAAI/bge-reranker-v2-m3": {
         "revision": "953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e",
         "allow_patterns": ["*.json", "*.txt", "pytorch_model.bin", "*.safetensors", "sentencepiece.bpe.model", "tokenizer*"],
