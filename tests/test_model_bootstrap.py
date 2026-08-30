@@ -21,6 +21,14 @@ def test_dek21_v2_registry_is_pinned_for_local_bootstrap():
     assert required_model_files(model_name) == metadata["allow_patterns"]
 
 
+def test_dek21_allowlist_contains_phobert_tokenizer_files():
+    files = required_model_files("CODE4LIFEOFFICIAL/huydang-dek21-embedding-v2")
+
+    assert "bpe.codes" in files
+    assert "*.json" in files
+    assert "tokenizer*" in files
+
+
 def test_explicit_cpu_is_preserved():
     assert resolve_device("cpu") == "cpu"
 

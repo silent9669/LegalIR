@@ -14,7 +14,7 @@ MODEL_REGISTRY = {
     },
     "CODE4LIFEOFFICIAL/huydang-dek21-embedding-v2": {
         "revision": "99a2963b2f51fa7a570a3e7f550d7993b9de90a8",
-        "allow_patterns": ["*.json", "*.txt", "pytorch_model.bin", "*.safetensors", "sentencepiece.bpe.model", "tokenizer*"],
+        "allow_patterns": ["*.json", "*.txt", "pytorch_model.bin", "*.safetensors", "sentencepiece.bpe.model", "bpe.codes", "tokenizer*"],
         "ignore_patterns": ["onnx/*", "openvino/*", "*.msgpack", "*.h5", "coreml/*"],
     },
     "BAAI/bge-reranker-v2-m3": {
