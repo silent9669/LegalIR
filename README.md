@@ -2,42 +2,37 @@
 
 High-Recall Vietnamese Legal Information Retrieval Pipeline for UIT Data Science Challenge 2026.
 
-## 1. System Architecture & Shared Artifacts
+---
 
-- **Canonical Dataset Package (`artifacts/shared/canonical/v2/`)**:
-  - `documents.parquet`: 8,532 official context documents (100% coverage, 0 dropped).
-  - `chunks.parquet`: 1,153,876 dual-granularity chunks (934,416 micro chunks for BM25/Exact match and 219,460 macro chunks for Dense retrieval & Cross-Encoder evidence packs).
-  - `queries_train.parquet` & `qrels_train.parquet`: 7,000 queries and 7,637 exploded relations.
-  - `duplicate_groups.json` & `empty_context_ids.json`: Grouping of identical passages and metadata-only empty documents.
-  - `splits/`: 5-fold cross-validation (`random_5fold.json`) and document-disjoint split (`doc_disjoint_split.json`).
-  - `manifest.json` & `audit_report.json`: Invariant audit and checksum verification.
+## 1. System Architecture & Model Stack
 
-- **Multi-Branch Candidate Retrieval**:
-  - **BM25 on Micro Chunks (`src/retrieval/bm25_micro.py`)**: Vectorized BM25 on clause-level micro chunks with document score aggregation ($\max + 0.1 \times \text{mean}$) and legal field weighting.
-  - **Exact Identifier Matcher (`src/retrieval/exact_matcher.py`)**: Regex extraction of decree/circular/law numbers, titles, and legal metadata.
-  - **Train-Question Memory (`src/retrieval/question_memory.py`)**: Fold-isolated TF-IDF character n-gram + neural memory with zero validation label leakage.
-  - **Dense Retriever (`src/retrieval/dense_macro.py`)**: Macro-chunk embeddings using `BAAI/bge-m3`.
+- **Standardized Clean Workspace (`src/common/` & `src/task1/`)**:
+  - `src/common/normalize.py`: Unicode NFC normalization, PyVi word segmentation, and legal signal extraction (decree/circular numbers, articles, clauses, years).
+  - `src/common/legal_parser.py`: Hierarchical legal structure parser (Chương, Mục, Điều, Khoản, Điểm).
+  - `src/common/bm25.py`: Fast `bm25s` micro-chunk indexing with legal entity boosting (+30.0 for exact decree numbers, +15.0 for articles, +8.0 for clauses).
+  - `src/common/dense_dek21.py`: `CODE4LIFEOFFICIAL/huydang-dek21-embedding-v2` (768-dim, PyVi segmentation) dense retriever on Apple Silicon `mps`/`cpu`.
+  - `src/common/rrf.py`: Weighted Reciprocal Rank Fusion ($k=60$) across retrieval branches.
+  - `src/common/evidence.py`: Structured multi-chunk evidence pack builder (`[QUESTION]`, `[DOCUMENT]`, `[EVIDENCE 1]`, `[EVIDENCE 2]`).
+  - `src/common/reranker.py`: `BAAI/bge-reranker-v2-m3` cross-encoder scoring on `mps`/`cpu`.
 
-- **Cross-Encoder Reranking & Evidence Packs (`src/ranking/`)**:
-  - `EvidencePackBuilder`: Constructs concise `[VĂN BẢN]`, `[ĐIỀU KHOẢN]`, `[NỘI DUNG]` context packs.
-  - `CrossEncoderReranker`: `BAAI/bge-reranker-v2-m3` pair inference.
-
-- **Fusion & Selection (`src/ranking/`)**:
-  - Reciprocal Rank Fusion (RRF) and fold-safe LightGBM ranking models.
-  - `TopKSelector`: Strict selection of 1 to 5 unique official document IDs.
+- **Task 1 Pipeline Modules (`src/task1/`)**:
+  - `src/task1/memory.py`: Fold-isolated Train-Question Memory (TF-IDF char n-grams + DEk21 train embeddings).
+  - `src/task1/retrieve.py`: 4-Branch candidate search engine.
+  - `src/task1/rerank.py`: Document-level evidence reranking.
+  - `src/task1/selector.py`: Top-5 unique document ID selector with fallback guards.
+  - `src/task1/predict.py`: End-to-end `LegalIRPipeline`.
 
 ---
 
-## 2. Official Dual-Validation Benchmark Results
+## 2. Learned Parameter Compliance Audit (< 4.0B limit)
 
-### Model Comparison under Identical Dataset & Split Checksums
+| Model Component | Hugging Face Repository | Parameter Count | Device |
+| :--- | :--- | :---: | :---: |
+| **Dense Retriever** | `CODE4LIFEOFFICIAL/huydang-dek21-embedding-v2` | 134,998,272 (~0.135B) | `mps` / `cpu` |
+| **Cross-Encoder Reranker** | `BAAI/bge-reranker-v2-m3` | 567,755,777 (~0.568B) | `mps` / `cpu` |
+| **Total System Parameters** | **LegalIR 4-Branch Stack** | **702,754,049 (~0.703B)** | **PASS (< 4.0B)** |
 
-| Model / Pipeline Configuration | Random 5-Fold Recall@5 | Random 5-Fold Prec@5 | Candidate Recall@50 | Doc-Disjoint Recall@5 | Doc-Disjoint Cand@50 |
-| :--- | :---: | :---: | :---: | :---: | :---: |
-| **Strict Baseline** (`strict_baseline`) | **73.96% ± 0.98%** | 15.69% | 94.03% | **66.00%** | 93.08% |
-| **Accepted Model: Fielded BM25 + Exact** (`final_model`) | **75.36% ± 1.17%** | **16.00%** | **94.42%** | **67.72%** | **93.76%** |
-
-*All benchmarks are 100% leakage-free, cross-validated across all 5 folds with fold-isolated memory, and tested against the exact official Codabench scorer.*
+*Zero external legal corpus, zero synthetic data augmentation, zero Task 2 data, zero external API calls.*
 
 ---
 
@@ -46,20 +41,22 @@ High-Recall Vietnamese Legal Information Retrieval Pipeline for UIT Data Science
 ```bash
 # 1. Install dependencies
 pip install -r requirements.txt
-pip install -r requirements-dev.txt
 
-# 2. Build Canonical Dataset v2 (from raw ZIP)
-python -m src.dataset.build_canonical --config configs/pipeline.yaml
+# 2. Build Canonical Dataset from raw contexts & train.json
+python scripts/01_build_dataset.py
 
-# 3. Build Micro BM25 Index
-python -m src.retrieval.build_indexes --config configs/pipeline.yaml --bm25
+# 3. Precompute BM25 & DEk21 Indexes on MPS
+python scripts/02_build_indexes.py
 
-# 4. Run Full Benchmark (5-fold + Doc-disjoint)
-python -m src.evaluation.benchmark --config configs/pipeline.yaml
+# 4. Run Dual-Validation Benchmark (5-Fold CV & Document-Disjoint)
+python scripts/03_run_benchmark.py
 
-# 5. Generate Submission for Public Official Test
-python -m src.pipeline.run_all --config configs/pipeline.yaml --offline
+# 5. Generate High-Score Submission on Public Test Queries
+python scripts/04_predict_submission.py
 
-# 6. Run Test Suite
+# 6. Verify Learned Parameters (<4.0B)
+python scripts/audit_parameters.py
+
+# 7. Run Full Test Suite
 pytest tests/ -v
 ```
