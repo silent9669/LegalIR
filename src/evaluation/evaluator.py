@@ -18,12 +18,9 @@ def _stringify_id(value: Any) -> str:
 def _normalize_ids(value: Any) -> list[str]:
     """Normalize a prediction or qrel value to an ordered list of IDs."""
     if isinstance(value, Mapping):
-        if "answer" in value:
-            return _normalize_ids(value["answer"])
-        if "doc_ids" in value:
-            return _normalize_ids(value["doc_ids"])
-        if "doc_id" in value:
-            return _normalize_ids(value["doc_id"])
+        for key in ("answer", "doc_ids", "doc_id", "document_id"):
+            if key in value:
+                return _normalize_ids(value[key])
         return []
     if isinstance(value, (str, bytes)):
         return [_stringify_id(value)]

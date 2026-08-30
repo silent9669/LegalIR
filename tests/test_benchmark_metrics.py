@@ -105,6 +105,14 @@ def test_candidate_recall_accepts_scalar_candidate_mapping():
     assert metrics == {"candidate_recall@1": 1.0}
 
 
+def test_candidate_recall_accepts_scalar_document_mapping():
+    assert compute_candidate_recall(
+        {"q1": {"document_id": "doc_1"}},
+        {"q1": ["doc_1"]},
+        k=1,
+    ) == 1.0
+
+
 def test_candidate_recall_accepts_scalar_candidate_string():
     assert compute_candidate_recall(
         {"q1": "doc_1"},
