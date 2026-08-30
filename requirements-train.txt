@@ -1,2 +1,0 @@
-peft>=0.7.0
-accelerate>=0.25.0

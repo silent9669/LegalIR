@@ -1,8 +1,0 @@
-reranker:
-  model_name: "BAAI/bge-reranker-v2-m3"
-  candidate_k: 50
-  max_length: 512
-  batch_size: 16
-  evidence:
-    format: "[VĂN BẢN] / [ĐIỀU KHOẢN] / [NỘI DUNG]"
-    max_chars: 1200

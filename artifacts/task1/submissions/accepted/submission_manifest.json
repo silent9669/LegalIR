@@ -1,0 +1,10 @@
+{
+  "run_id": "submission_task1_20260830",
+  "timestamp_utc": "20260830_183400",
+  "total_queries": 1000,
+  "submission_json_sha256": "fb638ba90e7facf8df8e277519d741265d9fd6fe7f44f801b5d9713a401184f4",
+  "submission_zip_sha256": "723d2ddba479c1c29ec9a95750292ffbd99897d914007d335729a02f34a9be76",
+  "compliance_verified": true,
+  "json_size_bytes": 117385,
+  "zip_size_bytes": 21613
+}

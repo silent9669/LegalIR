@@ -49,13 +49,16 @@ artifacts/local/
 *.npy
 
 # Raw BTC data
+artifacts/raw/
 artifacts/shared/raw/
 train.json
 public-official.json
 selected-contexts.zip
 selected-contexts/
 
-# Legacy local data, parquet, and pickle artifacts
+# Local data, parquet, indexes, and pickle artifacts
+artifacts/task1/indexes/
+artifacts/task1/checkpoints/
 data/task1_canonical/
 artifacts/data/
 artifacts/indexes/
@@ -64,5 +67,3 @@ indexes/
 *.pkl
 *.zip
 chunks_output.jsonl
-selected-contexts.zip
-selected-contexts/
