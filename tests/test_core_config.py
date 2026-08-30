@@ -26,3 +26,12 @@ def test_config_loads_defaults(tmp_path: Path):
     data = load_pipeline_config(cfg)
     assert data["seed"] == 42
     assert data["paths"]["canonical"] == "artifacts/shared/canonical/v2"
+
+
+def test_pipeline_config_dek21():
+    from src.core.config import load_pipeline_config
+    cfg = load_pipeline_config()
+    assert cfg.retrieval.dense_macro.model_name == "CODE4LIFEOFFICIAL/huydang-dek21-embedding-v2"
+    assert cfg.retrieval.dense_macro.dimension == 768
+    assert cfg.retrieval.dense_macro.use_pyvi is True
+    assert cfg.ranking.reranker.model_name == "BAAI/bge-reranker-v2-m3"

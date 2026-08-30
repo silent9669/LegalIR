@@ -43,8 +43,9 @@ retrieval:
     min_similarity: 0.82
     top_k: 5
   dense_macro:
-    model_name: "BAAI/bge-m3"
-    revision: "5617a9f61b028005a4858fdac845db406aefb181"
+    model_name: "CODE4LIFEOFFICIAL/huydang-dek21-embedding-v2"
+    dimension: 768
+    use_pyvi: true
     top_k: 50
     max_length: 512
   hybrid_union:
