@@ -8,6 +8,8 @@ import pandas as pd
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
+from src.retrieval.dense_macro import DenseMacroRetriever
+
 
 def normalize_text(text: str) -> str:
     if text is None or (isinstance(text, float) and pd.isna(text)):
@@ -161,7 +163,8 @@ class TrainQuestionMemory:
     ``dense_encoder`` is intentionally injectable.  Production callers can
     supply ``DenseMacroRetriever.encode_texts`` (the DEk21 v2 encoder), while
     tests and offline callers can provide a deterministic encoder or precomputed
-    embeddings without downloading a model.
+    embeddings without downloading a model.  Set ``use_dense=True`` to lazily
+    construct the default DEk21 retriever when no dense source is supplied.
     """
 
     DEFAULT_MODEL_NAME = "CODE4LIFEOFFICIAL/huydang-dek21-embedding-v2"
@@ -175,6 +178,10 @@ class TrainQuestionMemory:
         lexical_weight: float = 1.0,
         dense_weight: float = 1.0,
         model_name: str = DEFAULT_MODEL_NAME,
+        use_dense: bool = False,
+        dense_dimension: int = 768,
+        dense_use_pyvi: bool = True,
+        dense_device: str | None = None,
     ):
         if min_similarity < -1.0 or min_similarity > 1.0:
             raise ValueError("min_similarity must be between -1 and 1")
@@ -182,6 +189,8 @@ class TrainQuestionMemory:
             raise ValueError("dense_min_similarity must be between -1 and 1")
         if lexical_weight < 0.0 or dense_weight < 0.0:
             raise ValueError("signal weights must be non-negative")
+        if dense_dimension <= 0:
+            raise ValueError("dense_dimension must be positive")
 
         self.min_similarity = float(min_similarity)
         self.dense_min_similarity = float(
@@ -189,6 +198,10 @@ class TrainQuestionMemory:
         )
         self.dense_encoder = dense_encoder
         self.dense_embeddings_input = dense_embeddings
+        self.use_dense = bool(use_dense or dense_encoder is not None or dense_embeddings is not None)
+        self.dense_dimension = int(dense_dimension)
+        self.dense_use_pyvi = bool(dense_use_pyvi)
+        self.dense_device = dense_device
         self.lexical_weight = float(lexical_weight)
         self.dense_weight = float(dense_weight)
         self.model_name = str(model_name)
@@ -328,8 +341,18 @@ class TrainQuestionMemory:
         norms = np.linalg.norm(matrix, axis=1, keepdims=True)
         return np.divide(matrix, norms, out=np.zeros_like(matrix), where=norms > 0)
 
+    def _ensure_dense_encoder(self) -> Any | None:
+        if self.dense_encoder is None and self.use_dense:
+            self.dense_encoder = DenseMacroRetriever(
+                model_name=self.model_name,
+                dimension=self.dense_dimension,
+                use_pyvi=self.dense_use_pyvi,
+                device=self.dense_device,
+            )
+        return self.dense_encoder
+
     def _encode(self, texts: list[str]) -> np.ndarray:
-        encoder = self.dense_encoder
+        encoder = self._ensure_dense_encoder()
         if encoder is None:
             raise ValueError("a dense_encoder is required to encode question text")
         if callable(encoder):
@@ -393,10 +416,12 @@ class TrainQuestionMemory:
                 if qid in self.training_query_ids
             ]
             self.dense_embeddings = self._provided_embeddings(self.qids, record_embeddings)
-            if self.dense_embeddings is None and self.dense_encoder is not None:
-                self.dense_embeddings = self._encode(self.texts)
-                if len(self.dense_embeddings) != len(self.texts):
-                    raise ValueError("dense_encoder output length must match indexed questions")
+            if self.dense_embeddings is None and self.use_dense:
+                self._ensure_dense_encoder()
+                if self.dense_encoder is not None:
+                    self.dense_embeddings = self._encode(self.texts)
+                    if len(self.dense_embeddings) != len(self.texts):
+                        raise ValueError("dense_encoder output length must match indexed questions")
         return self
 
     @staticmethod
@@ -418,6 +443,8 @@ class TrainQuestionMemory:
         dense_sims: np.ndarray | None = None
         if self.dense_embeddings is not None:
             query_embedding = self._query_vector(q_emb) if q_emb is not None else None
+            if query_embedding is None and self.use_dense:
+                self._ensure_dense_encoder()
             if query_embedding is None and self.dense_encoder is not None:
                 query_embedding = self._encode([normalized_query])[0]
             if query_embedding is not None:

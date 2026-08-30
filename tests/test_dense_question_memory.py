@@ -74,3 +74,35 @@ def test_train_question_memory_dense_signal_accepts_precomputed_query_embedding(
     assert hits[0]["doc_id"] == "doc_100"
     assert hits[0]["dense_similarity"] == 1.0
     assert hits[0]["vote_count"] == 1
+
+
+def test_train_question_memory_use_dense_lazily_loads_dek21(monkeypatch):
+    import src.retrieval.question_memory as question_memory_module
+    from src.retrieval.question_memory import TrainQuestionMemory
+
+    class FakeDenseMacroRetriever:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def encode_texts(self, texts):
+            return np.array(
+                [[1.0, 0.0] if "đất" in text or "không" in text else [0.0, 1.0] for text in texts],
+                dtype=np.float32,
+            )
+
+    monkeypatch.setattr(question_memory_module, "DenseMacroRetriever", FakeDenseMacroRetriever)
+    memory = TrainQuestionMemory(
+        min_similarity=0.95,
+        dense_min_similarity=0.8,
+        use_dense=True,
+    )
+    memory.fit(
+        {"q1": "quy định về đất đai", "q2": "thủ tục kinh doanh"},
+        {"q1": ["doc_100"], "q2": ["doc_200"]},
+    )
+
+    assert memory.dense_embeddings is not None
+    assert memory.dense_encoder.kwargs["model_name"] == memory.DEFAULT_MODEL_NAME
+    hits = memory.search("không trùng từ", top_k=5)
+    assert hits[0]["doc_id"] == "doc_100"
+    assert hits[0]["dense_similarity"] == 1.0
