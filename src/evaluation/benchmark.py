@@ -12,7 +12,13 @@ from src.core.config import load_pipeline_config
 from src.core.paths import ProjectPaths
 from src.dataset.validator import validate_canonical_dataset
 from src.evaluation.codabench_compat import assert_official_equivalence
-from src.evaluation.evaluator import compute_candidate_cutoffs, evaluate_predictions
+from src.evaluation.evaluator import (
+    DEFAULT_CANDIDATE_CUTOFFS,
+    FINAL_RANKING_METRICS,
+    compute_candidate_cutoffs,
+    evaluate_predictions,
+    normalize_candidate_cutoffs,
+)
 from src.retrieval.bm25_micro import BM25MicroRetriever
 from src.retrieval.exact_matcher import ExactMatcher
 from src.retrieval.hybrid_search import HybridSearchEngine
@@ -26,15 +32,54 @@ def build_memory_rows(
     queries_dict: dict[str, str],
     qrels_dict: dict[str, list[str]],
 ) -> list[dict[str, Any]]:
+    query_lookup = {str(qid): question for qid, question in queries_dict.items()}
+    qrel_lookup = {
+        str(qid): [str(doc_id) for doc_id in doc_ids]
+        for qid, doc_ids in qrels_dict.items()
+    }
     rows = []
     for qid in sorted(map(str, train_query_ids)):
-        if qid in queries_dict and qid in qrels_dict:
+        if qid in query_lookup and qid in qrel_lookup:
             rows.append({
                 "query_id": qid,
-                "question_norm": queries_dict[qid],
-                "doc_ids": qrels_dict[qid],
+                "question_norm": query_lookup[qid],
+                "doc_ids": qrel_lookup[qid],
             })
     return rows
+
+
+def _candidate_doc_id(candidate: Any) -> str | None:
+    if isinstance(candidate, dict):
+        candidate = candidate.get("doc_id", candidate.get("document_id"))
+    elif isinstance(candidate, (tuple, list)):
+        candidate = candidate[0] if candidate else None
+    if candidate is None:
+        return None
+    return str(candidate)
+
+
+def _build_isolated_memory(
+    train_query_ids: list[str],
+    validation_query_ids: list[str],
+    queries_dict: dict[str, str],
+    qrels_dict: dict[str, list[str]],
+    min_similarity: float = 0.82,
+) -> QuestionMemory:
+    """Build and verify memory from training-fold questions only."""
+    memory_rows = build_memory_rows(train_query_ids, queries_dict, qrels_dict)
+    memory = QuestionMemory(memory_rows, min_similarity=min_similarity)
+    train_ids = {str(qid) for qid in train_query_ids}
+    validation_ids = {str(qid) for qid in validation_query_ids}
+
+    if not memory.training_query_ids.issubset(train_ids):
+        leaked_ids = sorted(memory.training_query_ids - train_ids)
+        raise AssertionError(f"Question memory contains non-training query IDs: {leaked_ids}")
+    leaked_validation_ids = sorted(memory.training_query_ids & validation_ids)
+    if leaked_validation_ids:
+        raise AssertionError(
+            f"Question memory contains validation query IDs: {leaked_validation_ids}"
+        )
+    return memory
 
 
 def run_split_eval(
@@ -45,8 +90,9 @@ def run_split_eval(
     hybrid_engine: HybridSearchEngine,
     fuser: ReciprocalRankFusion,
     selector: TopKSelector,
-    candidate_cutoffs: list[int] = [20, 50, 100, 150],
+    candidate_cutoffs: list[int] | None = None,
 ) -> tuple[dict[str, Any], dict[str, list[str]], dict[str, list[str]]]:
+    candidate_cutoffs = normalize_candidate_cutoffs(candidate_cutoffs)
     val_predictions = {}
     val_candidates = {}
     val_ground_truth = {}
@@ -62,7 +108,11 @@ def run_split_eval(
             exclude_qid=qid_str,
             top_k=max(candidate_cutoffs),
         )
-        val_candidates[qid_str] = [c["doc_id"] for c in cands]
+        val_candidates[qid_str] = [
+            doc_id
+            for doc_id in (_candidate_doc_id(candidate) for candidate in cands)
+            if doc_id is not None
+        ]
 
         ranked = fuser.rank_candidates(cands)
         top5 = selector.select(ranked)
@@ -76,6 +126,62 @@ def run_split_eval(
     assert_official_equivalence(val_predictions, val_ground_truth)
 
     return metrics, val_predictions, val_candidates
+
+
+def _metric_value(metrics: dict[str, Any], key: str) -> float:
+    aliases = {
+        "recall_at_1": ("recall_at_1", "recall@1", "Recall@1"),
+        "recall_at_3": ("recall_at_3", "recall@3", "Recall@3"),
+        "recall_at_5": ("recall_at_5", "recall@5", "Recall@5"),
+        "precision_at_5": ("precision_at_5", "precision@5", "Precision@5"),
+    }
+    for alias in aliases[key]:
+        if alias in metrics:
+            return float(metrics[alias])
+    return 0.0
+
+
+def aggregate_fold_metrics(
+    fold_metrics: list[dict[str, Any]],
+    candidate_cutoffs: list[int] | None = None,
+) -> dict[str, Any]:
+    """Aggregate candidate and final ranking metrics across validation folds."""
+    if not fold_metrics:
+        raise ValueError("at least one fold metric report is required")
+
+    normalized_cutoffs = normalize_candidate_cutoffs(candidate_cutoffs)
+    values = {
+        key: [_metric_value(metrics, key) for metrics in fold_metrics]
+        for key in FINAL_RANKING_METRICS
+    }
+    means = {key: float(np.mean(scores)) for key, scores in values.items()}
+    candidate_recalls = {
+        f"candidate_recall@{cutoff}": float(
+            np.mean([
+                float(metrics.get(f"candidate_recall@{cutoff}", 0.0))
+                for metrics in fold_metrics
+            ])
+        )
+        for cutoff in normalized_cutoffs
+    }
+    final_ranking_metrics = {
+        "Recall@1": means["recall_at_1"],
+        "Recall@3": means["recall_at_3"],
+        "Recall@5": means["recall_at_5"],
+        "Precision@5": means["precision_at_5"],
+    }
+
+    return {
+        "mean_recall_at_1": means["recall_at_1"],
+        "mean_recall_at_3": means["recall_at_3"],
+        "mean_recall_at_5": means["recall_at_5"],
+        "std_recall_at_5": float(np.std(values["recall_at_5"])),
+        "mean_precision_at_5": means["precision_at_5"],
+        "candidate_recalls": candidate_recalls,
+        **candidate_recalls,
+        "final_ranking_metrics": final_ranking_metrics,
+        **final_ranking_metrics,
+    }
 
 
 def run_benchmark(
@@ -103,7 +209,10 @@ def run_benchmark(
     qrels_df = pd.read_parquet(canonical_dir / "qrels_train.parquet")
 
     queries_dict = dict(zip(queries_df["query_id"].astype(str), queries_df["question_norm"]))
-    qrels_dict = qrels_df.groupby("query_id")["doc_id"].apply(lambda s: [str(x) for x in s]).to_dict()
+    qrels_dict = {
+        str(qid): [str(doc_id) for doc_id in doc_ids]
+        for qid, doc_ids in qrels_df.groupby("query_id")["doc_id"].apply(list).to_dict().items()
+    }
 
     splits_dir = canonical_dir / "splits"
     random_5fold = json.loads((splits_dir / "random_5fold.json").read_text(encoding="utf-8"))
@@ -129,8 +238,13 @@ def run_benchmark(
     fuser = ReciprocalRankFusion()
     selector = TopKSelector(max_k=5)
 
-    candidate_cutoffs = cfg.get("evaluation", {}).get("candidate_cutoffs", [20, 50, 100, 150])
+    configured_cutoffs = cfg.get("evaluation", {}).get("candidate_cutoffs")
+    candidate_cutoffs = normalize_candidate_cutoffs(
+        configured_cutoffs if configured_cutoffs is not None else DEFAULT_CANDIDATE_CUTOFFS
+    )
     num_folds_to_run = fold_limit if fold_limit is not None else len(random_5fold)
+    if not 1 <= num_folds_to_run <= len(random_5fold):
+        raise ValueError(f"fold_limit must be between 1 and {len(random_5fold)}")
 
     print(f"\n=======================================================")
     print(f"Running LegalIR Benchmark ({label}) — {num_folds_to_run}/5 folds")
@@ -145,13 +259,14 @@ def run_benchmark(
         train_qids = [str(x) for x in fold_data.get("train_query_ids", fold_data.get("train", []))]
         val_qids = [str(x) for x in fold_data.get("val_query_ids", fold_data.get("val", []))]
 
-        # Strict fold isolation: Build memory ONLY from fold's training queries
-        memory_rows = build_memory_rows(train_qids, queries_dict, qrels_dict)
-        memory = QuestionMemory(memory_rows, min_similarity=0.82)
-
-        # Leakage guard assertion
-        assert memory.training_query_ids == frozenset(train_qids), f"Fold {fold_idx} memory contains leaked query IDs!"
-        assert set(val_qids).isdisjoint(memory.training_query_ids), f"Fold {fold_idx} validation queries leaked into memory!"
+        # Strict fold isolation: Build memory ONLY from fold's training queries.
+        memory = _build_isolated_memory(
+            train_qids,
+            val_qids,
+            queries_dict,
+            qrels_dict,
+            min_similarity=0.82,
+        )
 
         hybrid_engine = HybridSearchEngine(
             bm25_retriever=bm25,
@@ -177,26 +292,25 @@ def run_benchmark(
 
         print(f"Fold {fold_idx + 1}: Recall@5={metrics['recall_at_5']:.4f} | Prec@5={metrics['precision_at_5']:.4f} | CandRec@50={metrics.get('candidate_recall@50', 0):.4f}")
 
-    # Aggregate 5-fold metrics
-    mean_rec_5 = float(np.mean([m["recall_at_5"] for m in fold_metrics_list]))
-    std_rec_5 = float(np.std([m["recall_at_5"] for m in fold_metrics_list]))
-    mean_prec_5 = float(np.mean([m["precision_at_5"] for m in fold_metrics_list]))
-    mean_r1 = float(np.mean([m["recall_at_1"] for m in fold_metrics_list]))
-    mean_r3 = float(np.mean([m["recall_at_3"] for m in fold_metrics_list]))
-
-    cand_rec_means = {
-        f"candidate_recall@{k}": float(np.mean([m.get(f"candidate_recall@{k}", 0.0) for m in fold_metrics_list]))
-        for k in candidate_cutoffs
-    }
+    # Aggregate all candidate and final ranking metrics across folds.
+    random_5fold_summary = aggregate_fold_metrics(fold_metrics_list, candidate_cutoffs)
+    mean_rec_5 = random_5fold_summary["mean_recall_at_5"]
+    std_rec_5 = random_5fold_summary["std_recall_at_5"]
+    mean_prec_5 = random_5fold_summary["mean_precision_at_5"]
+    cand_rec_means = random_5fold_summary["candidate_recalls"]
 
     # Run document-disjoint evaluation
     print("\nRunning Document-Disjoint Generalization Evaluation...")
     disjoint_train_qids = [str(x) for x in doc_disjoint.get("train_query_ids", doc_disjoint.get("train", []))]
     disjoint_val_qids = [str(x) for x in doc_disjoint.get("val_query_ids", doc_disjoint.get("val", []))]
 
-    disjoint_memory_rows = build_memory_rows(disjoint_train_qids, queries_dict, qrels_dict)
-    disjoint_memory = QuestionMemory(disjoint_memory_rows, min_similarity=0.82)
-    assert set(disjoint_val_qids).isdisjoint(disjoint_memory.training_query_ids)
+    disjoint_memory = _build_isolated_memory(
+        disjoint_train_qids,
+        disjoint_val_qids,
+        queries_dict,
+        qrels_dict,
+        min_similarity=0.82,
+    )
 
     disjoint_engine = HybridSearchEngine(
         bm25_retriever=bm25,
@@ -215,6 +329,11 @@ def run_benchmark(
         selector=selector,
         candidate_cutoffs=candidate_cutoffs,
     )
+    doc_disjoint_summary = aggregate_fold_metrics([doc_disjoint_metrics], candidate_cutoffs)
+    doc_disjoint_metrics.update({
+        "candidate_recalls": doc_disjoint_summary["candidate_recalls"],
+        "final_ranking_metrics": doc_disjoint_summary["final_ranking_metrics"],
+    })
 
     print(f"Doc-Disjoint: Recall@5={doc_disjoint_metrics['recall_at_5']:.4f} | Prec@5={doc_disjoint_metrics['precision_at_5']:.4f} | CandRec@50={doc_disjoint_metrics.get('candidate_recall@50', 0):.4f}")
 
@@ -232,12 +351,7 @@ def run_benchmark(
         "candidate_cutoffs": candidate_cutoffs,
         "random_5fold": {
             "num_folds_run": num_folds_to_run,
-            "mean_recall_at_5": mean_rec_5,
-            "std_recall_at_5": std_rec_5,
-            "mean_precision_at_5": mean_prec_5,
-            "mean_recall_at_1": mean_r1,
-            "mean_recall_at_3": mean_r3,
-            "candidate_recalls": cand_rec_means,
+            **random_5fold_summary,
             "folds": fold_metrics_list,
         },
         "document_disjoint": doc_disjoint_metrics,
