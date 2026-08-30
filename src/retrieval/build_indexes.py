@@ -46,9 +46,11 @@ def build_bm25_index(
 def build_dense_index(
     canonical_dir: str | Path = "artifacts/shared/canonical/v2",
     output_dir: str | Path = "artifacts/local/indexes/dense",
-    model_name_or_path: str = "BAAI/bge-m3",
+    model_name_or_path: str = "CODE4LIFEOFFICIAL/huydang-dek21-embedding-v2",
     batch_size: int = 32,
     max_length: int = 512,
+    dimension: int = 768,
+    use_pyvi: bool = True,
 ):
     canonical_dir = Path(canonical_dir)
     output_dir = Path(output_dir)
@@ -66,7 +68,9 @@ def build_dense_index(
     DenseMacroRetriever.build(
         chunks=macro_chunks,
         output_dir=output_dir,
-        model_name_or_path=model_name_or_path,
+        model_name=model_name_or_path,
+        dimension=dimension,
+        use_pyvi=use_pyvi,
         batch_size=batch_size,
         max_length=max_length,
     )
@@ -96,11 +100,11 @@ def main():
         dense_out = paths.local_indexes / "dense"
         # Find cached model path if available
         hf_manifest_path = paths.local_models / "huggingface" / "manifest.json"
-        model_path = "BAAI/bge-m3"
+        model_path = "CODE4LIFEOFFICIAL/huydang-dek21-embedding-v2"
         if hf_manifest_path.exists():
             hf_data = json.loads(hf_manifest_path.read_text(encoding="utf-8"))
-            if "BAAI/bge-m3" in hf_data:
-                model_path = hf_data["BAAI/bge-m3"]["path"]
+            if "CODE4LIFEOFFICIAL/huydang-dek21-embedding-v2" in hf_data:
+                model_path = hf_data["CODE4LIFEOFFICIAL/huydang-dek21-embedding-v2"]["path"]
 
         build_dense_index(
             canonical_dir=canonical_dir,
