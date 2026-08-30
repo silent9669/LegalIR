@@ -1,9 +1,16 @@
 import re
+import pandas as pd
 from src.common.bm25 import BM25Retriever
 from src.common.dense_dek21 import DEk21Retriever
 from src.common.rrf import reciprocal_rank_fusion
 from src.task1.memory import QuestionMemory
 from src.common.normalize import extract_legal_signals
+
+def clean_str(val) -> str:
+    if val is None or pd.isna(val):
+        return ""
+    s = str(val).strip()
+    return "" if s.lower() in ("nan", "none", "null") else s
 
 class LegalMatcher:
     def __init__(self, doc_index: dict = None):
@@ -12,9 +19,18 @@ class LegalMatcher:
     def search(self, query: str, top_k: int = 10) -> list[dict]:
         signals = extract_legal_signals(query)
         hits = []
-        for d in signals.get("doc_numbers", []):
+        doc_numbers = signals.get("doc_numbers", [])
+        if not doc_numbers:
+            return []
+
+        for d in doc_numbers:
             for doc_id, doc in self.doc_index.items():
-                if d in doc.get("legal_number", "") or d in doc.get("name_raw", ""):
+                if not isinstance(doc, dict):
+                    continue
+                legal_num = clean_str(doc.get("legal_number"))
+                name_raw = clean_str(doc.get("name_raw"))
+                title = clean_str(doc.get("title"))
+                if (legal_num and d in legal_num) or (name_raw and d in name_raw) or (title and d in title):
                     hits.append({
                         "doc_id": str(doc_id),
                         "score": 100.0,
