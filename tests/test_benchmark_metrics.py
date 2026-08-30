@@ -342,3 +342,75 @@ def test_run_split_eval_reports_candidate_and_final_metrics():
     assert metrics["Precision@5"] == 0.5
     assert predictions == {"q1": ["doc_x", "doc_1"]}
     assert candidates == {"q1": ["doc_x", "doc_1"]}
+
+
+def test_isolated_memory_uses_train_memory_fit_without_validation_qrels(monkeypatch):
+    calls = {}
+
+    class FakeTrainMemory:
+        def __init__(self, **kwargs):
+            calls["init"] = kwargs
+            self.training_query_ids = frozenset()
+
+        def fit(self, train_queries, qrels):
+            calls["fit"] = (train_queries, qrels)
+            self.training_query_ids = frozenset(row["query_id"] for row in train_queries)
+            return self
+
+    monkeypatch.setattr(benchmark, "TrainQuestionMemory", FakeTrainMemory)
+
+    memory = benchmark._build_isolated_memory(
+        train_query_ids=["train"],
+        validation_query_ids=["val"],
+        queries_dict={"train": "train question", "val": "validation question"},
+        qrels_dict={"train": ["doc-train"], "val": ["doc-val"]},
+    )
+
+    assert memory.training_query_ids == frozenset({"train"})
+    fit_queries, fit_qrels = calls["fit"]
+    assert [row["query_id"] for row in fit_queries] == ["train"]
+    assert fit_qrels == {"train": ["doc-train"]}
+
+
+def test_run_split_eval_applies_optional_reranker_before_fusion():
+    class StubEngine:
+        def search_candidates(self, query, exclude_qid=None, top_k=100):
+            return [{"doc_id": "doc_x"}, {"doc_id": "doc_1"}]
+
+    class StubReranker:
+        def __init__(self):
+            self.calls = []
+
+        def rerank(self, **kwargs):
+            self.calls.append(kwargs)
+            return [{"doc_id": "doc_1", "reranker_score": 3.0}]
+
+    class StubFuser:
+        def rank_candidates(self, candidates):
+            return candidates
+
+    class StubSelector:
+        def select(self, ranked):
+            return [candidate["doc_id"] for candidate in ranked]
+
+    reranker = StubReranker()
+    _, predictions, candidates = run_split_eval(
+        split_name="test",
+        val_query_ids=["q1"],
+        queries_dict={"q1": "question"},
+        qrels_dict={"q1": ["doc_1"]},
+        hybrid_engine=StubEngine(),
+        fuser=StubFuser(),
+        selector=StubSelector(),
+        reranker=reranker,
+        evidence_builder=object(),
+        rerank_k=1,
+        rerank_batch_size=2,
+        rerank_max_length=128,
+    )
+
+    assert candidates == {"q1": ["doc_x", "doc_1"]}
+    assert predictions == {"q1": ["doc_1"]}
+    assert reranker.calls[0]["top_k"] == 1
+    assert reranker.calls[0]["batch_size"] == 2
+    assert reranker.calls[0]["max_length"] == 128

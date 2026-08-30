@@ -44,3 +44,22 @@ def test_pipeline_predict_end_to_end(tmp_path: Path):
     assert 1 <= len(preds["q1"]["answer"]) <= 5
     assert preds["q1"]["answer"][0] == "1"
     assert preds["q2"]["answer"][0] == "2"
+
+
+def test_pipeline_fallback_uses_valid_documents_when_defaults_are_unavailable():
+    class EmptyEngine:
+        def search_candidates(self, query, exclude_qid=None, top_k=150):
+            return []
+
+    pipeline = LegalIRPipeline(
+        hybrid_engine=EmptyEngine(),
+        evidence_builder=EvidencePackBuilder(macro_chunks=[]),
+        selector=TopKSelector(max_k=5, min_k=1),
+        fallback_doc_ids=["2113", "58389", "84570"],
+        valid_doc_ids={"doc-b", "doc-a"},
+    )
+
+    answer = pipeline.predict_one("q1", "a question with no retrieval hits")
+
+    assert answer == ["doc-a", "doc-b"]
+    assert 1 <= len(answer) <= 5

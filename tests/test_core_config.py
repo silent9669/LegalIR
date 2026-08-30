@@ -35,3 +35,19 @@ def test_pipeline_config_dek21():
     assert cfg.retrieval.dense_macro.dimension == 768
     assert cfg.retrieval.dense_macro.use_pyvi is True
     assert cfg.ranking.reranker.model_name == "BAAI/bge-reranker-v2-m3"
+
+
+def test_pipeline_config_to_dict_is_safe_yaml_serializable():
+    import yaml
+
+    from src.core.config import PipelineConfig
+
+    cfg = PipelineConfig({
+        "nested": PipelineConfig({"value": 1}),
+        "items": [PipelineConfig({"name": "item"})],
+    })
+
+    plain = cfg.to_dict()
+
+    assert plain == {"nested": {"value": 1}, "items": [{"name": "item"}]}
+    assert yaml.safe_load(yaml.safe_dump(plain)) == plain

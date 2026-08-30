@@ -71,3 +71,77 @@ def test_reranker_resolves_manifest_model_path_for_offline_inference(tmp_path):
 
     assert reranker.model_path == model_dir
     assert reranker.local_files_only is True
+
+
+def test_run_all_reranker_forwards_manifest_and_offline_mode(tmp_path, monkeypatch):
+    import importlib
+    from types import SimpleNamespace
+
+    run_all_module = importlib.import_module("src.pipeline.run_all")
+    captured = {}
+
+    class StubReranker:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(run_all_module, "CrossEncoderReranker", StubReranker)
+    paths = SimpleNamespace(local_models=tmp_path / "models")
+
+    run_all_module._build_reranker(paths, offline=True)
+
+    assert captured["model_name"] == "BAAI/bge-reranker-v2-m3"
+    assert captured["manifest_path"] == paths.local_models / "huggingface" / "manifest.json"
+    assert captured["local_files_only"] is True
+
+
+def test_run_all_builds_missing_dek21_dense_index(tmp_path, monkeypatch):
+    import importlib
+    from types import SimpleNamespace
+
+    run_all_module = importlib.import_module("src.pipeline.run_all")
+    calls = {}
+
+    class StubDense:
+        @classmethod
+        def build(cls, **kwargs):
+            calls["build"] = kwargs
+            output_dir = kwargs["output_dir"]
+            output_dir.mkdir(parents=True, exist_ok=True)
+            (output_dir / "embeddings.npy").touch()
+            (output_dir / "chunks_meta.parquet").touch()
+
+        @classmethod
+        def load(cls, **kwargs):
+            calls["load"] = kwargs
+            return cls()
+
+    monkeypatch.setattr(run_all_module, "DenseMacroRetriever", StubDense)
+    paths = SimpleNamespace(
+        local_indexes=tmp_path / "indexes",
+        local_models=tmp_path / "models",
+    )
+    chunks = [{"doc_id": "doc-1", "chunk_id": "chunk-1", "text_norm": "text"}]
+
+    result = run_all_module._load_dense_branch(
+        paths,
+        {"model_name": "CODE4LIFEOFFICIAL/huydang-dek21-embedding-v2"},
+        offline=False,
+        chunks=chunks,
+    )
+
+    assert isinstance(result, StubDense)
+    assert calls["build"]["chunks"] == chunks
+    assert calls["build"]["model_name"] == "CODE4LIFEOFFICIAL/huydang-dek21-embedding-v2"
+    assert calls["load"]["model_name"] == "CODE4LIFEOFFICIAL/huydang-dek21-embedding-v2"
+
+
+def test_run_all_reranker_default_follows_configured_enabled_flag():
+    import importlib
+
+    run_all_module = importlib.import_module("src.pipeline.run_all")
+
+    assert run_all_module._resolve_use_reranker({"ranking": {"reranker": {"enabled": True}}}, None)
+    assert not run_all_module._resolve_use_reranker(
+        {"ranking": {"reranker": {"enabled": True}}}, False
+    )
+    assert run_all_module._resolve_use_reranker({}, None)

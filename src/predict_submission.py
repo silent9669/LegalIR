@@ -11,7 +11,7 @@ def main():
     parser.add_argument("--output_zip", type=str, default=None)
     parser.add_argument("--canonical_dir", type=str, default=None)
     parser.add_argument("--bm25_index", type=str, default=None)
-    parser.add_argument("--reranker", action="store_true", default=False)
+    parser.add_argument("--reranker", action="store_true", default=None)
     parser.add_argument("--fusion", type=str, default="rrf")
     args = parser.parse_args()
 

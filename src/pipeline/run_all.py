@@ -47,28 +47,59 @@ def _local_model_path(paths: ProjectPaths, model_name: str) -> str | None:
     if not isinstance(model_info, dict):
         return None
     model_path = model_info.get("path")
-    if model_path and Path(model_path).exists():
-        return str(model_path)
-    return None
+    if not model_path:
+        return None
+    path = Path(model_path).expanduser()
+    if not path.is_absolute():
+        path = manifest_path.parent / path
+    return str(path) if path.exists() else None
 
 
 def _load_dense_branch(
     paths: ProjectPaths,
     dense_cfg: dict[str, Any],
     offline: bool,
+    chunks: Any | None = None,
 ) -> DenseMacroRetriever | None:
-    """Load a precomputed dense branch without downloading or building it."""
+    """Build or load the configured DEk21 macro-chunk index."""
     index_dir = paths.local_indexes / "dense"
     required_files = (index_dir / "embeddings.npy", index_dir / "chunks_meta.parquet")
-    if not all(path.exists() for path in required_files):
-        print("Dense branch index unavailable; continuing with the remaining branches.")
-        return None
-
     model_name = str(
         dense_cfg.get("model_name", "CODE4LIFEOFFICIAL/huydang-dek21-embedding-v2")
     )
     configured_use_pyvi = bool(dense_cfg.get("use_pyvi", True))
     model_name_or_path = _local_model_path(paths, model_name)
+
+    if not all(path.exists() for path in required_files):
+        if chunks is None:
+            print("Dense branch index unavailable; continuing with the remaining branches.")
+            return None
+        if offline and model_name_or_path is None:
+            print(
+                f"Dense branch index unavailable and {model_name} is not cached; "
+                "skipping it in offline mode."
+            )
+            return None
+        try:
+            print(f"Building DEk21 dense index at {index_dir}...")
+            DenseMacroRetriever.build(
+                chunks=chunks,
+                output_dir=index_dir,
+                model_name=model_name_or_path or model_name,
+                batch_size=int(dense_cfg.get("batch_size", 32)),
+                max_length=int(dense_cfg.get("max_length", 512)),
+                dimension=int(dense_cfg.get("dimension", 768)),
+                use_pyvi=configured_use_pyvi,
+            )
+        except (OSError, ValueError, ImportError) as exc:
+            if offline:
+                print(f"Unable to build dense branch in offline mode: {exc}")
+                return None
+            raise
+        if not all(path.exists() for path in required_files):
+            print("Dense branch build did not produce a complete index; skipping it.")
+            return None
+
     if offline and model_name_or_path is None:
         print(
             f"Dense branch index found, but {model_name} is not cached; "
@@ -150,10 +181,26 @@ def _build_offline_dense_fallback(
     )
 
 
-def _build_reranker(paths: ProjectPaths) -> CrossEncoderReranker:
-    model_name = "BAAI/bge-reranker-v2-m3"
+def _build_reranker(
+    paths: ProjectPaths,
+    offline: bool = True,
+    model_name: str = "BAAI/bge-reranker-v2-m3",
+) -> CrossEncoderReranker:
+    manifest_path = paths.local_models / "huggingface" / "manifest.json"
     local_model_path = _local_model_path(paths, model_name)
-    return CrossEncoderReranker(model_name=local_model_path or model_name)
+    return CrossEncoderReranker(
+        model_name=local_model_path or model_name,
+        manifest_path=manifest_path,
+        local_files_only=offline,
+    )
+
+
+def _resolve_use_reranker(cfg: dict[str, Any], requested: bool | None) -> bool:
+    if requested is not None:
+        return bool(requested)
+    ranking_cfg = cfg.get("ranking", {})
+    reranker_cfg = ranking_cfg.get("reranker", {})
+    return bool(reranker_cfg.get("enabled", True))
 
 
 def run_all(
@@ -161,13 +208,14 @@ def run_all(
     input_file: str | Path | None = None,
     output_dir: str | Path | None = None,
     offline: bool = True,
-    use_reranker: bool = False,
+    use_reranker: bool | None = None,
     use_fusion: str = "rrf",
 ) -> Path:
     """Run LegalIR retrieval and write a Codabench-compatible submission."""
     paths = ProjectPaths.from_repo()
     config_file = _repo_path(paths, config_path)
     cfg = load_pipeline_config(config_file)
+    use_reranker = _resolve_use_reranker(cfg, use_reranker)
 
     canonical_dir = _repo_path(
         paths,
@@ -247,10 +295,13 @@ def run_all(
         min_similarity=float(memory_cfg.get("min_similarity", 0.82)),
     )
 
+    dense_cfg = retrieval_cfg.get("dense_macro", {})
+    macro_chunks_df = chunks_df[chunks_df["granularity"] == "macro"]
     dense = _load_dense_branch(
         paths,
-        retrieval_cfg.get("dense_macro", {}),
+        dense_cfg,
         offline=offline,
+        chunks=macro_chunks_df,
     )
     dense_mode = "index"
     if dense is None:
@@ -275,9 +326,7 @@ def run_all(
     print(f"Active retrieval branches: {', '.join(active_branches)}")
 
     evidence_cfg = cfg.get("ranking", {}).get("evidence", {})
-    macro_chunks = chunks_df[
-        chunks_df["granularity"] == "macro"
-    ].to_dict(orient="records")
+    macro_chunks = macro_chunks_df.to_dict(orient="records")
     evidence_builder = EvidencePackBuilder(
         macro_chunks=macro_chunks,
         doc_metadata=docs_dict,
@@ -285,7 +334,16 @@ def run_all(
         max_chars=int(evidence_cfg.get("max_chars", 1200)),
     )
 
-    reranker = _build_reranker(paths) if use_reranker else None
+    reranker_cfg = cfg.get("ranking", {}).get("reranker", {})
+    reranker = (
+        _build_reranker(
+            paths,
+            offline=offline,
+            model_name=str(reranker_cfg.get("model_name", "BAAI/bge-reranker-v2-m3")),
+        )
+        if use_reranker
+        else None
+    )
     fusion_cfg = cfg.get("ranking", {}).get("fusion", {})
     rrf_k = int(fusion_cfg.get("rrf_k", 60))
     if use_fusion == "rrf":
@@ -390,8 +448,9 @@ def run_all(
     (run_dir / "manifest.json").write_text(
         json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
     )
+    config_snapshot = cfg.to_dict() if hasattr(cfg, "to_dict") else dict(cfg)
     (run_dir / "config.snapshot.yaml").write_text(
-        yaml.dump(cfg, sort_keys=False), encoding="utf-8"
+        yaml.safe_dump(config_snapshot, sort_keys=False), encoding="utf-8"
     )
 
     print(f"Successfully packaged {zip_path} ({zip_path.stat().st_size} bytes)")
@@ -404,7 +463,7 @@ def main() -> None:
     parser.add_argument("--input", type=str, default=None)
     parser.add_argument("--output-dir", type=str, default=None)
     parser.add_argument("--offline", action="store_true", default=True)
-    parser.add_argument("--reranker", action="store_true", default=False)
+    parser.add_argument("--reranker", action="store_true", default=None)
     parser.add_argument("--fusion", type=str, default="rrf")
     args = parser.parse_args()
 

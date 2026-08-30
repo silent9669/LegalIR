@@ -41,11 +41,13 @@ class LegalIRPipeline:
         configured_fallbacks = fallback_doc_ids or ["2113", "58389", "84570"]
         self.fallback_doc_ids = self._unique_ids(configured_fallbacks)
         if self.valid_doc_ids is not None:
-            self.fallback_doc_ids = [
+            valid_fallbacks = [
                 doc_id
                 for doc_id in self.fallback_doc_ids
                 if doc_id in self.valid_doc_ids
             ]
+            valid_fallbacks.extend(sorted(self.valid_doc_ids))
+            self.fallback_doc_ids = self._unique_ids(valid_fallbacks)
 
     @staticmethod
     def _unique_ids(doc_ids: Iterable[Any]) -> list[str]:

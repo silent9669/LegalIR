@@ -12,6 +12,20 @@ class PipelineConfig(dict[str, Any]):
         except KeyError as exc:
             raise AttributeError(name) from exc
 
+    def to_dict(self) -> dict[str, Any]:
+        """Return a plain-Python representation safe for YAML serialization."""
+        return _to_plain(self)
+
+
+def _to_plain(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: _to_plain(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_to_plain(item) for item in value]
+    if isinstance(value, tuple):
+        return [_to_plain(item) for item in value]
+    return value
+
 
 def _wrap_config(value: Any) -> Any:
     if isinstance(value, dict):
