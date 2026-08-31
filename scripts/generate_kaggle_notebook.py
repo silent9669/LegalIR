@@ -117,7 +117,7 @@ def build_legalir_notebook() -> dict:
             "    Path(\"/kaggle/working\"),\n",
             "]\n",
             "\n",
-            "EXPECTED_COMMIT = os.environ.get(\"LEGALIR_COMMIT_SHA\", \"main\")\n",
+            "EXPECTED_COMMIT = os.environ.get(\"LEGALIR_COMMIT_SHA\", \"98e3d17bba42116375b7601d816960f641ee43d6\")\n",
             "REPO_ROOT = None\n",
             "for p in possible_repo_paths:\n",
             "    if (p / \"src\" / \"pipeline\").exists():\n",
