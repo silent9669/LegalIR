@@ -1,6 +1,7 @@
 """Deterministic statutory extraction and exact legal matching."""
 
 from collections import defaultdict
+from pathlib import Path
 import re
 from typing import Any, Mapping
 import unicodedata
@@ -30,6 +31,17 @@ def normalize_text(text: Any) -> str:
     return text.strip().lower()
 
 
+def fold_accent_ascii(text: Any) -> str:
+    """Fold Vietnamese accents to ASCII and normalize separators for slug/title matching."""
+    if text is None or (isinstance(text, float) and pd.isna(text)):
+        return ""
+    nfkd = unicodedata.normalize("NFKD", str(text))
+    ascii_text = "".join(c for c in nfkd if not unicodedata.combining(c))
+    ascii_text = ascii_text.replace("đ", "d").replace("Đ", "d")
+    ascii_text = re.sub(r"[ \t\-_/]+", " ", ascii_text)
+    return ascii_text.strip().lower()
+
+
 def _get_tokens(text: str) -> set[str]:
     if not text:
         return set()
@@ -44,9 +56,11 @@ class ExactMatcher:
         self,
         documents: list[dict[str, Any]] | dict[str, dict[str, Any]] | None = None,
         doc_index: dict[str, Any] | None = None,
+        chunks: list[dict[str, Any]] | pd.DataFrame | str | Path | None = None,
     ):
         self.doc_by_num: dict[str, list[str]] = defaultdict(list)
         self.doc_by_title: dict[str, list[str]] = defaultdict(list)
+        self.doc_by_title_ascii: dict[str, list[str]] = defaultdict(list)
         self.doc_metadata: dict[str, dict[str, Any]] = {}
         self.doc_articles: dict[str, set[str]] = defaultdict(set)
         self.doc_clauses: dict[str, set[str]] = defaultdict(set)
@@ -84,10 +98,11 @@ class ExactMatcher:
                     if clean_num and clean_num != norm_num:
                         self.doc_by_num[clean_num].append(doc_id)
 
-            # Index title safely
-            title = d.get("title")
+            # Index title safely (both accented and ASCII folded)
+            title = d.get("title") or d.get("name_raw")
             if title is not None and not (isinstance(title, float) and pd.isna(title)):
                 norm_title = normalize_text(title)
+                ascii_title = fold_accent_ascii(title)
                 if norm_title:
                     self.doc_by_title[norm_title].append(doc_id)
                     self.doc_title_tokens[doc_id] = _get_tokens(norm_title)
@@ -95,13 +110,68 @@ class ExactMatcher:
                     if len(title_no_year) > 6 and title_no_year != norm_title:
                         self.doc_by_title[title_no_year].append(doc_id)
 
-            # Index articles / clauses / points if present in metadata or chunks
+                if ascii_title and len(ascii_title) > 6:
+                    self.doc_by_title_ascii[ascii_title].append(doc_id)
+                    ascii_no_year = re.sub(r"\b(19[89]\d|20[012]\d)\b", "", ascii_title).strip()
+                    if len(ascii_no_year) > 6 and ascii_no_year != ascii_title:
+                        self.doc_by_title_ascii[ascii_no_year].append(doc_id)
+
+            # Index articles / clauses / points if present in document metadata
             art = d.get("article")
             if art is not None and not (isinstance(art, float) and pd.isna(art)):
                 self.doc_articles[doc_id].add(normalize_text(art))
 
             cl = d.get("clause")
             if cl is not None and not (isinstance(cl, float) and pd.isna(cl)):
+                self.doc_clauses[doc_id].add(normalize_text(cl))
+
+            pt = d.get("point")
+            if pt is not None and not (isinstance(pt, float) and pd.isna(pt)):
+                self.doc_points[doc_id].add(normalize_text(pt))
+
+        # Index statutory metadata from chunks if provided
+        if chunks is not None:
+            if isinstance(chunks, (str, Path)):
+                p = Path(chunks)
+                if p.is_file():
+                    chunks = pd.read_parquet(p)
+                else:
+                    chunks = []
+            if isinstance(chunks, pd.DataFrame):
+                chunk_records = chunks[["doc_id", "article", "clause", "point"]].dropna(how="all").to_dict(orient="records") if set(["doc_id", "article", "clause", "point"]).issubset(chunks.columns) else chunks.to_dict(orient="records")
+            else:
+                chunk_records = list(chunks)
+
+            for c in chunk_records:
+                did = str(c.get("doc_id", ""))
+                if not did:
+                    continue
+                art = c.get("article")
+                if art is not None and not (isinstance(art, float) and pd.isna(art)):
+                    norm_art = normalize_text(art)
+                    if norm_art:
+                        self.doc_articles[did].add(norm_art)
+                        art_num = re.sub(r"^[^\d]*", "", norm_art)
+                        if art_num:
+                            self.doc_articles[did].add(f"điều {art_num}")
+
+                cl = c.get("clause")
+                if cl is not None and not (isinstance(cl, float) and pd.isna(cl)):
+                    norm_cl = normalize_text(cl)
+                    if norm_cl:
+                        self.doc_clauses[did].add(norm_cl)
+                        cl_num = re.sub(r"^[^\d]*", "", norm_cl)
+                        if cl_num:
+                            self.doc_clauses[did].add(f"khoản {cl_num}")
+
+                pt = c.get("point")
+                if pt is not None and not (isinstance(pt, float) and pd.isna(pt)):
+                    norm_pt = normalize_text(pt)
+                    if norm_pt:
+                        self.doc_points[did].add(norm_pt)
+                        pt_clean = re.sub(r"^[^\w]*", "", norm_pt)
+                        if pt_clean:
+                            self.doc_points[did].add(f"điểm {pt_clean}")
                 self.doc_clauses[doc_id].add(normalize_text(cl))
 
             pt = d.get("point")
@@ -170,9 +240,16 @@ class ExactMatcher:
                 matches[did]["exact_legal_number"] = True
                 matches[did]["score"] = max(matches[did]["score"], score_val)
 
-        # 2. Match exact law titles
+        # 2. Match exact law titles (accented and ASCII folded)
         for title, dids in self.doc_by_title.items():
             if len(title) > 6 and title in norm_query:
+                for did in dids:
+                    matches[did]["exact_title"] = True
+                    matches[did]["score"] = max(matches[did]["score"], 0.85)
+
+        ascii_query = fold_accent_ascii(query)
+        for title_ascii, dids in self.doc_by_title_ascii.items():
+            if len(title_ascii) > 6 and title_ascii in ascii_query:
                 for did in dids:
                     matches[did]["exact_title"] = True
                     matches[did]["score"] = max(matches[did]["score"], 0.85)

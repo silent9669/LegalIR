@@ -338,10 +338,10 @@ def run_kaggle_pipeline(
     submissions_dir = working_path / "submissions"
     submissions_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1b. Fail-Fast Early Public Test Check in FULL mode
+    # 1b. Fail-Fast Early Public Test Check in FULL or GPU_SMOKE mode
     public_test_file = discover_public_test_file(public_json_path, repo_root=root_path)
-    if is_full and (public_test_file is None or not public_test_file.exists()):
-        raise FileNotFoundError("Full mode requires official public-official.json; refusing to generate submission")
+    if (is_full or is_gpu_smoke) and (public_test_file is None or not public_test_file.exists()):
+        raise FileNotFoundError(f"{run_mode_str.upper()} mode requires official public-official.json; refusing to proceed")
 
     # 2. Hardware and GPU Device Allocation (P1.10)
     from src.models.device import resolve_device
@@ -359,6 +359,12 @@ def run_kaggle_pipeline(
     else:
         dense_device = "cpu"
         reranker_device = "cpu"
+
+    if is_gpu_smoke:
+        if dense_device != "cuda:0":
+            raise RuntimeError(f"gpu_smoke mode requires dense_device == 'cuda:0', got '{dense_device}'")
+        if reranker_device != "cuda:1":
+            raise RuntimeError(f"gpu_smoke mode requires reranker_device == 'cuda:1', got '{reranker_device}'")
 
     print(f"[+] Device Allocation (P1.10 Multi-GPU Utilization):")
     print(f"    - Dense Embedding & Question Encoding : {dense_device}")
@@ -501,7 +507,7 @@ def run_kaggle_pipeline(
             device=dense_device,
             dimension=768,
         )
-        dense_batch = 128 if "cuda" in str(dense_device) else 32
+        dense_batch = 32 if "cuda" in str(dense_device) else 32
         try:
             dense_retriever.fit(macro_chunks.to_dict("records"), batch_size=dense_batch)
             dense_retriever.save(dense_dir)
@@ -655,9 +661,9 @@ def run_kaggle_pipeline(
     print("=" * 70)
 
     public_test_file = discover_public_test_file(public_json_path, repo_root=root_path)
-    if is_full:
+    if is_full or is_gpu_smoke:
         if public_test_file is None or not public_test_file.exists():
-            raise FileNotFoundError("Full mode requires official public-official.json; refusing to generate submission")
+            raise FileNotFoundError(f"{run_mode_str.upper()} mode requires official public-official.json; refusing to generate submission")
         with open(public_test_file, "r", encoding="utf-8") as f:
             public_data = json.load(f)
     elif public_test_file and public_test_file.exists():
@@ -666,7 +672,7 @@ def run_kaggle_pipeline(
             public_data = json.load(f)
     else:
         print("[!] public-official.json not found. Using train queries sample for inference verification.")
-        sample_records = df_queries.head(20 if (is_smoke or is_gpu_smoke) else 100).to_dict("records")
+        sample_records = df_queries.head(20).to_dict("records")
         public_data = {
             str(r["query_id"]): {
                 "question": str(
@@ -823,7 +829,12 @@ def run_kaggle_pipeline(
         gpu0_res = torch.cuda.max_memory_reserved(0) if torch.cuda.is_available() and torch.cuda.device_count() > 0 else 0
         gpu1_res = torch.cuda.max_memory_reserved(1) if torch.cuda.is_available() and torch.cuda.device_count() > 1 else 0
 
-        oom_ev = int(getattr(pipeline.reranker, "oom_events", 0)) if pipeline.reranker is not None else 0
+        oof_reranker_oom = sum(f.get("reranker_oom_events", 0) for f in cv_report.get("folds", []))
+        final_reranker_oom = int(getattr(pipeline.reranker, "oom_events", 0)) if pipeline.reranker is not None else 0
+        dense_oom = int(getattr(dense_retriever, "dense_oom_events", 0)) if dense_retriever is not None else 0
+        total_reranker_oom = oof_reranker_oom + final_reranker_oom
+        total_oom_events = total_reranker_oom + dense_oom
+
         min_batch = int(getattr(pipeline.reranker, "min_successful_batch_size", 16)) if pipeline.reranker is not None else 16
 
         gpu_smoke_report = {
@@ -831,12 +842,19 @@ def run_kaggle_pipeline(
             "dense_actual": dense_actual_dev,
             "reranker_requested": reranker_device,
             "reranker_actual": reranker_actual_dev,
+            "dense_search_backend": "faiss_index_flat_ip" if getattr(dense_retriever, "_faiss_index", None) is not None else "numpy",
             "gpu0_peak_allocated_bytes": int(gpu0_alloc),
             "gpu1_peak_allocated_bytes": int(gpu1_alloc),
             "gpu0_peak_reserved_bytes": int(gpu0_res),
             "gpu1_peak_reserved_bytes": int(gpu1_res),
-            "oom_events": oom_ev,
-            "oom": bool(oom_ev > 0),
+            "dense_initial_batch_size": int(getattr(dense_retriever, "dense_initial_batch_size", 32)) if dense_retriever is not None else 32,
+            "dense_min_successful_batch_size": int(getattr(dense_retriever, "dense_min_successful_batch_size", 32)) if dense_retriever is not None else 32,
+            "dense_oom_events": dense_oom,
+            "oof_reranker_oom_events": oof_reranker_oom,
+            "final_reranker_oom_events": final_reranker_oom,
+            "total_reranker_oom_events": total_reranker_oom,
+            "total_oom_events": total_oom_events,
+            "oom": bool(total_oom_events > 0),
             "stable_reranker_batch_size": min_batch,
             "optimizer_steps": int(final_reranker_report.get("optimizer_steps", 0)),
             "param_diff": float(final_reranker_report.get("param_diff", 0.0) or 0.0),
@@ -849,6 +867,31 @@ def run_kaggle_pipeline(
         report_path = working_path / "gpu_smoke_report.json"
         report_path.write_text(json.dumps(gpu_smoke_report, indent=2), encoding="utf-8")
         print(f"[+] Saved GPU smoke hardware report to {report_path}")
+
+        # Runtime projection calculation
+        q_infer_time = float(time.time() - t0_infer)
+        q_infer_rate = len(q_items) / max(0.001, q_infer_time)
+        projected_public_infer_sec = 999.0 / max(0.1, q_infer_rate)
+
+        oof_q_sec = float(cv_report.get("queries_per_second", 1.0))
+        projected_5fold_oof_sec = (7000.0 * 5) / max(0.1, oof_q_sec) if is_full else (7000.0 * 2) / max(0.1, oof_q_sec)
+        projected_final_train_sec = float(final_reranker_report.get("training_time_sec", 10.0)) * (500.0 / max(1.0, float(final_reranker_report.get("global_steps", 1))))
+
+        projected_total_sec = projected_5fold_oof_sec + projected_final_train_sec + projected_public_infer_sec + 300.0
+
+        runtime_proj = {
+            "public_queries_per_second": round(q_infer_rate, 2),
+            "oof_queries_per_second": round(oof_q_sec, 2),
+            "projected_5fold_oof_seconds": round(projected_5fold_oof_sec, 2),
+            "projected_5fold_oof_hours": round(projected_5fold_oof_sec / 3600.0, 3),
+            "projected_final_training_seconds": round(projected_final_train_sec, 2),
+            "projected_public_inference_seconds": round(projected_public_infer_sec, 2),
+            "projected_total_runtime_hours": round(projected_total_sec / 3600.0, 3),
+            "fits_kaggle_session_limit": bool(projected_total_sec < 32400.0),
+        }
+        proj_path = working_path / "runtime_projection.json"
+        proj_path.write_text(json.dumps(runtime_proj, indent=2), encoding="utf-8")
+        print(f"[+] Saved runtime projection to {proj_path}")
 
     # Copy files to /kaggle/working root if running in Kaggle environment and in full mode AFTER manifest creation
     if is_full and Path("/kaggle/working").exists() and is_submission_valid:

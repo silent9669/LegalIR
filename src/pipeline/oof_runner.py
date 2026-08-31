@@ -170,7 +170,11 @@ class OOFRunner:
     def load_retrievers(self) -> None:
         """Load or initialize retrieval components."""
         if self.exact is None:
-            self.exact = ExactMatcher(documents=list(self.doc_map.values()))
+            chunks_path = self.data_dir / "chunks.parquet"
+            self.exact = ExactMatcher(
+                documents=list(self.doc_map.values()),
+                chunks=chunks_path if chunks_path.exists() else None,
+            )
 
         if self.bm25 is None:
             bm25_index_dir = self.index_dir / "bm25"
@@ -464,6 +468,10 @@ class OOFRunner:
                 fold_info=fold_info,
                 reranker=fold_reranker,
             )
+
+            if fold_reranker is not None:
+                f_metrics["reranker_oom_events"] = int(getattr(fold_reranker, "oom_events", 0))
+                f_metrics["min_successful_batch_size"] = int(getattr(fold_reranker, "min_successful_batch_size", 16))
 
             if self.train_reranker_per_fold and fold_reranker is not None:
                 train_ids = set(str(x) for x in fold_info.get("train_query_ids", fold_info.get("train", [])))

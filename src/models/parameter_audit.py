@@ -238,11 +238,12 @@ def audit_model_parameters(
     adapter_p = 0
 
     if isinstance(model_or_config, nn.Module):
-        if hasattr(model_or_config, "peft_config") or hasattr(model_or_config, "base_model"):
+        if hasattr(model_or_config, "peft_config") or hasattr(model_or_config, "base_model") or any("lora" in n.lower() for n, _ in model_or_config.named_parameters()):
             is_peft = True
-            trainable_p = sum(p.numel() for p in model_or_config.parameters() if p.requires_grad)
-            adapter_p = trainable_p
-            base_p = total_p - adapter_p
+            lora_p = sum(p.numel() for n, p in model_or_config.named_parameters() if "lora" in n.lower() or p.requires_grad)
+            adapter_p = lora_p
+            base_p = max(0, total_p - adapter_p)
+            trainable_p = lora_p
 
     return {
         "model_name": inferred_name,

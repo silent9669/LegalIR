@@ -22,14 +22,54 @@ from transformers import (
 from src.training.losses import get_loss_function
 
 
-class RerankerPairDataset(Dataset):
-    """PyTorch Dataset for (query, evidence, label) pairs."""
+import random
 
-    def __init__(self, data: pd.DataFrame | list[dict[str, Any]]):
-        if isinstance(data, pd.DataFrame):
-            self.records = data.to_dict(orient="records")
+
+def balance_pairs_by_query(records: list[dict[str, Any]], seed: int = 42) -> list[dict[str, Any]]:
+    """Order pairs so that every query is presented before any query is oversampled."""
+    by_query: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for r in records:
+        qid = str(r.get("query_id", ""))
+        by_query[qid].append(dict(r))
+
+    # Sort each query's pairs: positives first, then negatives
+    for qid in by_query:
+        by_query[qid].sort(key=lambda x: -float(x.get("label", 0.0)))
+
+    qids = sorted(list(by_query.keys()))
+    rng = random.Random(seed)
+    rng.shuffle(qids)
+
+    balanced: list[dict[str, Any]] = []
+    # Pass 1: pick up to 2 items (1 positive + 1 negative) per query to maximize immediate query diversity
+    for qid in qids:
+        if by_query[qid]:
+            balanced.append(by_query[qid].pop(0))
+        if by_query[qid] and float(by_query[qid][0].get("label", 0.0)) <= 0.5:
+            balanced.append(by_query[qid].pop(0))
+
+    # Pass 2: cycle through remaining items round-robin
+    has_items = True
+    while has_items:
+        has_items = False
+        for qid in qids:
+            if by_query[qid]:
+                balanced.append(by_query[qid].pop(0))
+                has_items = True
+
+    return balanced
+
+
+class RerankerPairDataset(Dataset):
+    """PyTorch Dataset for (query, evidence, label) pairs with query-balanced scheduling."""
+
+    def __init__(self, data: pd.DataFrame | list[dict[str, Any]], balanced: bool = True, seed: int = 42):
+        raw_records = data.to_dict(orient="records") if isinstance(data, pd.DataFrame) else list(data)
+        if balanced and raw_records:
+            self.records = balance_pairs_by_query(raw_records, seed=seed)
         else:
-            self.records = list(data)
+            self.records = raw_records
+        self.unique_query_ids = set(str(r.get("query_id", "")) for r in self.records if r.get("query_id"))
 
     def __len__(self) -> int:
         return len(self.records)
@@ -109,6 +149,7 @@ class RerankerGroupDataset(Dataset):
                     "positive": pos,
                     "negatives": negs,
                 })
+        self.unique_query_ids = set(item["query_id"] for item in self.items if item.get("query_id"))
 
     def __len__(self) -> int:
         return len(self.items)
@@ -128,9 +169,13 @@ class RerankerGroupCollator:
         all_queries = []
         all_passages = []
         group_sizes = []
+        query_ids = []
 
         for item in batch:
             q = item["query"]
+            qid = item.get("query_id", "")
+            query_ids.append(qid)
+
             # First item in group is positive
             all_queries.append(q)
             all_passages.append(item["positive"]["evidence"])
@@ -151,6 +196,7 @@ class RerankerGroupCollator:
             return_tensors="pt",
         )
         features["group_sizes"] = group_sizes
+        features["query_ids"] = query_ids
         return features
 
 
@@ -453,7 +499,7 @@ class RerankerTrainer:
         elapsed_time = time.time() - start_time
         final_train_loss = loss_history[-1] if loss_history else 0.0
 
-        total_input_queries = len(set(r.get("query_id") for r in getattr(self.train_dataset, "records", []))) if hasattr(self.train_dataset, "records") else len(seen_query_ids)
+        total_input_queries = len(getattr(self.train_dataset, "unique_query_ids", set())) or len(seen_query_ids)
         actual_seen_count = len(seen_query_ids)
         coverage_pct = round((actual_seen_count / max(1, total_input_queries)) * 100.0, 2)
 

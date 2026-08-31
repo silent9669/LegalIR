@@ -54,6 +54,9 @@ class DenseMacroRetriever:
         self.embeddings: np.ndarray | None = None
         self.query_encoder: Callable[[list[str]], np.ndarray] | None = None
         self._faiss_index = None
+        self.dense_oom_events: int = 0
+        self.dense_initial_batch_size: int = 32
+        self.dense_min_successful_batch_size: int = 32
 
     @classmethod
     def from_arrays(
@@ -120,6 +123,10 @@ class DenseMacroRetriever:
                 "PyVi is required when use_pyvi=True; install it with `pip install pyvi`."
             ) from exc
         return ViTokenizer.tokenize(normalized)
+
+    def ensure_loaded(self) -> None:
+        """Explicitly load tokenizer and model onto device."""
+        self._load_model()
 
     def _load_model(self) -> None:
         if self.model_name == "mock":
@@ -201,34 +208,55 @@ class DenseMacroRetriever:
         import torch
         import torch.nn.functional as F
 
+        is_cuda = str(self.device).startswith("cuda")
         all_vectors: list[np.ndarray] = []
-        for start in range(0, len(normalized_texts), batch_size):
-            batch = normalized_texts[start : start + batch_size]
-            inputs = self.tokenizer(
-                batch,
-                padding=True,
-                truncation=True,
-                max_length=max_length,
-                return_tensors="pt",
-            )
-            inputs = self._move_inputs_to_device(inputs)
+        self.dense_initial_batch_size = batch_size
+        curr_batch_size = batch_size
 
-            with torch.no_grad():
-                outputs = self.model(**inputs)
-                hidden_state = getattr(outputs, "last_hidden_state", None)
-                if hidden_state is None:
-                    hidden_state = outputs[0]
-                attention_mask = inputs.get("attention_mask")
-                if attention_mask is None:
-                    attention_mask = torch.ones(
-                        hidden_state.shape[:2], dtype=hidden_state.dtype, device=hidden_state.device
-                    )
-                mask = attention_mask.unsqueeze(-1).to(hidden_state.dtype)
-                pooled = (hidden_state * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1e-9)
-                normalized = F.normalize(pooled, p=2, dim=1)
-                vectors = normalized.cpu().to(torch.float32).numpy()
+        idx = 0
+        while idx < len(normalized_texts):
+            curr_chunk = normalized_texts[idx : idx + curr_batch_size]
+            try:
+                inputs = self.tokenizer(
+                    curr_chunk,
+                    padding=True,
+                    truncation=True,
+                    max_length=max_length,
+                    return_tensors="pt",
+                )
+                inputs = self._move_inputs_to_device(inputs)
 
-            all_vectors.append(vectors)
+                with torch.no_grad():
+                    with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=is_cuda):
+                        outputs = self.model(**inputs)
+                        hidden_state = getattr(outputs, "last_hidden_state", None)
+                        if hidden_state is None:
+                            hidden_state = outputs[0]
+                        attention_mask = inputs.get("attention_mask")
+                        if attention_mask is None:
+                            attention_mask = torch.ones(
+                                hidden_state.shape[:2], dtype=hidden_state.dtype, device=hidden_state.device
+                            )
+                        mask = attention_mask.unsqueeze(-1).to(hidden_state.dtype)
+                        pooled = (hidden_state * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1e-9)
+                        normalized = F.normalize(pooled, p=2, dim=1)
+                        vectors = normalized.cpu().to(torch.float32).numpy()
+
+                all_vectors.append(vectors)
+                idx += len(curr_chunk)
+            except RuntimeError as exc:
+                msg = str(exc).lower()
+                if ("out of memory" in msg or "cuda error: out of memory" in msg or "mps" in msg):
+                    self.dense_oom_events += 1
+                    if is_cuda and torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    if curr_batch_size <= 1:
+                        raise RuntimeError(f"Dense encoding failed with OOM even at batch_size=1: {exc}") from exc
+                    curr_batch_size = max(1, curr_batch_size // 2)
+                    self.dense_min_successful_batch_size = min(self.dense_min_successful_batch_size, curr_batch_size)
+                    print(f"[-] Dense CUDA OOM event #{self.dense_oom_events}: adapting batch size to {curr_batch_size}")
+                else:
+                    raise
 
         return self._coerce_embedding_matrix(np.vstack(all_vectors))
 

@@ -78,6 +78,10 @@ class CrossEncoderReranker:
             path = manifest.parent / path
         return path if path.is_dir() else None
 
+    def ensure_loaded(self) -> None:
+        """Explicitly instantiate and load tokenizer and model onto device."""
+        self._load_model()
+
     def _load_model(self) -> None:
         if self.model is not None or self.score_fn is not None:
             return

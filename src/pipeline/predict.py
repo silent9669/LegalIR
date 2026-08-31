@@ -200,6 +200,11 @@ class LegalIRPipeline:
         models_to_audit = []
         dense_ret = getattr(self.hybrid_engine, "dense_retriever", None) or getattr(self.hybrid_engine, "dense", None)
         if dense_ret is not None:
+            if hasattr(dense_ret, "ensure_loaded"):
+                try:
+                    dense_ret.ensure_loaded()
+                except Exception:
+                    pass
             if hasattr(dense_ret, "model") and dense_ret.model is not None:
                 models_to_audit.append((dense_ret.model, getattr(dense_ret, "model_name", "CODE4LIFEOFFICIAL/huydang-dek21-embedding-v2"), "dense_embedding"))
             elif getattr(dense_ret, "model_name", None):
@@ -208,6 +213,11 @@ class LegalIRPipeline:
                 models_to_audit.append({"name": "CODE4LIFEOFFICIAL/huydang-dek21-embedding-v2", "role": "dense_embedding"})
 
         if self.reranker is not None:
+            if hasattr(self.reranker, "ensure_loaded"):
+                try:
+                    self.reranker.ensure_loaded()
+                except Exception:
+                    pass
             if hasattr(self.reranker, "model") and self.reranker.model is not None:
                 models_to_audit.append((self.reranker.model, getattr(self.reranker, "model_name", "BAAI/bge-reranker-v2-m3"), "cross_encoder_reranker"))
             elif getattr(self.reranker, "model_name", None):
@@ -449,7 +459,10 @@ class LegalIRPipeline:
                     raise ValueError("Strict artifact check failed: feature_columns in fusion manifest is empty")
 
         # 4. Exact Matcher
-        exact = ExactMatcher(documents=list(doc_map.values()))
+        exact = ExactMatcher(
+            documents=list(doc_map.values()),
+            chunks=chunks_path if chunks_path.exists() else None,
+        )
 
         hybrid_engine = HybridSearchEngine(
             bm25_retriever=bm25,
