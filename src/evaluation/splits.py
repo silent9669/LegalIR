@@ -8,20 +8,22 @@ import pandas as pd
 
 
 def generate_random_5fold_split(queries: list, seed: int = 42) -> list[dict[str, Any]]:
-    """Generate 5-fold cross-validation query splits."""
-    random.seed(seed)
-    qids = sorted([str(q["query_id"]) if isinstance(q, dict) else str(q) for q in queries])
-    random.shuffle(qids)
+    """Generate 5-fold cross-validation query splits with deterministic ordering."""
+    qids = sorted(list(set(str(q["query_id"]) if isinstance(q, dict) else str(q) for q in queries)))
+    rng = random.Random(seed)
+    shuffled_qids = list(qids)
+    rng.shuffle(shuffled_qids)
 
-    n = len(qids)
+    n = len(shuffled_qids)
     fold_size = n // 5
     folds = []
 
     for i in range(5):
         val_start = i * fold_size
         val_end = (i + 1) * fold_size if i < 4 else n
-        val_qids = qids[val_start:val_end]
-        train_qids = [qid for qid in qids if qid not in set(val_qids)]
+        val_qids = sorted(shuffled_qids[val_start:val_end])
+        val_set = set(val_qids)
+        train_qids = sorted([qid for qid in qids if qid not in val_set])
 
         folds.append({
             "fold": i,
@@ -34,9 +36,14 @@ def generate_random_5fold_split(queries: list, seed: int = 42) -> list[dict[str,
     return folds
 
 
-def generate_document_disjoint_split(queries: list, qrels: list, val_ratio: float = 0.2, seed: int = 42) -> dict[str, Any]:
+def generate_document_disjoint_split(
+    queries: list,
+    qrels: list,
+    val_ratio: float = 0.2,
+    seed: int = 42,
+) -> dict[str, Any]:
     """Generate a document-disjoint split where validation gold documents never appear in the train set."""
-    random.seed(seed)
+    rng = random.Random(seed)
 
     # Map query -> gold docs and doc -> queries
     q2d = defaultdict(set)
@@ -70,7 +77,7 @@ def generate_document_disjoint_split(queries: list, qrels: list, val_ratio: floa
         clusters.append(cluster)
 
     # Shuffle clusters and greedily assign to val up to val_ratio
-    random.shuffle(clusters)
+    rng.shuffle(clusters)
     total_queries = len(all_qids)
     target_val_count = int(total_queries * val_ratio)
 
@@ -93,7 +100,8 @@ def generate_document_disjoint_split(queries: list, qrels: list, val_ratio: floa
         train_docs.update(q2d[q])
 
     overlap = val_docs & train_docs
-    assert len(overlap) == 0, f"Document-disjoint split violation! Overlap: {overlap}"
+    if len(overlap) > 0:
+        raise AssertionError(f"Document-disjoint split violation! Overlap: {overlap}")
 
     return {
         "train": sorted(train_qids),
@@ -102,6 +110,141 @@ def generate_document_disjoint_split(queries: list, qrels: list, val_ratio: floa
         "val_query_ids": sorted(val_qids),
         "train_doc_count": len(train_docs),
         "val_doc_count": len(val_docs),
+    }
+
+
+def verify_fold_isolation(
+    folds: list[dict[str, Any]],
+    qrels: list[dict[str, Any]] | dict[str, list[str]] | None = None,
+) -> dict[str, Any]:
+    """Strictly verify fold isolation properties:
+    1. At least 2 folds.
+    2. Each fold has non-empty disjoint train and val sets (train & val == empty).
+    3. Val sets across all folds are pairwise disjoint.
+    4. Union of all val sets covers all queries.
+    5. If qrels provided, ensure validation queries' qrels are completely isolated.
+    """
+    if not folds or len(folds) < 2:
+        raise AssertionError(f"Expected at least 2 folds, got {len(folds) if folds else 0}")
+
+    all_val_ids: list[str] = []
+    all_train_ids_fold0: set[str] = set()
+
+    for idx, f in enumerate(folds):
+        train_ids = set(str(x) for x in f.get("train_query_ids", f.get("train", [])))
+        val_ids = set(str(x) for x in f.get("val_query_ids", f.get("val", [])))
+
+        if not train_ids:
+            raise AssertionError(f"Fold {idx} has empty train query set")
+        if not val_ids:
+            raise AssertionError(f"Fold {idx} has empty val query set")
+
+        intersection = train_ids & val_ids
+        if intersection:
+            raise AssertionError(
+                f"Fold {idx} has {len(intersection)} queries in both train and val: {sorted(list(intersection))[:5]}"
+            )
+
+        if idx == 0:
+            all_train_ids_fold0 = train_ids | val_ids
+
+        all_val_ids.extend(list(val_ids))
+
+    # Check pairwise disjointness of validation sets
+    if len(all_val_ids) != len(set(all_val_ids)):
+        seen = set()
+        duplicates = set()
+        for qid in all_val_ids:
+            if qid in seen:
+                duplicates.add(qid)
+            seen.add(qid)
+        raise AssertionError(
+            f"Validation sets across folds are not pairwise disjoint! Duplicates: {sorted(list(duplicates))[:5]}"
+        )
+
+    # Check that union of all val sets equals total query set
+    if all_train_ids_fold0 and set(all_val_ids) != all_train_ids_fold0:
+        missing = all_train_ids_fold0 - set(all_val_ids)
+        extra = set(all_val_ids) - all_train_ids_fold0
+        raise AssertionError(
+            f"Fold validation sets do not partition full query set! Missing: {len(missing)}, Extra: {len(extra)}"
+        )
+
+    # If qrels provided, verify qrel mapping isolation
+    if qrels is not None:
+        q2d = defaultdict(set)
+        if isinstance(qrels, dict):
+            for qid, docs in qrels.items():
+                for d in docs:
+                    q2d[str(qid)].add(str(d))
+        else:
+            for r in qrels:
+                q2d[str(r["query_id"])].add(str(r["doc_id"]))
+
+        for idx, f in enumerate(folds):
+            val_ids = set(str(x) for x in f.get("val_query_ids", f.get("val", [])))
+            train_ids = set(str(x) for x in f.get("train_query_ids", f.get("train", [])))
+
+            # Verify no validation qrels exist in training set
+            leaked_qrels = val_ids & train_ids
+            if leaked_qrels:
+                raise AssertionError(f"Fold {idx} leaked validation queries into train: {leaked_qrels}")
+
+    return {
+        "is_isolated": True,
+        "num_folds": len(folds),
+        "total_queries": len(all_val_ids),
+        "val_queries_per_fold": [len(f.get("val_query_ids", f.get("val", []))) for f in folds],
+    }
+
+
+def verify_document_disjoint_isolation(
+    split: dict[str, Any],
+    qrels: list[dict[str, Any]] | dict[str, list[str]],
+) -> dict[str, Any]:
+    """Strictly verify document-disjoint split isolation:
+    1. train_qids and val_qids are disjoint.
+    2. Gold documents for train queries and gold documents for val queries have ZERO overlap.
+    """
+    train_qids = set(str(x) for x in split.get("train_query_ids", split.get("train", [])))
+    val_qids = set(str(x) for x in split.get("val_query_ids", split.get("val", [])))
+
+    if not train_qids or not val_qids:
+        raise AssertionError("Train or val query set in document-disjoint split is empty")
+
+    query_overlap = train_qids & val_qids
+    if query_overlap:
+        raise AssertionError(f"Document-disjoint split has query overlap: {query_overlap}")
+
+    q2d = defaultdict(set)
+    if isinstance(qrels, dict):
+        for qid, docs in qrels.items():
+            for d in docs:
+                q2d[str(qid)].add(str(d))
+    else:
+        for r in qrels:
+            q2d[str(r["query_id"])].add(str(r["doc_id"]))
+
+    train_docs = set()
+    for q in train_qids:
+        train_docs.update(q2d[q])
+
+    val_docs = set()
+    for q in val_qids:
+        val_docs.update(q2d[q])
+
+    doc_overlap = train_docs & val_docs
+    if doc_overlap:
+        raise AssertionError(
+            f"Document-disjoint split violation! Overlap of {len(doc_overlap)} docs between train and val: {sorted(list(doc_overlap))[:5]}"
+        )
+
+    return {
+        "is_disjoint": True,
+        "train_queries": len(train_qids),
+        "val_queries": len(val_qids),
+        "train_docs": len(train_docs),
+        "val_docs": len(val_docs),
     }
 
 
@@ -118,13 +261,15 @@ def create_all_splits(canonical_dir: str | Path):
 
     print(f"Generating 5-fold random CV splits for {len(queries)} queries...")
     random_5fold = generate_random_5fold_split(queries, seed=42)
+    verify_fold_isolation(random_5fold, qrels)
     (splits_dir / "random_5fold.json").write_text(json.dumps(random_5fold, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
     print("Generating document-disjoint split...")
     doc_disjoint = generate_document_disjoint_split(queries, qrels, val_ratio=0.2, seed=42)
+    verify_document_disjoint_isolation(doc_disjoint, qrels)
     (splits_dir / "doc_disjoint_split.json").write_text(json.dumps(doc_disjoint, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
-    print(f"Splits successfully created in {splits_dir}!")
+    print(f"Splits successfully created and verified in {splits_dir}!")
     print(f"  Random 5-fold: 5 folds x {len(random_5fold[0]['val_query_ids'])} val queries")
     print(f"  Doc-disjoint: {len(doc_disjoint['train_query_ids'])} train queries ({doc_disjoint['train_doc_count']} docs) | {len(doc_disjoint['val_query_ids'])} val queries ({doc_disjoint['val_doc_count']} docs)")
 

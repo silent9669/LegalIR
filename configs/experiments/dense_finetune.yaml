@@ -1,0 +1,11 @@
+experiment: "dense_finetune"
+base_model_name: "CODE4LIFEOFFICIAL/huydang-dek21-embedding-v2"
+output_dir: "artifacts/local/training/dense_checkpoints"
+training:
+  learning_rate: 1.0e-5
+  batch_size: 32
+  max_steps: 300
+  warmup_ratio: 0.1
+  temperature: 0.05
+  max_length: 512
+device: "auto"

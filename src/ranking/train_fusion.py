@@ -1,54 +1,270 @@
-from pathlib import Path
-from typing import Any
+"""Learned Fusion (Learning-to-Rank) and RRF Cross-Validation Trainer.
+
+Provides:
+- Fold-isolated cross-validation over OOF candidate features.
+- Model selection gate comparing Learned Ranker vs Weighted RRF on Recall@5.
+- Training on all folds and serialization of winning model artifacts.
+"""
+
 import argparse
+from collections import defaultdict
 import json
+import os
+from pathlib import Path
+from typing import Any, Mapping
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
 from src.core.config import load_pipeline_config
 from src.core.paths import ProjectPaths
-from src.evaluation.benchmark import build_memory_rows
-from src.ranking.fusion import LightGBMRanker
-from src.ranking.oof_features import FEATURE_COLUMNS, FEATURE_SCHEMA_VERSION, extract_candidate_features
+from src.evaluation.evaluator import evaluate_predictions
+from src.ranking.fusion import LearnedRanker, LightGBMRanker, ReciprocalRankFusion
+from src.ranking.oof_features import (
+    CORE_FEATURE_COLUMNS,
+    FEATURE_COLUMNS,
+    FEATURE_SCHEMA_VERSION,
+    extract_candidate_features,
+)
+from src.ranking.selector import TopKSelector
 from src.retrieval.bm25_micro import BM25MicroRetriever
 from src.retrieval.exact_matcher import ExactMatcher
 from src.retrieval.hybrid_search import HybridSearchEngine
-from src.retrieval.question_memory import QuestionMemory
+from src.retrieval.question_memory import TrainQuestionMemory
 
 
-def generate_fold_features(
-    train_qids: list[str],
-    queries_dict: dict[str, str],
-    qrels_dict: dict[str, list[str]],
-    hybrid_engine: HybridSearchEngine,
-    candidate_k: int = 50,
-) -> pd.DataFrame:
-    all_dfs = []
-    for qid in tqdm(train_qids, desc="Extracting candidates & features", leave=False):
-        q_text = queries_dict.get(qid, "")
-        gold_set = set(qrels_dict.get(qid, []))
-        if not q_text or not gold_set:
-            continue
+def evaluate_features_with_ranker(
+    val_df: pd.DataFrame,
+    ranker: Any,
+    qrels_dict: Mapping[str, list[str]],
+    top_k: int = 5,
+) -> tuple[dict[str, list[str]], dict[str, Any]]:
+    """Rank candidates for each query in validation DataFrame and evaluate metrics."""
+    if val_df.empty:
+        return {}, {}
 
-        cands = hybrid_engine.search_candidates(q_text, exclude_qid=qid, top_k=candidate_k)
-        if not cands:
-            continue
+    selector = TopKSelector(max_k=top_k)
+    y_pred: dict[str, list[str]] = {}
+    grouped = val_df.groupby("query_id")
 
-        df = extract_candidate_features(query_id=qid, candidate_records=cands)
-        df["target"] = df["doc_id"].apply(lambda d: 1 if d in gold_set else 0)
-        all_dfs.append(df)
+    for qid, group_df in grouped:
+        qid_str = str(qid)
+        cands = group_df.to_dict("records")
 
-    if not all_dfs:
-        return pd.DataFrame()
-    return pd.concat(all_dfs, ignore_index=True)
+        if hasattr(ranker, "predict"):
+            ranked = ranker.predict(cands, query_id=qid_str)
+        elif hasattr(ranker, "rank_candidates"):
+            ranked = ranker.rank_candidates(cands)
+        else:
+            ranked = cands
+
+        top_docs = selector.select(ranked)
+        y_pred[qid_str] = top_docs
+
+    val_qrels = {str(qid): qrels_dict.get(str(qid), []) for qid in y_pred.keys()}
+    metrics = evaluate_predictions(y_pred=y_pred, y_true=val_qrels)
+    return y_pred, metrics
+
+
+def train_and_evaluate_fusion_cv(
+    oof_df: pd.DataFrame,
+    qrels_dict: Mapping[str, list[str]],
+    output_dir: str | Path | None = None,
+    num_boost_round: int = 100,
+    learning_rate: float = 0.05,
+    num_leaves: int = 31,
+    feature_cols: list[str] | None = None,
+    rrf_weights: Mapping[str, float] | None = None,
+) -> dict[str, Any]:
+    """Execute 5-fold cross-validation for Learned Ranker vs Weighted RRF.
+
+    Strict fold isolation: Fold f model is trained on folds != f only.
+    """
+    if oof_df.empty or "fold" not in oof_df.columns:
+        raise ValueError("oof_df must be non-empty and contain a 'fold' column.")
+
+    output_dir = Path(output_dir) if output_dir else Path("artifacts/local/training/fusion")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    available_cols = list(feature_cols) if feature_cols is not None else [
+        c for c in FEATURE_COLUMNS if c in oof_df.columns
+    ]
+    if not available_cols:
+        available_cols = [c for c in CORE_FEATURE_COLUMNS if c in oof_df.columns]
+
+    target_col = "label" if "label" in oof_df.columns else "target"
+    unique_folds = sorted(oof_df["fold"].unique())
+
+    learned_fold_metrics = []
+    rrf_fold_metrics = []
+    trained_fold_models = {}
+
+    print(f"\nEvaluating Fusion across {len(unique_folds)} folds...")
+
+    rrf_baseline = ReciprocalRankFusion(weights=rrf_weights)
+
+    for f_idx in unique_folds:
+        train_mask = oof_df["fold"] != f_idx
+        val_mask = oof_df["fold"] == f_idx
+
+        train_data = oof_df[train_mask]
+        val_data = oof_df[val_mask]
+
+        # 1. Fit Fold-Isolated Learned Ranker
+        # Note: LightGBM requires groups sorted consecutively by query_id
+        train_data_sorted = train_data.sort_values("query_id")
+        val_data_sorted = val_data.sort_values("query_id")
+
+        train_groups = train_data_sorted.groupby("query_id", sort=False).size().values
+        val_groups = val_data_sorted.groupby("query_id", sort=False).size().values
+
+        X_train = train_data_sorted[available_cols]
+        y_train = train_data_sorted[target_col].values
+
+        X_val = val_data_sorted[available_cols]
+        y_val = val_data_sorted[target_col].values
+
+        ranker = LightGBMRanker(
+            feature_cols=available_cols,
+            learning_rate=learning_rate,
+            num_leaves=num_leaves,
+        )
+        ranker.fit(
+            X=X_train,
+            y=y_train,
+            groups=train_groups,
+            eval_set=(X_val, y_val),
+            eval_groups=val_groups,
+            num_boost_round=num_boost_round,
+            early_stopping_rounds=10,
+        )
+
+        fold_model_file = output_dir / f"model_fold_{f_idx}.txt"
+        ranker.save(fold_model_file)
+        trained_fold_models[f"fold_{f_idx}"] = str(fold_model_file)
+
+        # 2. Evaluate Learned Ranker on Validation Fold f
+        _, learned_m = evaluate_features_with_ranker(val_data, ranker, qrels_dict)
+        learned_m["fold"] = int(f_idx)
+        learned_fold_metrics.append(learned_m)
+
+        # 3. Evaluate Weighted RRF on Validation Fold f
+        _, rrf_m = evaluate_features_with_ranker(val_data, rrf_baseline, qrels_dict)
+        rrf_m["fold"] = int(f_idx)
+        rrf_fold_metrics.append(rrf_m)
+
+        print(
+            f"Fold {f_idx}: "
+            f"Learned Recall@5 = {learned_m['recall@5'] * 100:.2f}% (Prec@5 = {learned_m['precision@5'] * 100:.2f}%) | "
+            f"RRF Recall@5 = {rrf_m['recall@5'] * 100:.2f}% (Prec@5 = {rrf_m['precision@5'] * 100:.2f}%)"
+        )
+
+    # Aggregate Metrics
+    learned_mean_rec5 = float(np.mean([m["recall@5"] for m in learned_fold_metrics]))
+    learned_std_rec5 = float(np.std([m["recall@5"] for m in learned_fold_metrics]))
+    learned_mean_prec5 = float(np.mean([m["precision@5"] for m in learned_fold_metrics]))
+
+    rrf_mean_rec5 = float(np.mean([m["recall@5"] for m in rrf_fold_metrics]))
+    rrf_std_rec5 = float(np.std([m["recall@5"] for m in rrf_fold_metrics]))
+    rrf_mean_prec5 = float(np.mean([m["precision@5"] for m in rrf_fold_metrics]))
+
+    # Model Selection Gate
+    # Primary criterion: Official Task 1 Recall@5
+    if learned_mean_rec5 >= rrf_mean_rec5:
+        winning_method = "learned_ranker"
+        winning_model_type = ranker.model_type
+        winner_rec5 = learned_mean_rec5
+        winner_prec5 = learned_mean_prec5
+        gate_decision = f"Learned Ranker selected (+{(learned_mean_rec5 - rrf_mean_rec5) * 100:.4f}% vs RRF)"
+    else:
+        winning_method = "reciprocal_rank_fusion"
+        winning_model_type = "rrf_weighted"
+        winner_rec5 = rrf_mean_rec5
+        winner_prec5 = rrf_mean_prec5
+        gate_decision = f"Weighted RRF selected (+{(rrf_mean_rec5 - learned_mean_rec5) * 100:.4f}% vs Learned)"
+
+    print("\n" + "=" * 70)
+    print(">> FUSION MODEL SELECTION GATE SUMMARY:")
+    print(f"   Learned Ranker Mean Recall@5 : {learned_mean_rec5 * 100:.4f}% (+/- {learned_std_rec5 * 100:.4f}%)")
+    print(f"   Weighted RRF   Mean Recall@5 : {rrf_mean_rec5 * 100:.4f}% (+/- {rrf_std_rec5 * 100:.4f}%)")
+    print(f"   Winning Method               : {winning_method} ({gate_decision})")
+    print("=" * 70)
+
+    # 4. Train Final Model on All Folds
+    print("\nTraining Final Fusion Model on All Folds...")
+    all_sorted = oof_df.sort_values("query_id")
+    all_groups = all_sorted.groupby("query_id", sort=False).size().values
+    all_X = all_sorted[available_cols]
+    all_y = all_sorted[target_col].values
+
+    full_ranker = LightGBMRanker(
+        feature_cols=available_cols,
+        learning_rate=learning_rate,
+        num_leaves=num_leaves,
+    )
+    full_ranker.fit(all_X, all_y, all_groups, num_boost_round=num_boost_round)
+
+    full_model_file = output_dir / "model_full.txt"
+    full_ranker.save(full_model_file)
+    trained_fold_models["full"] = str(full_model_file)
+
+    # 5. Export artifacts & manifests
+    comparison_report = {
+        "winning_method": winning_method,
+        "winning_model_type": winning_model_type,
+        "winner_mean_recall@5": winner_rec5,
+        "winner_mean_precision@5": winner_prec5,
+        "gate_decision": gate_decision,
+        "learned_ranker": {
+            "mean_recall@5": learned_mean_rec5,
+            "std_recall@5": learned_std_rec5,
+            "mean_precision@5": learned_mean_prec5,
+            "folds": learned_fold_metrics,
+        },
+        "reciprocal_rank_fusion": {
+            "mean_recall@5": rrf_mean_rec5,
+            "std_recall@5": rrf_std_rec5,
+            "mean_precision@5": rrf_mean_prec5,
+            "folds": rrf_fold_metrics,
+        },
+    }
+
+    with open(output_dir / "fusion_comparison.json", "w", encoding="utf-8") as f:
+        json.dump(comparison_report, f, indent=2)
+
+    manifest = {
+        "schema_version": FEATURE_SCHEMA_VERSION,
+        "feature_columns": available_cols,
+        "total_oof_rows": len(oof_df),
+        "winning_method": winning_method,
+        "winning_metrics": {
+            "mean_recall@5": winner_rec5,
+            "mean_precision@5": winner_prec5,
+        },
+        "models": trained_fold_models,
+    }
+
+    with open(output_dir / "manifest.json", "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
+
+    with open(output_dir / "winning_method.json", "w", encoding="utf-8") as f:
+        json.dump({"winning_method": winning_method, "decision": gate_decision}, f, indent=2)
+
+    return {
+        "manifest": manifest,
+        "comparison": comparison_report,
+        "winning_method": winning_method,
+        "winner_mean_recall@5": winner_rec5,
+    }
 
 
 def train_fusion_models(
     config_path: str | Path = "configs/pipeline.yaml",
     output_dir: str | Path | None = None,
     candidate_k: int = 50,
+    oof_features_path: str | Path | None = None,
 ) -> dict[str, Any]:
+    """Orchestrate OOF feature extraction and fusion training from canonical datasets."""
     paths = ProjectPaths.from_repo()
     cfg = load_pipeline_config(Path(config_path))
 
@@ -56,17 +272,28 @@ def train_fusion_models(
     output_dir = Path(output_dir) if output_dir else paths.repo / "artifacts" / "local" / "training" / "fusion"
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    qrels_path = canonical_dir / "qrels_train.parquet"
+    qrels_df = pd.read_parquet(qrels_path)
+    qrels_dict = qrels_df.groupby("query_id")["doc_id"].apply(lambda s: [str(x) for x in s]).to_dict()
+
+    if oof_features_path is not None and Path(oof_features_path).exists():
+        print(f"Loading precomputed OOF features from {oof_features_path}...")
+        oof_df = pd.read_parquet(oof_features_path)
+        return train_and_evaluate_fusion_cv(
+            oof_df=oof_df,
+            qrels_dict=qrels_dict,
+            output_dir=output_dir,
+        )
+
     print(f"Loading canonical data for fusion training from {canonical_dir}...")
     docs_df = pd.read_parquet(canonical_dir / "documents.parquet")
     chunks_df = pd.read_parquet(canonical_dir / "chunks.parquet")
     queries_df = pd.read_parquet(canonical_dir / "queries_train.parquet")
-    qrels_df = pd.read_parquet(canonical_dir / "qrels_train.parquet")
 
     splits_dir = canonical_dir / "splits"
     random_5fold = json.loads((splits_dir / "random_5fold.json").read_text(encoding="utf-8"))
 
     queries_dict = dict(zip(queries_df["query_id"].astype(str), queries_df["question_norm"]))
-    qrels_dict = qrels_df.groupby("query_id")["doc_id"].apply(lambda s: [str(x) for x in s]).to_dict()
 
     bm25_path = paths.local_indexes / "bm25" / "bm25_micro_index.pkl"
     if bm25_path.exists():
@@ -83,9 +310,11 @@ def train_fusion_models(
         val_qids = [str(x) for x in fold_data.get("val_query_ids", fold_data.get("val", []))]
         train_qids = [str(x) for x in fold_data.get("train_query_ids", fold_data.get("train", []))]
 
-        # Memory uses only fold train queries
-        mem_rows = build_memory_rows(train_qids, queries_dict, qrels_dict)
-        memory = QuestionMemory(mem_rows, min_similarity=0.82)
+        fold_train_queries = {qid: queries_dict[qid] for qid in train_qids if qid in queries_dict}
+        fold_train_qrels = {qid: qrels_dict[qid] for qid in train_qids if qid in qrels_dict}
+
+        memory = TrainQuestionMemory(min_similarity=0.82)
+        memory.fit(fold_train_queries, fold_train_qrels)
 
         engine = HybridSearchEngine(
             bm25_retriever=bm25,
@@ -95,64 +324,45 @@ def train_fusion_models(
         )
 
         print(f"Extracting OOF features for fold {f_idx + 1}/5 ({len(val_qids)} val queries)...")
-        val_df = generate_fold_features(val_qids, queries_dict, qrels_dict, engine, candidate_k=candidate_k)
-        val_df["fold"] = f_idx
-        fold_feature_dfs.append(val_df)
+        for qid in tqdm(val_qids, desc=f"Fold {f_idx} Features", leave=False):
+            q_text = queries_dict.get(qid, "")
+            gold_set = set(qrels_dict.get(qid, []))
+            if not q_text or not gold_set:
+                continue
+
+            cands = engine.search_candidates(q_text, exclude_qid=qid, top_k=candidate_k)
+            if not cands:
+                continue
+
+            df = extract_candidate_features(query_id=qid, candidate_records=cands, query_text=q_text, qrels=gold_set)
+            df["fold"] = f_idx
+            fold_feature_dfs.append(df)
 
     oof_df = pd.concat(fold_feature_dfs, ignore_index=True)
     oof_df.to_parquet(output_dir / "oof_features.parquet", index=False)
-
     print(f"Total OOF feature rows: {len(oof_df)}")
 
-    # Train fold-specific models (out-of-fold training)
-    trained_models = {}
-    for f_idx in range(5):
-        train_mask = oof_df["fold"] != f_idx
-        train_data = oof_df[train_mask]
-
-        # Group by query_id
-        groups = train_data.groupby("query_id").size().values
-        X = train_data[FEATURE_COLUMNS]
-        y = train_data["target"].values
-
-        ranker = LightGBMRanker()
-        ranker.fit(X, y, groups)
-
-        model_file = output_dir / f"model_fold_{f_idx}.txt"
-        ranker.save(model_file)
-        trained_models[f"fold_{f_idx}"] = str(model_file)
-        print(f"Saved fold {f_idx} model to {model_file}")
-
-    # Train full model on all OOF features
-    full_groups = oof_df.groupby("query_id").size().values
-    full_X = oof_df[FEATURE_COLUMNS]
-    full_y = oof_df["target"].values
-
-    full_ranker = LightGBMRanker()
-    full_ranker.fit(full_X, full_y, full_groups)
-    full_model_file = output_dir / "model_full.txt"
-    full_ranker.save(full_model_file)
-    trained_models["full"] = str(full_model_file)
-    print(f"Saved full-data model to {full_model_file}")
-
-    manifest = {
-        "schema_version": FEATURE_SCHEMA_VERSION,
-        "feature_columns": FEATURE_COLUMNS,
-        "total_rows": len(oof_df),
-        "models": trained_models,
-    }
-    (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-    print("Fusion models training completed successfully!")
-    return manifest
+    return train_and_evaluate_fusion_cv(
+        oof_df=oof_df,
+        qrels_dict=qrels_dict,
+        output_dir=output_dir,
+    )
 
 
 def main():
     parser = argparse.ArgumentParser(description="LegalIR LightGBM Fusion Trainer")
     parser.add_argument("--config", type=str, default="configs/pipeline.yaml")
     parser.add_argument("--output-dir", type=str, default=None)
+    parser.add_argument("--candidate-k", type=int, default=50)
+    parser.add_argument("--oof-features", type=str, default=None, help="Path to existing oof_features.parquet")
     args = parser.parse_args()
 
-    train_fusion_models(config_path=args.config, output_dir=args.output_dir)
+    train_fusion_models(
+        config_path=args.config,
+        output_dir=args.output_dir,
+        candidate_k=args.candidate_k,
+        oof_features_path=args.oof_features,
+    )
 
 
 if __name__ == "__main__":

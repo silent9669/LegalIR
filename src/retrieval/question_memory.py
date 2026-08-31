@@ -1,7 +1,10 @@
+"""Fold-safe Question Memory Retriever using Lexical TF-IDF and Dense Embedding Matching."""
+
 from collections import defaultdict
+import json
 from pathlib import Path
-from typing import Any, Callable, Mapping
 import re
+from typing import Any, Callable, Mapping
 import unicodedata
 import numpy as np
 import pandas as pd
@@ -11,160 +14,22 @@ from sklearn.metrics.pairwise import cosine_similarity
 from src.retrieval.dense_macro import DenseMacroRetriever
 
 
-def normalize_text(text: str) -> str:
+def normalize_text(text: Any) -> str:
     if text is None or (isinstance(text, float) and pd.isna(text)):
         return ""
-    text = str(text)
-    text = unicodedata.normalize("NFC", text)
+    text = unicodedata.normalize("NFC", str(text))
     text = re.sub(r"[ \t]+", " ", text)
     return text.strip().lower()
-
-
-class QuestionMemory:
-    def __init__(
-        self,
-        train_queries: list[dict[str, Any]],
-        min_similarity: float = 0.82,
-        dense_encoder: Callable[[list[str]], np.ndarray] | None = None,
-        dense_min_similarity: float = 0.85,
-    ):
-        """
-        train_queries: list of dicts with:
-          - query_id: str
-          - question_norm: str
-          - doc_ids: list of str (gold document IDs)
-        """
-        self.min_similarity = min_similarity
-        self.dense_min_similarity = dense_min_similarity
-        self.dense_encoder = dense_encoder
-        self.qids: list[str] = []
-        self.texts: list[str] = []
-        self.qid_to_docs: dict[str, list[str]] = {}
-
-        for q in train_queries:
-            qid = str(q["query_id"])
-            text = normalize_text(q.get("question_norm") or q.get("question_raw", ""))
-            doc_ids = [str(x) for x in q.get("doc_ids", [])]
-
-            self.qids.append(qid)
-            self.texts.append(text)
-            self.qid_to_docs[qid] = doc_ids
-
-        self.training_query_ids: frozenset[str] = frozenset(self.qids)
-
-        # Build word and character n-gram TF-IDF vectorizer
-        min_df = 1 if len(self.texts) < 20 else 2
-        self.vectorizer = TfidfVectorizer(
-            analyzer="char_wb",
-            ngram_range=(3, 5),
-            min_df=min_df,
-            sublinear_tf=True,
-        )
-        if self.texts:
-            self.tfidf_matrix = self.vectorizer.fit_transform(self.texts)
-        else:
-            self.tfidf_matrix = None
-
-        self.dense_embeddings = None
-        if self.dense_encoder and self.texts:
-            raw_embs = self.dense_encoder(self.texts)
-            # Normalize embeddings for cosine similarity via dot product
-            norms = np.linalg.norm(raw_embs, axis=1, keepdims=True)
-            norms[norms == 0] = 1.0
-            self.dense_embeddings = raw_embs / norms
-
-    def retrieve(
-        self,
-        query: str,
-        top_k: int = 5,
-        min_sim: float | None = None,
-        min_similarity: float | None = None,
-        dense_min_similarity: float | None = None,
-        exclude_qid: str | None = None,
-    ) -> dict[str, dict[str, Any]]:
-        """
-        Returns {doc_id: {"score": sim_score, "lexical_similarity": sim, "dense_similarity": d_sim, "matched_qid": qid, "vote_count": count}}
-        """
-        effective_lex_sim = min_similarity if min_similarity is not None else (min_sim if min_sim is not None else self.min_similarity)
-        effective_dense_sim = dense_min_similarity if dense_min_similarity is not None else self.dense_min_similarity
-
-        if not query or not self.texts:
-            return {}
-
-        norm_q = normalize_text(query)
-        doc_votes = defaultdict(lambda: {
-            "score": 0.0,
-            "lexical_similarity": 0.0,
-            "dense_similarity": 0.0,
-            "matched_qid": None,
-            "vote_count": 0,
-        })
-
-        # 1. Lexical TF-IDF match
-        if self.tfidf_matrix is not None:
-            q_vec = self.vectorizer.transform([norm_q])
-            sims = cosine_similarity(q_vec, self.tfidf_matrix)[0]
-            top_indices = np.argsort(sims)[::-1][:top_k * 4]
-
-            for idx in top_indices:
-                sim = float(sims[idx])
-                matched_qid = self.qids[idx]
-
-                if exclude_qid and str(matched_qid) == str(exclude_qid):
-                    continue
-                if sim < effective_lex_sim:
-                    continue
-
-                for doc_id in self.qid_to_docs.get(matched_qid, []):
-                    doc_votes[doc_id]["vote_count"] += 1
-                    if sim > doc_votes[doc_id]["lexical_similarity"]:
-                        doc_votes[doc_id]["lexical_similarity"] = sim
-                        doc_votes[doc_id]["score"] = max(doc_votes[doc_id]["score"], sim)
-                        doc_votes[doc_id]["matched_qid"] = matched_qid
-
-        # 2. Dense semantic question similarity match
-        if self.dense_encoder is not None and self.dense_embeddings is not None:
-            q_emb = self.dense_encoder([norm_q])
-            q_norm = np.linalg.norm(q_emb[0])
-            if q_norm > 0:
-                q_vec_norm = q_emb[0] / q_norm
-                dense_sims = np.dot(self.dense_embeddings, q_vec_norm)
-                top_dense_indices = np.argsort(dense_sims)[::-1][:top_k * 4]
-
-                for idx in top_dense_indices:
-                    d_sim = float(dense_sims[idx])
-                    matched_qid = self.qids[idx]
-
-                    if exclude_qid and str(matched_qid) == str(exclude_qid):
-                        continue
-                    if d_sim < effective_dense_sim:
-                        continue
-
-                    for doc_id in self.qid_to_docs.get(matched_qid, []):
-                        if doc_votes[doc_id]["vote_count"] == 0:
-                            doc_votes[doc_id]["vote_count"] += 1
-                        if d_sim > doc_votes[doc_id]["dense_similarity"]:
-                            doc_votes[doc_id]["dense_similarity"] = d_sim
-                            doc_votes[doc_id]["score"] = max(doc_votes[doc_id]["score"], d_sim)
-                            if doc_votes[doc_id]["matched_qid"] is None:
-                                doc_votes[doc_id]["matched_qid"] = matched_qid
-
-        return dict(doc_votes)
 
 
 class TrainQuestionMemory:
     """Fold-local memory over labelled training questions.
 
-    The index is rebuilt by :meth:`fit` from only the supplied questions and
-    qrels.  Character n-gram TF-IDF and optional DEk21-compatible question
-    embeddings are independent retrieval signals; each matching training
-    question casts one similarity-weighted vote for every gold document.
+    The index is built by :meth:`fit` strictly from training questions and their
+    gold qrels.  Validation queries and self-query IDs during training are isolated
+    to prevent any target leakage.
 
-    ``dense_encoder`` is intentionally injectable.  Production callers can
-    supply ``DenseMacroRetriever.encode_texts`` (the DEk21 v2 encoder), while
-    tests and offline callers can provide a deterministic encoder or precomputed
-    embeddings without downloading a model.  Set ``use_dense=True`` to lazily
-    construct the default DEk21 retriever when no dense source is supplied.
+    Supports character n-gram TF-IDF and DEk21-compatible question embeddings.
     """
 
     DEFAULT_MODEL_NAME = "CODE4LIFEOFFICIAL/huydang-dek21-embedding-v2"
@@ -390,21 +255,19 @@ class TrainQuestionMemory:
             return self._normalize_embeddings(record_embeddings)
         return None
 
-    def fit(self, train_queries: Any, qrels: Any) -> "TrainQuestionMemory":
+    def fit(self, train_queries: Any, qrels: Any = None) -> "TrainQuestionMemory":
         """Index only the supplied training questions and their gold qrels."""
         self._clear_index()
-        qrels_by_qid = self._qrel_records(qrels)
+        qrels_by_qid = self._qrel_records(qrels) if qrels is not None else {}
         query_records = self._query_records(train_queries)
 
         for qid, text, embedding in query_records:
-            # Requiring qrels here is the leakage guard: an unlabelled query,
-            # including a validation query accidentally passed alongside the
-            # fold, cannot become a memory entry.
-            if qid not in qrels_by_qid:
+            # Leakage guard: only queries with gold labels in the training set enter memory
+            if qrels is not None and qid not in qrels_by_qid:
                 continue
             self.qids.append(qid)
             self.texts.append(text)
-            self.qid_to_docs[qid] = qrels_by_qid[qid]
+            self.qid_to_docs[qid] = qrels_by_qid.get(qid, [])
 
         self.training_query_ids = frozenset(self.qids)
         if self.texts:
@@ -431,7 +294,13 @@ class TrainQuestionMemory:
             raise ValueError("q_emb must contain exactly one question embedding")
         return matrix[0]
 
-    def search(self, q_text: str, top_k: int = 5, q_emb: Any | None = None) -> list[dict[str, Any]]:
+    def search(
+        self,
+        q_text: str,
+        top_k: int = 5,
+        q_emb: Any | None = None,
+        exclude_qid: str | None = None,
+    ) -> list[dict[str, Any]]:
         """Return gold documents voted for by similar indexed questions."""
         if top_k <= 0 or not q_text or not self.texts:
             return []
@@ -455,6 +324,10 @@ class TrainQuestionMemory:
         votes: dict[str, dict[str, Any]] = {}
         best_contributions: dict[str, float] = {}
         for index, lexical_sim in enumerate(lexical_sims):
+            qid = self.qids[index]
+            if exclude_qid is not None and str(qid) == str(exclude_qid):
+                continue
+
             lexical_sim = float(lexical_sim)
             dense_sim = float(dense_sims[index]) if dense_sims is not None else 0.0
             lexical_match = lexical_sim >= self.min_similarity
@@ -465,8 +338,7 @@ class TrainQuestionMemory:
             lexical_score = lexical_sim if lexical_match else 0.0
             dense_score = dense_sim if dense_match else 0.0
             contribution = self.lexical_weight * lexical_score + self.dense_weight * dense_score
-            qid = self.qids[index]
-            for doc_id in self.qid_to_docs[qid]:
+            for doc_id in self.qid_to_docs.get(qid, []):
                 vote = votes.setdefault(
                     doc_id,
                     {
@@ -493,5 +365,97 @@ class TrainQuestionMemory:
             key=lambda vote: (-float(vote["score"]), str(vote["doc_id"])),
         )[:top_k]
 
-    query = search
-    retrieve = search
+    def query(
+        self,
+        q_text: str,
+        top_k: int = 5,
+        q_emb: Any | None = None,
+        exclude_qid: str | None = None,
+    ) -> list[dict[str, Any]]:
+        return self.search(q_text, top_k=top_k, q_emb=q_emb, exclude_qid=exclude_qid)
+
+    def retrieve(
+        self,
+        q_text: str,
+        top_k: int = 5,
+        q_emb: Any | None = None,
+        exclude_qid: str | None = None,
+        min_similarity: float | None = None,
+        min_sim: float | None = None,
+        dense_min_similarity: float | None = None,
+    ) -> Any:
+        # If called by legacy callers expecting dict return, support it
+        hits = self.search(q_text, top_k=top_k, q_emb=q_emb, exclude_qid=exclude_qid)
+        return {h["doc_id"]: h for h in hits}
+
+    def save(self, index_dir: str | Path) -> Path:
+        """Save question memory index to disk."""
+        index_dir = Path(index_dir)
+        index_dir.mkdir(parents=True, exist_ok=True)
+        data = {
+            "qids": self.qids,
+            "queries": self.texts,
+            "qrels": self.qid_to_docs,
+            "min_similarity": self.min_similarity,
+            "dense_min_similarity": self.dense_min_similarity,
+        }
+        with open(index_dir / "train_qa.json", "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        if self.dense_embeddings is not None:
+            np.save(str(index_dir / "train_embeddings.npy"), self.dense_embeddings.astype(np.float16))
+        return index_dir
+
+    @classmethod
+    def load(
+        cls,
+        index_dir: str | Path,
+        dense_retriever: Any | None = None,
+        min_similarity: float = 0.82,
+    ) -> "TrainQuestionMemory":
+        """Load question memory index from disk."""
+        index_dir = Path(index_dir)
+        qa_path = index_dir / "train_qa.json"
+        emb_path = index_dir / "train_embeddings.npy"
+        mem = cls(min_similarity=min_similarity, dense_encoder=dense_retriever)
+        if qa_path.exists():
+            with open(qa_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            queries = {qid: q for qid, q in zip(data["qids"], data["queries"])}
+            qrels = data["qrels"]
+            mem.fit(queries, qrels)
+            if emb_path.exists():
+                mem.dense_embeddings = np.load(str(emb_path))
+        return mem
+
+
+class QuestionMemory(TrainQuestionMemory):
+    """Compatibility subclass of TrainQuestionMemory with dict-oriented helper methods."""
+
+    def __init__(
+        self,
+        train_queries: list[dict[str, Any]] | None = None,
+        min_similarity: float = 0.82,
+        dense_encoder: Callable[[list[str]], np.ndarray] | None = None,
+        dense_min_similarity: float = 0.85,
+    ):
+        super().__init__(
+            min_similarity=min_similarity,
+            dense_encoder=dense_encoder,
+            dense_min_similarity=dense_min_similarity,
+            use_dense=dense_encoder is not None,
+        )
+        if train_queries is not None:
+            self.fit_records(train_queries)
+
+    def fit_records(self, train_queries: list[dict[str, Any]]) -> "QuestionMemory":
+        qrels_dict = {}
+        queries_dict = {}
+        for q in train_queries:
+            qid = str(q.get("query_id", q.get("qid", "")))
+            text = q.get("question_norm") or q.get("question_raw") or q.get("text", "")
+            doc_ids = q.get("doc_ids", [])
+            queries_dict[qid] = text
+            qrels_dict[qid] = [str(x) for x in doc_ids]
+
+        self.fit(queries_dict, qrels_dict)
+        return self

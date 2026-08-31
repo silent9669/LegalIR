@@ -6,7 +6,9 @@ import pandas as pd
 from src.core.config import load_pipeline_config
 from src.core.paths import ProjectPaths
 from src.retrieval.bm25_micro import BM25MicroRetriever
+from src.retrieval.bm25_pyvi import BM25PyViRetriever
 from src.retrieval.dense_macro import DenseMacroRetriever
+from src.retrieval.question_memory import TrainQuestionMemory
 
 
 def build_bm25_index(
@@ -21,8 +23,8 @@ def build_bm25_index(
     print(f"Loading micro chunks from {chunks_path}...")
 
     chunks_df = pd.read_parquet(chunks_path)
-    micro_chunks_df = chunks_df[chunks_df["granularity"] == "micro"]
-    print(f"Total micro chunks to index: {len(micro_chunks_df)}")
+    micro_chunks_df = chunks_df[chunks_df["granularity"] == "micro"] if "granularity" in chunks_df.columns else chunks_df
+    print(f"Total micro chunks to index for Legal BM25: {len(micro_chunks_df)}")
 
     micro_chunks = micro_chunks_df.to_dict(orient="records")
 
@@ -43,6 +45,40 @@ def build_bm25_index(
     print(f"BM25 micro index build completed successfully in {output_dir}!")
 
 
+def build_bm25_pyvi_index(
+    canonical_dir: str | Path = "artifacts/shared/canonical/v2",
+    output_dir: str | Path = "artifacts/local/indexes/bm25_pyvi",
+):
+    canonical_dir = Path(canonical_dir)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    chunks_path = canonical_dir / "chunks.parquet"
+    print(f"Loading micro chunks from {chunks_path}...")
+
+    chunks_df = pd.read_parquet(chunks_path)
+    micro_chunks_df = chunks_df[chunks_df["granularity"] == "micro"] if "granularity" in chunks_df.columns else chunks_df
+    print(f"Total micro chunks to index for PyVi BM25: {len(micro_chunks_df)}")
+
+    micro_chunks = micro_chunks_df.to_dict(orient="records")
+
+    bm25_pyvi = BM25PyViRetriever()
+    bm25_pyvi.fit(micro_chunks, show_progress=True)
+
+    save_path = output_dir / "bm25_pyvi_index.pkl"
+    print(f"Saving PyVi BM25 index to {save_path}...")
+    bm25_pyvi.save(save_path)
+
+    manifest = {
+        "index_type": "bm25_pyvi",
+        "total_micro_chunks": len(micro_chunks),
+        "avg_len": bm25_pyvi.avg_len,
+        "vocabulary_size": len(bm25_pyvi.idf),
+    }
+    (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    print(f"PyVi BM25 index build completed successfully in {output_dir}!")
+
+
 def build_dense_index(
     canonical_dir: str | Path = "artifacts/shared/canonical/v2",
     output_dir: str | Path = "artifacts/local/indexes/dense",
@@ -60,7 +96,7 @@ def build_dense_index(
     print(f"Loading macro chunks from {chunks_path}...")
 
     chunks_df = pd.read_parquet(chunks_path)
-    macro_chunks_df = chunks_df[chunks_df["granularity"] == "macro"]
+    macro_chunks_df = chunks_df[chunks_df["granularity"] == "macro"] if "granularity" in chunks_df.columns else chunks_df
     print(f"Total macro chunks to encode: {len(macro_chunks_df)}")
 
     macro_chunks = macro_chunks_df.to_dict(orient="records")
@@ -80,6 +116,7 @@ def main():
     parser = argparse.ArgumentParser(description="LegalIR Retrieval Index Builder")
     parser.add_argument("--config", type=str, default="configs/pipeline.yaml")
     parser.add_argument("--bm25", action="store_true", help="Build BM25 micro index")
+    parser.add_argument("--bm25-pyvi", action="store_true", help="Build PyVi BM25 micro index")
     parser.add_argument("--dense", action="store_true", help="Build Dense macro index")
     args = parser.parse_args()
 
@@ -90,11 +127,15 @@ def main():
 
     canonical_dir = paths.canonical
 
-    build_all = not args.bm25 and not args.dense
+    build_all = not args.bm25 and not getattr(args, "bm25_pyvi", False) and not args.dense
 
     if args.bm25 or build_all:
         bm25_out = paths.local_indexes / "bm25"
         build_bm25_index(canonical_dir, bm25_out)
+
+    if getattr(args, "bm25_pyvi", False) or build_all:
+        bm25_pyvi_out = paths.local_indexes / "bm25_pyvi"
+        build_bm25_pyvi_index(canonical_dir, bm25_pyvi_out)
 
     if args.dense or build_all:
         dense_out = paths.local_indexes / "dense"

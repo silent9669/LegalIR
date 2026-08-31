@@ -1,0 +1,8 @@
+environment: "kaggle"
+gpu: "T4_x2"
+batch_size_per_gpu: 16
+use_hf_token: true
+paths:
+  canonical: "artifacts/task1/data"
+  indexes: "artifacts/task1/indexes"
+  output_dir: "/kaggle/working/legalir_run"

@@ -22,10 +22,12 @@ class CrossEncoderReranker:
         score_fn: Callable[..., list[float]] | None = None,
         *,
         model_path: str | Path | None = None,
+        adapter_path: str | Path | None = None,
         manifest_path: str | Path | None = None,
         local_files_only: bool | None = None,
     ):
         self.model_name = str(model_name)
+        self.adapter_path = Path(adapter_path).expanduser() if adapter_path is not None else None
         self.model_path = self._resolve_model_path(model_path, manifest_path)
         self.local_files_only = (
             self.model_path is not None
@@ -79,10 +81,50 @@ class CrossEncoderReranker:
         import torch
         from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
-        model_source = str(self.model_path) if self.model_path is not None else self.model_name
+        # Check if an adapter checkpoint is specified or present in model_path
+        adapter_dir = None
+        if self.adapter_path is not None and Path(self.adapter_path).is_dir():
+            adapter_dir = Path(self.adapter_path)
+        elif self.model_path is not None and (Path(self.model_path) / "adapter_config.json").is_file():
+            adapter_dir = Path(self.model_path)
+
         load_kwargs = {"local_files_only": self.local_files_only}
-        self.tokenizer = AutoTokenizer.from_pretrained(model_source, **load_kwargs)
-        self.model = AutoModelForSequenceClassification.from_pretrained(model_source, **load_kwargs)
+
+        if adapter_dir is not None:
+            # PEFT LoRA adapter checkpoint loading
+            adapter_config_file = adapter_dir / "adapter_config.json"
+            base_model_source = self.model_name
+            if adapter_config_file.is_file():
+                try:
+                    cfg_data = json.loads(adapter_config_file.read_text(encoding="utf-8"))
+                    if "base_model_name_or_path" in cfg_data and cfg_data["base_model_name_or_path"]:
+                        # Use base model from adapter config unless user provided custom model_name
+                        if self.model_name == "BAAI/bge-reranker-v2-m3" or self.model_name == "":
+                            base_model_source = cfg_data["base_model_name_or_path"]
+                except Exception:
+                    pass
+
+            try:
+                self.tokenizer = AutoTokenizer.from_pretrained(str(adapter_dir), **load_kwargs)
+            except Exception:
+                self.tokenizer = AutoTokenizer.from_pretrained(base_model_source, **load_kwargs)
+
+            base_model = AutoModelForSequenceClassification.from_pretrained(
+                base_model_source,
+                num_labels=1,
+                **load_kwargs,
+            )
+            from peft import PeftModel
+
+            self.model = PeftModel.from_pretrained(base_model, str(adapter_dir), **load_kwargs)
+        else:
+            model_source = str(self.model_path) if self.model_path is not None else self.model_name
+            self.tokenizer = AutoTokenizer.from_pretrained(model_source, **load_kwargs)
+            self.model = AutoModelForSequenceClassification.from_pretrained(
+                model_source,
+                **load_kwargs,
+            )
+
         self.model.to(self.device)
         self.model.eval()
 
@@ -314,3 +356,101 @@ class CrossEncoderReranker:
                 "evidence_chunk_count": 0,
             })
         return reranked_target + remaining_candidates
+
+    def rerank_pairs(
+        self,
+        pairs: list[tuple[str, str]],
+        batch_size: int | None = None,
+        max_length: int = 256,
+    ) -> np.ndarray:
+        """Score pairs and return a NumPy array of float32 scores."""
+        if not pairs:
+            return np.array([], dtype=np.float32)
+        if self.model_name == "mock" and self.score_fn is None:
+            scores = []
+            for q, doc in pairs:
+                q_words = set(str(q).lower().split())
+                doc_words = set(str(doc).lower().split())
+                overlap = len(q_words & doc_words)
+                scores.append(float(overlap))
+            return np.array(scores, dtype=np.float32)
+        scores = self.score_pairs(pairs, batch_size=batch_size or 16, max_length=max_length)
+        return np.array(scores, dtype=np.float32)
+
+    def rerank_candidates(
+        self,
+        query: str,
+        candidates: list[dict[str, Any]],
+        evidence_texts: list[str] | None = None,
+        top_k: int = 5,
+    ) -> list[dict[str, Any]]:
+        """Rerank candidate list using pairs constructed from evidence texts."""
+        if not candidates:
+            return []
+        if evidence_texts is None:
+            evidence_texts = [c.get("evidence_text") or c.get("text_raw", "") for c in candidates]
+        pairs = [(query, str(text)[:1000]) for text in evidence_texts]
+        scores = self.rerank_pairs(pairs)
+        scored = []
+        for item, sc in zip(candidates, scores):
+            entry = dict(item)
+            entry["reranker_score"] = float(sc)
+            scored.append(entry)
+        scored.sort(key=lambda x: -x["reranker_score"])
+        for rank, item in enumerate(scored[:top_k], start=1):
+            item["final_rank"] = rank
+        return scored[:top_k]
+
+
+# Backward-compatibility alias
+BGEReranker = CrossEncoderReranker
+
+
+class DocumentReranker:
+    """Convenience wrapper for document-level reranking with evidence builder."""
+
+    def __init__(
+        self,
+        reranker: CrossEncoderReranker | None = None,
+        evidence_builder: EvidencePackBuilder | None = None,
+        doc_map: dict[str, Any] | None = None,
+        chunk_map: dict[str, list[dict[str, Any]]] | None = None,
+    ):
+        self.reranker = reranker
+        self.evidence_builder = evidence_builder or EvidencePackBuilder()
+        self.doc_map = doc_map or {}
+        self.chunk_map = chunk_map or {}
+
+    def rerank_documents(
+        self,
+        query: str,
+        candidates: list[dict[str, Any]],
+        top_k: int = 5,
+    ) -> list[dict[str, Any]]:
+        if not candidates or self.reranker is None:
+            return candidates[:top_k]
+
+        evidence_texts = []
+        valid_candidates = []
+
+        for c in candidates:
+            doc_id = str(c.get("doc_id", ""))
+            doc_info = self.doc_map.get(doc_id, {"doc_id": doc_id})
+            chunks = self.chunk_map.get(doc_id, [])
+
+            if not chunks and "best_chunk" in c:
+                chunks = [c["best_chunk"]]
+
+            if hasattr(self.evidence_builder, "build_pack") and (doc_id in getattr(self.evidence_builder, "chunks_by_doc", {}) or not chunks):
+                ev_text = self.evidence_builder.build_pack(query, doc_id, candidate_record=c)
+            else:
+                ev_text = self.evidence_builder.build_evidence_text(query, doc_info, chunks)
+            evidence_texts.append(ev_text)
+            valid_candidates.append(c)
+
+        reranked = self.reranker.rerank_candidates(
+            query, valid_candidates, evidence_texts=evidence_texts, top_k=top_k
+        )
+        return reranked
+
+

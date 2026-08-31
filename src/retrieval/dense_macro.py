@@ -12,7 +12,6 @@ import pandas as pd
 
 from src.models.device import resolve_device
 
-
 DEFAULT_MODEL_NAME = "CODE4LIFEOFFICIAL/huydang-dek21-embedding-v2"
 DEFAULT_DIMENSION = 768
 
@@ -123,6 +122,8 @@ class DenseMacroRetriever:
         return ViTokenizer.tokenize(normalized)
 
     def _load_model(self) -> None:
+        if self.model_name == "mock":
+            return
         if self.tokenizer is not None and self.model is not None:
             return
 
@@ -190,7 +191,13 @@ class DenseMacroRetriever:
         if self.query_encoder is not None:
             return self._coerce_embedding_matrix(self.query_encoder(normalized_texts))
 
+        if self.model_name == "mock":
+            np.random.seed(42)
+            emb = np.random.randn(len(normalized_texts), self.dimension).astype(np.float32)
+            return self._coerce_embedding_matrix(emb)
+
         self._load_model()
+
         import torch
         import torch.nn.functional as F
 
@@ -268,11 +275,11 @@ class DenseMacroRetriever:
             return
         try:
             import faiss
+            index = faiss.IndexFlatIP(self.dimension)
+            index.add(self.embeddings.astype(np.float32, copy=False))
+            self._faiss_index = index
         except ImportError:
-            return
-        index = faiss.IndexFlatIP(self.dimension)
-        index.add(self.embeddings.astype(np.float32, copy=False))
-        self._faiss_index = index
+            self._faiss_index = None
 
     def _validate_metadata_lengths(self) -> None:
         if self.embeddings is None:
@@ -348,13 +355,51 @@ class DenseMacroRetriever:
         self.query_ids = query_ids
         return self.encode_texts(texts, batch_size=batch_size, max_length=max_length)
 
-    def search(self, query: str, top_k: int = 50) -> list[dict[str, Any]]:
-        """Return top documents with scores aggregated from their best chunks."""
-        if top_k <= 0 or not query or self.embeddings is None or len(self.embeddings) == 0:
+    def encode_and_cache_queries(
+        self,
+        queries: Any,
+        cache_path: str | Path,
+        batch_size: int = 32,
+        max_length: int = 512,
+        dtype: np.dtype = np.float32,
+    ) -> np.ndarray:
+        """Encode queries and cache to disk, or load from cache if already present."""
+        cache_path = Path(cache_path)
+        if cache_path.exists():
+            embeddings = np.load(str(cache_path))
+            return self._normalize_embeddings(embeddings)
+
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        embeddings = self.encode_queries(queries, batch_size=batch_size, max_length=max_length)
+        np.save(str(cache_path), embeddings.astype(dtype))
+        return embeddings
+
+    def search(
+        self,
+        query: str,
+        top_k: int = 50,
+        q_emb: np.ndarray | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return top documents with scores aggregated from their best chunks.
+
+        Accepts either a raw query string or a precomputed query vector ``q_emb``.
+        """
+        if top_k <= 0 or self.embeddings is None or len(self.embeddings) == 0:
             return []
         self._validate_metadata_lengths()
 
-        q_vec = self.encode_queries([query], batch_size=1)[0].astype(np.float32, copy=False)
+        if q_emb is not None:
+            q_vec = np.asarray(q_emb, dtype=np.float32)
+            if q_vec.ndim == 2 and q_vec.shape[0] == 1:
+                q_vec = q_vec[0]
+            norm = np.linalg.norm(q_vec)
+            if norm > 0:
+                q_vec = q_vec / norm
+        else:
+            if not query:
+                return []
+            q_vec = self.encode_queries([query], batch_size=1)[0].astype(np.float32, copy=False)
+
         candidate_count = min(max(top_k * 6, top_k), len(self.embeddings))
         if self._faiss_index is not None:
             scores, indices = self._faiss_index.search(q_vec.reshape(1, -1), candidate_count)
@@ -384,21 +429,43 @@ class DenseMacroRetriever:
             document_records.append(
                 {
                     "doc_id": doc_id,
-                    "score": aggregate_score,
-                    "dense_score": aggregate_score,
-                    "dense_best_score": best_score,
-                    "dense_second_score": second_score,
-                    "dense_mean_score": mean_score,
+                    "score": float(aggregate_score),
+                    "dense_score": float(aggregate_score),
+                    "dense_best_score": float(best_score),
+                    "dense_second_score": float(second_score),
+                    "dense_mean_score": float(mean_score),
                     "dense_best_chunk_id": best_chunk_id,
                 }
             )
 
-        document_records.sort(key=lambda item: (-item["score"], item["doc_id"]))
+        document_records.sort(key=lambda item: (-item["score"], str(item["doc_id"])))
         return document_records[:top_k]
 
-    def retrieve(self, query: str, top_k: int = 50) -> list[dict[str, Any]]:
+    def retrieve(self, query: str, top_k: int = 50, q_emb: np.ndarray | None = None) -> list[dict[str, Any]]:
         """Backward-compatible alias for :meth:`search`."""
-        return self.search(query, top_k=top_k)
+        return self.search(query, top_k=top_k, q_emb=q_emb)
+
+    def fit(self, corpus: Any, batch_size: int = 32, max_length: int = 512):
+        """Fit / encode corpus for retrieval."""
+        self.encode_corpus(corpus, batch_size=batch_size, max_length=max_length)
+        return self
+
+    def save(self, output_dir: str | Path) -> Path:
+        """Save embeddings and chunk metadata to output directory."""
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        if self.embeddings is not None:
+            np.save(str(output_dir / "embeddings.npy"), self.embeddings.astype(np.float16))
+        meta_df = pd.DataFrame({"chunk_id": self.chunk_ids, "doc_id": self.doc_ids})
+        meta_df.to_parquet(output_dir / "chunks_meta.parquet", index=False)
+        manifest = {
+            "model_name": self.model_name,
+            "total_chunks": len(self.chunk_ids),
+            "dimension": self.dimension,
+            "use_pyvi": self.use_pyvi,
+        }
+        (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        return output_dir
 
     @classmethod
     def build(

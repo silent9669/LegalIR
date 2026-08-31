@@ -14,6 +14,7 @@ from src.core.paths import ProjectPaths
 from src.dataset.validator import validate_canonical_dataset
 from src.evaluation.benchmark import build_memory_rows
 from src.evaluation.submission import package_submission, validate_submission
+from src.models.parameter_audit import audit_system_parameters, MAX_PARAMETER_BUDGET, ParameterBudgetExceededError
 from src.pipeline.predict import LegalIRPipeline
 from src.ranking.evidence_pack import EvidencePackBuilder
 from src.ranking.fusion import LightGBMRanker, ReciprocalRankFusion
@@ -216,6 +217,22 @@ def run_all(
     config_file = _repo_path(paths, config_path)
     cfg = load_pipeline_config(config_file)
     use_reranker = _resolve_use_reranker(cfg, use_reranker)
+
+    # 0. Preflight Parameter Budget Audit (<4B Rule)
+    print("\n[Preflight] Running Strict Parameter Budget Audit (<4B Rule)...")
+    sub_dir = _repo_path(paths, submission_dir)
+    sub_dir.mkdir(parents=True, exist_ok=True)
+    audit_report = audit_system_parameters(
+        config_path=config_file,
+        output_json=sub_dir / "parameter_audit.json",
+        raise_on_violation=True,
+        offline_fallback=True,
+    )
+    print(
+        f"Parameter audit: {audit_report['total_learned_parameters']:,} parameters "
+        f"({audit_report['total_parameters_billions']:.4f}B / 4.0B, "
+        f"{audit_report['budget_utilization_pct']:.2f}% utilization). PASS\n"
+    )
 
     canonical_dir = _repo_path(
         paths,

@@ -5,6 +5,7 @@ import inspect
 from typing import Any
 
 from src.retrieval.bm25_micro import BM25MicroRetriever
+from src.retrieval.bm25_pyvi import BM25PyViRetriever
 from src.retrieval.dense_macro import DenseMacroRetriever
 from src.retrieval.exact_matcher import ExactMatcher
 from src.retrieval.question_memory import QuestionMemory, TrainQuestionMemory
@@ -12,15 +13,16 @@ from src.retrieval.types import CandidateRecord
 
 
 class HybridSearchEngine:
-    """Unify lexical, dense, memory, and exact candidate retrieval.
+    """Unify lexical (raw legal & PyVi), dense, memory, and exact candidate retrieval.
 
-    Each branch returns a ranked list of document records.  The engine removes
-    duplicate document IDs within a branch, unions the four branch outputs, and
-    ranks the union with weighted reciprocal-rank fusion.
+    Each branch returns a ranked list of document records. The engine removes
+    duplicate document IDs within a branch, unions all branch outputs, and
+    ranks the candidate union with weighted reciprocal-rank fusion (RRF).
     """
 
     DEFAULT_BRANCH_WEIGHTS = {
         "bm25": 1.0,
+        "bm25_pyvi": 1.0,
         "dense": 1.2,
         "memory": 2.0,
         "exact": 2.5,
@@ -32,22 +34,39 @@ class HybridSearchEngine:
         exact_matcher: ExactMatcher | None = None,
         question_memory: QuestionMemory | TrainQuestionMemory | None = None,
         dense_retriever: DenseMacroRetriever | None = None,
+        bm25_pyvi_retriever: BM25PyViRetriever | None = None,
         *,
+        bm25: Any | None = None,
+        bm25_pyvi: Any | None = None,
+        dense: Any | None = None,
+        exact: Any | None = None,
+        memory: Any | None = None,
         bm25_engine: Any | None = None,
         dense_macro: Any | None = None,
-        memory: Any | None = None,
         branch_weights: Mapping[str, float] | None = None,
     ):
-        """Create a hybrid engine.
-
-        The explicit ``*_retriever`` names are the public API used by the
-        pipeline.  The aliases keep the branch names from the design spec
-        usable by callers that construct the engine directly.
-        """
-        self.bm25 = bm25_retriever if bm25_retriever is not None else bm25_engine
-        self.exact = exact_matcher
-        self.memory = question_memory if question_memory is not None else memory
-        self.dense = dense_retriever if dense_retriever is not None else dense_macro
+        """Create a hybrid engine supporting up to 5 retrieval branches."""
+        self.bm25 = (
+            bm25_retriever
+            if bm25_retriever is not None
+            else (bm25 if bm25 is not None else bm25_engine)
+        )
+        self.bm25_pyvi = (
+            bm25_pyvi_retriever
+            if bm25_pyvi_retriever is not None
+            else (bm25_pyvi if bm25_pyvi is not None else None)
+        )
+        self.exact = exact_matcher if exact_matcher is not None else exact
+        self.memory = (
+            question_memory
+            if question_memory is not None
+            else (memory if memory is not None else None)
+        )
+        self.dense = (
+            dense_retriever
+            if dense_retriever is not None
+            else (dense if dense is not None else dense_macro)
+        )
 
         self.branch_weights = dict(self.DEFAULT_BRANCH_WEIGHTS)
         if branch_weights is not None:
@@ -65,10 +84,11 @@ class HybridSearchEngine:
         top_k_candidates: int = 100,
         rrf_k: int = 60,
         exclude_qid: str | None = None,
+        q_emb: Any | None = None,
     ) -> list[CandidateRecord]:
         """Retrieve and fuse up to ``top_k_candidates`` unique documents.
 
-        ``rrf_k`` is the standard RRF smoothing constant.  A branch's rank is
+        ``rrf_k`` is the standard RRF smoothing constant. A branch's rank is
         one-based and contributes ``weight / (rrf_k + rank)`` to its document.
         Branch-specific details and each contribution are retained in the
         returned candidate record for downstream ranking and inspection.
@@ -84,9 +104,13 @@ class HybridSearchEngine:
             branch_results["bm25"] = self._rank_branch(
                 self._retrieve(self.bm25, query, top_k_candidates), "bm25"
             )
+        if self.bm25_pyvi is not None:
+            branch_results["bm25_pyvi"] = self._rank_branch(
+                self._retrieve(self.bm25_pyvi, query, top_k_candidates), "bm25_pyvi"
+            )
         if self.dense is not None:
             branch_results["dense"] = self._rank_branch(
-                self._retrieve(self.dense, query, top_k_candidates), "dense"
+                self._retrieve_dense(self.dense, query, top_k_candidates, q_emb=q_emb), "dense"
             )
         if self.memory is not None:
             branch_results["memory"] = self._rank_branch(
@@ -95,6 +119,7 @@ class HybridSearchEngine:
                     query,
                     top_k_candidates,
                     exclude_qid=exclude_qid,
+                    q_emb=q_emb,
                 ),
                 "memory",
             )
@@ -116,6 +141,7 @@ class HybridSearchEngine:
         exclude_qid: str | None = None,
         top_k: int = 50,
         rrf_k: int = 60,
+        q_emb: Any | None = None,
         *,
         top_k_candidates: int | None = None,
     ) -> list[CandidateRecord]:
@@ -127,6 +153,40 @@ class HybridSearchEngine:
             top_k_candidates=top_k,
             rrf_k=rrf_k,
             exclude_qid=exclude_qid,
+            q_emb=q_emb,
+        )
+
+    def retrieve_candidates(
+        self,
+        query: str,
+        top_k: int = 60,
+        rrf_k: int = 60,
+        weights: Mapping[str, float] | None = None,
+        exclude_qid: str | None = None,
+        q_emb: Any | None = None,
+    ) -> list[CandidateRecord]:
+        """Alias for search_candidates supporting dynamic branch weights."""
+        if weights is not None:
+            old_weights = dict(self.branch_weights)
+            try:
+                for k, v in weights.items():
+                    if k in self.branch_weights:
+                        self.branch_weights[k] = float(v)
+                return self.search(
+                    query=query,
+                    top_k_candidates=top_k,
+                    rrf_k=rrf_k,
+                    exclude_qid=exclude_qid,
+                    q_emb=q_emb,
+                )
+            finally:
+                self.branch_weights = old_weights
+        return self.search(
+            query=query,
+            top_k_candidates=top_k,
+            rrf_k=rrf_k,
+            exclude_qid=exclude_qid,
+            q_emb=q_emb,
         )
 
     @staticmethod
@@ -140,7 +200,13 @@ class HybridSearchEngine:
         raise TypeError(f"retriever must expose one of {', '.join(names)}")
 
     @staticmethod
-    def _invoke(method: Any, query: str, top_k: int, exclude_qid: str | None = None) -> Any:
+    def _invoke(
+        method: Any,
+        query: str,
+        top_k: int,
+        exclude_qid: str | None = None,
+        q_emb: Any | None = None,
+    ) -> Any:
         """Call branch methods while supporting legacy and new signatures."""
         try:
             parameters = inspect.signature(method).parameters
@@ -160,6 +226,8 @@ class HybridSearchEngine:
             "exclude_qid" in parameters or accepts_kwargs
         ):
             kwargs["exclude_qid"] = exclude_qid
+        if q_emb is not None and ("q_emb" in parameters or accepts_kwargs):
+            kwargs["q_emb"] = q_emb
 
         if parameters:
             return method(query, **kwargs)
@@ -174,15 +242,21 @@ class HybridSearchEngine:
         return cls._invoke(method, query, top_k)
 
     @classmethod
+    def _retrieve_dense(cls, retriever: Any, query: str, top_k: int, q_emb: Any | None = None) -> Any:
+        method = cls._method(retriever, ("retrieve", "search", "query"))
+        return cls._invoke(method, query, top_k, q_emb=q_emb)
+
+    @classmethod
     def _retrieve_memory(
         cls,
         memory: Any,
         query: str,
         top_k: int,
-        exclude_qid: str | None,
+        exclude_qid: str | None = None,
+        q_emb: Any | None = None,
     ) -> Any:
         method = cls._method(memory, ("query", "search", "retrieve"))
-        return cls._invoke(method, query, top_k, exclude_qid=exclude_qid)
+        return cls._invoke(method, query, top_k, exclude_qid=exclude_qid, q_emb=q_emb)
 
     @classmethod
     def _match_exact(cls, matcher: Any, query: str) -> Any:
@@ -287,24 +361,28 @@ class HybridSearchEngine:
         }
         records: list[CandidateRecord] = []
 
+        all_branches = ("bm25", "bm25_pyvi", "dense", "memory", "exact")
+
         for doc_id in doc_ids:
             branch_contributions: dict[str, float] = {}
             branch_ranks: dict[str, int] = {}
             branch_metadata: dict[str, dict[str, Any]] = {}
             rrf_score = 0.0
 
-            for branch in ("bm25", "dense", "memory", "exact"):
+            for branch in all_branches:
                 ranks, details = branch_results.get(branch, ({}, {}))
                 rank = ranks.get(doc_id)
                 if rank is None:
                     continue
-                contribution = float(weights[branch]) / (rrf_k + rank)
+                w = float(weights.get(branch, 1.0))
+                contribution = w / (rrf_k + rank)
                 branch_ranks[branch] = rank
                 branch_contributions[branch] = contribution
-                branch_metadata[branch] = details[doc_id]
+                branch_metadata[branch] = details.get(doc_id, {})
                 rrf_score += contribution
 
             bm25_info = branch_metadata.get("bm25", {})
+            bm25_pyvi_info = branch_metadata.get("bm25_pyvi", {})
             dense_info = branch_metadata.get("dense", {})
             memory_info = branch_metadata.get("memory", {})
             exact_info = branch_metadata.get("exact", {})
@@ -317,18 +395,34 @@ class HybridSearchEngine:
                 "branch_ranks": branch_ranks,
                 "branch_contributions": branch_contributions,
                 "branch_metadata": branch_metadata,
+                # BM25 Raw / Legal
                 "bm25_rank": branch_ranks.get("bm25"),
                 "bm25_score": cls._score(bm25_info, "bm25"),
+                "bm25_raw_score": cls._as_float(bm25_info.get("bm25_raw_score", 0.0)),
                 "bm25_best_score": cls._as_float(bm25_info.get("bm25_best_score", 0.0)),
                 "bm25_second_score": cls._as_float(bm25_info.get("bm25_second_score", 0.0)),
                 "bm25_mean_score": cls._as_float(bm25_info.get("bm25_mean_score", 0.0)),
                 "bm25_best_chunk_id": bm25_info.get("bm25_best_chunk_id"),
+                "bm25_legal_boost": cls._as_float(bm25_info.get("bm25_legal_boost", 0.0)),
+                # BM25 PyVi
+                "bm25_pyvi_rank": branch_ranks.get("bm25_pyvi"),
+                "bm25_pyvi_score": cls._score(bm25_pyvi_info, "bm25_pyvi"),
+                "bm25_pyvi_best_score": cls._as_float(bm25_pyvi_info.get("bm25_pyvi_best_score", 0.0)),
+                "bm25_pyvi_second_score": cls._as_float(bm25_pyvi_info.get("bm25_pyvi_second_score", 0.0)),
+                "bm25_pyvi_mean_score": cls._as_float(bm25_pyvi_info.get("bm25_pyvi_mean_score", 0.0)),
+                "bm25_pyvi_best_chunk_id": bm25_pyvi_info.get("bm25_pyvi_best_chunk_id"),
+                # Exact match
                 "exact_score": exact_score,
                 "exact_match_score": exact_score,
                 "exact_legal_number": bool(exact_info.get("exact_legal_number", False)),
-                "exact_title": bool(exact_info.get("exact_title", False)),
+                "exact_article": bool(exact_info.get("exact_article", False)),
+                "exact_clause": bool(exact_info.get("exact_clause", False)),
+                "exact_point": bool(exact_info.get("exact_point", False)),
                 "exact_year": bool(exact_info.get("exact_year", False)),
                 "exact_doc_type": bool(exact_info.get("exact_doc_type", False)),
+                "exact_title": bool(exact_info.get("exact_title", False)),
+                "exact_title_overlap": cls._as_float(exact_info.get("exact_title_overlap", 0.0)),
+                # Memory
                 "memory_rank": branch_ranks.get("memory"),
                 "memory_score": cls._score(memory_info, "memory"),
                 "memory_lexical_similarity": cls._as_float(
@@ -336,13 +430,19 @@ class HybridSearchEngine:
                 ),
                 "memory_dense_similarity": cls._as_float(memory_info.get("dense_similarity", 0.0)),
                 "memory_vote_count": int(cls._as_float(memory_info.get("vote_count", 0))),
+                # Dense Macro
                 "dense_rank": branch_ranks.get("dense"),
                 "dense_score": cls._score(dense_info, "dense"),
                 "dense_best_score": cls._as_float(dense_info.get("dense_best_score", 0.0)),
                 "dense_second_score": cls._as_float(dense_info.get("dense_second_score", 0.0)),
+                "dense_mean_score": cls._as_float(dense_info.get("dense_mean_score", 0.0)),
                 "dense_best_chunk_id": dense_info.get("dense_best_chunk_id"),
             }
             records.append(record)
 
-        records.sort(key=lambda candidate: (-candidate["rrf_score"], candidate["doc_id"]))
+        records.sort(key=lambda candidate: (-candidate["rrf_score"], str(candidate["doc_id"])))
         return records[:top_k_candidates]
+
+
+# Backward-compatibility alias
+CandidateRetriever = HybridSearchEngine

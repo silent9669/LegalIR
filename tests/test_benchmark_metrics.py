@@ -63,6 +63,8 @@ def test_default_candidate_cutoffs_cover_standard_diagnostics():
         "candidate_recall@20",
         "candidate_recall@50",
         "candidate_recall@100",
+        "candidate_recall@150",
+        "candidate_recall@200",
     }
 
 
@@ -335,6 +337,8 @@ def test_run_split_eval_reports_candidate_and_final_metrics():
         "candidate_recall@20",
         "candidate_recall@50",
         "candidate_recall@100",
+        "candidate_recall@150",
+        "candidate_recall@200",
     }
     assert metrics["Recall@1"] == 0.0
     assert metrics["Recall@3"] == 1.0

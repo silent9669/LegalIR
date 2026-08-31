@@ -1,12 +1,22 @@
 from collections.abc import Iterable as IterableABC
 from collections.abc import Mapping
 from typing import Any, Iterable
-
 import numpy as np
 
 
-DEFAULT_CANDIDATE_CUTOFFS = (20, 50, 100)
+DEFAULT_CANDIDATE_CUTOFFS = (20, 50, 100, 150, 200)
 FINAL_RANKING_METRICS = ("recall_at_1", "recall_at_3", "recall_at_5", "precision_at_5")
+ALL_EVALUATION_METRICS = (
+    "recall_at_1",
+    "recall_at_3",
+    "recall_at_5",
+    "precision_at_1",
+    "precision_at_3",
+    "precision_at_5",
+    "mrr",
+    "map",
+    "ndcg_at_5",
+)
 
 
 def _stringify_id(value: Any) -> str:
@@ -74,8 +84,22 @@ def normalize_candidate_cutoffs(cutoffs: Iterable[int] | int | str | None = None
     return normalized
 
 
-def evaluate_predictions(y_pred: dict[str, Any], y_true: dict[str, Any]) -> dict[str, Any]:
-    """Exact Codabench retrieval evaluation function."""
+def evaluate_predictions(
+    y_pred: dict[str, Any],
+    y_true: dict[str, Any],
+    candidate_pools: dict[str, Any] | None = None,
+    runtimes: dict[str, float] | list[float] | float | None = None,
+    cutoffs: Iterable[int] | None = None,
+) -> dict[str, Any]:
+    """
+    Exact Codabench retrieval evaluation function with full metric reporting:
+    - Official Codabench Recall & Precision
+    - Recall@1, Recall@3, Recall@5
+    - Precision@1, Precision@3, Precision@5
+    - Candidate Recall@20, @50, @100, @150, @200 (if candidate_pools provided)
+    - MRR, MAP, nDCG@5
+    - Runtime per query (if runtimes provided)
+    """
     normalized_pred = _normalize_query_values(y_pred)
     normalized_true = _normalize_query_values(y_true)
 
@@ -84,6 +108,12 @@ def evaluate_predictions(y_pred: dict[str, Any], y_true: dict[str, Any]) -> dict
     r1_list = []
     r3_list = []
     r5_list = []
+    p1_list = []
+    p3_list = []
+    p5_list = []
+    mrr_list = []
+    map_list = []
+    ndcg5_list = []
 
     for qid, gold_list in normalized_true.items():
         gold_set = set(gold_list)
@@ -97,28 +127,78 @@ def evaluate_predictions(y_pred: dict[str, Any], y_true: dict[str, Any]) -> dict
         if 0 < len(preds) <= 5:
             rec = len(gold_set & pred_set) / len(gold_set)
             prec = len(gold_set & pred_set) / len(preds)
+
+            top1 = set(preds[:1])
+            top3 = set(preds[:3])
+            top5 = set(preds[:5])
+            r1 = len(gold_set & top1) / len(gold_set)
+            r3 = len(gold_set & top3) / len(gold_set)
+            r5 = rec
+            p1 = len(gold_set & top1) / len(preds[:1]) if len(preds[:1]) > 0 else 0.0
+            p3 = len(gold_set & top3) / len(preds[:3]) if len(preds[:3]) > 0 else 0.0
+            p5 = prec
+
+            # MRR (Mean Reciprocal Rank @ 5)
+            rr = 0.0
+            for rank, doc_id in enumerate(preds[:5], start=1):
+                if doc_id in gold_set:
+                    rr = 1.0 / rank
+                    break
+
+            # MAP (Mean Average Precision @ 5)
+            ap = 0.0
+            hits = 0
+            for rank, doc_id in enumerate(preds[:5], start=1):
+                if doc_id in gold_set:
+                    hits += 1
+                    ap += hits / rank
+            map_score = ap / len(gold_set) if len(gold_set) > 0 else 0.0
+
+            # nDCG@5 (Normalized Discounted Cumulative Gain @ 5)
+            dcg = 0.0
+            for rank, doc_id in enumerate(preds[:5], start=1):
+                if doc_id in gold_set:
+                    dcg += 1.0 / np.log2(rank + 1.0)
+            idcg = sum(1.0 / np.log2(i + 1.0) for i in range(1, min(len(gold_set), 5) + 1))
+            ndcg_score = float(dcg / idcg) if idcg > 0.0 else 0.0
         else:
             rec = 0.0
             prec = 0.0
+            r1 = 0.0
+            r3 = 0.0
+            r5 = 0.0
+            p1 = 0.0
+            p3 = 0.0
+            p5 = 0.0
+            rr = 0.0
+            map_score = 0.0
+            ndcg_score = 0.0
 
         recalls.append(rec)
         precisions.append(prec)
-
-        # Standard Top-K Recall metrics
-        top1 = set(preds[:1])
-        top3 = set(preds[:3])
-        top5 = set(preds[:5])
-        r1_list.append(len(gold_set & top1) / len(gold_set))
-        r3_list.append(len(gold_set & top3) / len(gold_set))
-        r5_list.append(len(gold_set & top5) / len(gold_set))
+        r1_list.append(r1)
+        r3_list.append(r3)
+        r5_list.append(r5)
+        p1_list.append(p1)
+        p3_list.append(p3)
+        p5_list.append(p5)
+        mrr_list.append(rr)
+        map_list.append(map_score)
+        ndcg5_list.append(ndcg_score)
 
     mean_rec = float(np.mean(recalls)) if recalls else 0.0
     mean_prec = float(np.mean(precisions)) if precisions else 0.0
     mean_r1 = float(np.mean(r1_list)) if r1_list else 0.0
     mean_r3 = float(np.mean(r3_list)) if r3_list else 0.0
     mean_r5 = float(np.mean(r5_list)) if r5_list else 0.0
+    mean_p1 = float(np.mean(p1_list)) if p1_list else 0.0
+    mean_p3 = float(np.mean(p3_list)) if p3_list else 0.0
+    mean_p5 = float(np.mean(p5_list)) if p5_list else 0.0
+    mean_mrr = float(np.mean(mrr_list)) if mrr_list else 0.0
+    mean_map = float(np.mean(map_list)) if map_list else 0.0
+    mean_ndcg5 = float(np.mean(ndcg5_list)) if ndcg5_list else 0.0
 
-    return {
+    metrics: dict[str, Any] = {
         # Codabench-compatible aggregate names.
         "recall": mean_rec,
         "precision": mean_prec,
@@ -126,18 +206,70 @@ def evaluate_predictions(y_pred: dict[str, Any], y_true: dict[str, Any]) -> dict
         "recall_at_1": mean_r1,
         "recall_at_3": mean_r3,
         "recall_at_5": mean_r5,
+        "precision_at_1": mean_p1,
+        "precision_at_3": mean_p3,
         "precision_at_5": mean_prec,
         # Public report aliases used by the benchmark acceptance contract.
         "recall@1": mean_r1,
         "recall@3": mean_r3,
         "recall@5": mean_r5,
+        "precision@1": mean_p1,
+        "precision@3": mean_p3,
         "precision@5": mean_prec,
         "Recall@1": mean_r1,
         "Recall@3": mean_r3,
         "Recall@5": mean_r5,
+        "Precision@1": mean_p1,
+        "Precision@3": mean_p3,
         "Precision@5": mean_prec,
+        # IR Ranking metrics
+        "mrr": mean_mrr,
+        "MRR": mean_mrr,
+        "mrr@5": mean_mrr,
+        "map": mean_map,
+        "MAP": mean_map,
+        "map@5": mean_map,
+        "ndcg_at_5": mean_ndcg5,
+        "ndcg@5": mean_ndcg5,
+        "nDCG@5": mean_ndcg5,
         "total_evaluated_queries": len(recalls),
     }
+
+    # Candidate Recall cutoffs if candidate_pools provided
+    if candidate_pools is not None:
+        cand_cutoffs = normalize_candidate_cutoffs(cutoffs)
+        cand_metrics = compute_candidate_cutoffs(candidate_pools, y_true, cutoffs=cand_cutoffs)
+        metrics.update(cand_metrics)
+        for k, v in cand_metrics.items():
+            num = k.split("@")[-1]
+            metrics[f"cand@{num}"] = v
+            metrics[f"Candidate Recall@{num}"] = v
+
+    # Runtime metrics if runtimes provided
+    if runtimes is not None:
+        num_q = max(1, len(recalls))
+        if isinstance(runtimes, Mapping):
+            times = [float(v) for v in runtimes.values()]
+            total_sec = float(sum(times))
+            mean_sec = float(np.mean(times)) if times else 0.0
+        elif isinstance(runtimes, (list, tuple, np.ndarray)):
+            times = [float(v) for v in runtimes]
+            total_sec = float(sum(times))
+            mean_sec = float(np.mean(times)) if times else 0.0
+        elif isinstance(runtimes, (int, float)):
+            total_sec = float(runtimes)
+            mean_sec = total_sec / num_q
+        else:
+            total_sec = 0.0
+            mean_sec = 0.0
+
+        metrics["runtime_per_query_seconds"] = mean_sec
+        metrics["runtime_per_query_ms"] = mean_sec * 1000.0
+        metrics["runtime_per_query"] = mean_sec
+        metrics["total_runtime_seconds"] = total_sec
+        metrics["queries_per_second"] = (num_q / total_sec) if total_sec > 0 else 0.0
+
+    return metrics
 
 
 def compute_candidate_recall(
@@ -180,7 +312,7 @@ def compute_candidate_cutoffs(
     ground_truths: dict[str, Any],
     cutoffs: Iterable[int] | None = None,
 ) -> dict[str, float]:
-    """Compute candidate recall for the standard diagnostic cutoffs."""
+    """Compute candidate recall for diagnostic cutoffs (e.g. 20, 50, 100, 150, 200)."""
     normalized_cutoffs = normalize_candidate_cutoffs(cutoffs)
     return {
         f"candidate_recall@{cutoff}": compute_candidate_recall(

@@ -1,0 +1,39 @@
+{
+  "is_compliant": true,
+  "verdict": "PASS",
+  "total_learned_parameters": 702754049,
+  "total_parameters_billions": 0.702754,
+  "budget_limit": 4000000000,
+  "budget_limit_billions": 4.0,
+  "budget_utilization_pct": 17.5689,
+  "headroom_parameters": 3297245951,
+  "headroom_billions": 3.297246,
+  "models": {
+    "CODE4LIFEOFFICIAL/huydang-dek21-embedding-v2": {
+      "model_name": "CODE4LIFEOFFICIAL/huydang-dek21-embedding-v2",
+      "role": "dense_embedding",
+      "parameters": 134998272,
+      "parameters_billions": 0.134998,
+      "trainable_parameters": 134998272,
+      "is_peft_lora": false,
+      "base_parameters": 134998272,
+      "adapter_parameters": 0
+    },
+    "BAAI/bge-reranker-v2-m3": {
+      "model_name": "BAAI/bge-reranker-v2-m3",
+      "role": "cross_encoder_reranker",
+      "parameters": 567755777,
+      "parameters_billions": 0.567756,
+      "trainable_parameters": 567755777,
+      "is_peft_lora": false,
+      "base_parameters": 567755777,
+      "adapter_parameters": 0
+    }
+  },
+  "audit_timestamp_utc": "2026-08-31T07:46:50.178670+00:00",
+  "rule_compliance": {
+    "max_allowed_budget": 4000000000,
+    "passed": true,
+    "rule": "Total learned parameters across all models in Task 1 system must be < 4,000,000,000 (<4B)"
+  }
+}

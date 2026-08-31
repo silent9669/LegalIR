@@ -1,11 +1,12 @@
 from collections.abc import Iterable
+from pathlib import Path
 from typing import Any
 
 from tqdm import tqdm
 
 from src.ranking.evidence_pack import EvidencePackBuilder
 from src.ranking.fusion import LightGBMRanker, ReciprocalRankFusion
-from src.ranking.reranker import CrossEncoderReranker
+from src.ranking.reranker import CrossEncoderReranker, DocumentReranker
 from src.ranking.selector import TopKSelector
 from src.retrieval.hybrid_search import HybridSearchEngine
 
@@ -15,18 +16,23 @@ class LegalIRPipeline:
 
     def __init__(
         self,
-        hybrid_engine: HybridSearchEngine,
-        evidence_builder: EvidencePackBuilder,
-        reranker: CrossEncoderReranker | None = None,
+        hybrid_engine: HybridSearchEngine | None = None,
+        evidence_builder: EvidencePackBuilder | None = None,
+        reranker: CrossEncoderReranker | DocumentReranker | None = None,
         ranker: ReciprocalRankFusion | LightGBMRanker | None = None,
         selector: TopKSelector | None = None,
         candidate_k: int = 150,
         rerank_k: int = 50,
         fallback_doc_ids: list[str] | None = None,
         valid_doc_ids: Iterable[str] | None = None,
+        *,
+        retriever: Any | None = None,
     ):
-        self.hybrid_engine = hybrid_engine
-        self.evidence_builder = evidence_builder
+        engine = hybrid_engine if hybrid_engine is not None else retriever
+        if engine is None:
+            raise ValueError("hybrid_engine or retriever must be provided")
+        self.hybrid_engine = engine
+        self.evidence_builder = evidence_builder or EvidencePackBuilder()
         self.reranker = reranker
         self.ranker = ranker or ReciprocalRankFusion()
         self.selector = selector or TopKSelector(max_k=5)
@@ -86,21 +92,43 @@ class LegalIRPipeline:
         if not question.strip():
             return self._fallback_answer()
 
-        candidates = self.hybrid_engine.search_candidates(
-            query=question,
-            exclude_qid=str(query_id) if query_id else None,
-            top_k=self.candidate_k,
-        )
+        if hasattr(self.hybrid_engine, "search_candidates"):
+            candidates = self.hybrid_engine.search_candidates(
+                query=question,
+                exclude_qid=str(query_id) if query_id else None,
+                top_k=self.candidate_k,
+            )
+        elif hasattr(self.hybrid_engine, "retrieve_candidates"):
+            candidates = self.hybrid_engine.retrieve_candidates(
+                query=question,
+                top_k=self.candidate_k,
+            )
+        elif hasattr(self.hybrid_engine, "search"):
+            candidates = self.hybrid_engine.search(
+                query=question,
+                top_k_candidates=self.candidate_k,
+                exclude_qid=str(query_id) if query_id else None,
+            )
+        else:
+            candidates = []
+
         if not candidates:
             return self._fallback_answer()
 
         if self.reranker is not None:
-            candidates = self.reranker.rerank(
-                query=question,
-                candidates=candidates,
-                evidence_builder=self.evidence_builder,
-                top_k=self.rerank_k,
-            )
+            if hasattr(self.reranker, "rerank"):
+                candidates = self.reranker.rerank(
+                    query=question,
+                    candidates=candidates,
+                    evidence_builder=self.evidence_builder,
+                    top_k=self.rerank_k,
+                )
+            elif hasattr(self.reranker, "rerank_documents"):
+                candidates = self.reranker.rerank_documents(
+                    query=question,
+                    candidates=candidates,
+                    top_k=self.rerank_k,
+                )
 
         if hasattr(self.ranker, "predict"):
             ranked = self.ranker.predict(candidates)
@@ -109,18 +137,80 @@ class LegalIRPipeline:
         else:
             ranked = candidates
 
-        selected = self.selector.select(ranked)
+        selected = self.selector.select(ranked, valid_doc_ids=self.valid_doc_ids)
         return self._sanitize_answer(selected)
+
+    def audit_parameters(
+        self,
+        output_json: str | Path | None = None,
+        raise_on_violation: bool = True,
+    ) -> dict[str, Any]:
+        """Perform a strict parameter audit of all models in this pipeline against the 4B limit."""
+        from src.models.parameter_audit import audit_system_parameters
+
+        models_to_audit = []
+        if hasattr(self.hybrid_engine, "dense_retriever") and self.hybrid_engine.dense_retriever is not None:
+            dense_ret = self.hybrid_engine.dense_retriever
+            if hasattr(dense_ret, "model") and dense_ret.model is not None:
+                models_to_audit.append((dense_ret.model, getattr(dense_ret, "model_name", "dense_embedding"), "dense_embedding"))
+            elif getattr(dense_ret, "model_name", None):
+                models_to_audit.append({"name": str(dense_ret.model_name), "role": "dense_embedding"})
+
+        if self.reranker is not None:
+            if hasattr(self.reranker, "model") and self.reranker.model is not None:
+                models_to_audit.append((self.reranker.model, getattr(self.reranker, "model_name", "cross_encoder_reranker"), "cross_encoder_reranker"))
+            elif getattr(self.reranker, "model_name", None):
+                models_to_audit.append({"name": str(self.reranker.model_name), "role": "cross_encoder_reranker"})
+
+        if not models_to_audit:
+            models_to_audit = None
+
+        return audit_system_parameters(
+            models=models_to_audit,
+            output_json=output_json,
+            raise_on_violation=raise_on_violation,
+            offline_fallback=True,
+        )
+
+    def predict_single(
+        self,
+        query: str,
+        query_id: str | None = None,
+        top_k_candidates: int | None = None,
+        top_k_rerank: int | None = None,
+    ) -> list[str]:
+        """Predict top document IDs for a single query."""
+        old_cand_k = self.candidate_k
+        old_rerank_k = self.rerank_k
+        try:
+            if top_k_candidates is not None:
+                self.candidate_k = int(top_k_candidates)
+            if top_k_rerank is not None:
+                self.rerank_k = int(top_k_rerank)
+            return self.predict_one(query_id=query_id or "0", question=query)
+        finally:
+            self.candidate_k = old_cand_k
+            self.rerank_k = old_rerank_k
 
     def predict_batch(
         self,
-        queries: dict[str, str],
+        queries: dict[str, str] | list[dict[str, Any]],
         show_progress: bool = False,
     ) -> dict[str, dict[str, list[str]]]:
         """Return ``{query_id: {"answer": [document_id, ...]}}``."""
+        if isinstance(queries, list):
+            query_map = {}
+            for item in queries:
+                qid = str(item.get("id") or item.get("query_id") or "")
+                qtext = item.get("question") or item.get("question_raw") or item.get("question_norm") or ""
+                query_map[qid] = qtext
+            query_dict = query_map
+        else:
+            query_dict = queries
+
         results: dict[str, dict[str, list[str]]] = {}
         iterator = sorted(
-            queries.items(),
+            query_dict.items(),
             key=lambda item: (
                 0,
                 int(item[0]),
@@ -136,3 +226,117 @@ class LegalIRPipeline:
             results[str(query_id)] = {"answer": answer}
 
         return results
+
+    @classmethod
+    def load_pipeline(
+        cls,
+        data_dir: str | Path = "artifacts/task1/data",
+        index_dir: str | Path = "artifacts/task1/indexes",
+        use_reranker: bool = True,
+        device: str | None = None,
+        audit_preflight: bool = False,
+        audit_output_json: str | Path | None = None,
+    ) -> "LegalIRPipeline":
+        """Load fully instantiated pipeline from index and data artifacts."""
+        import json
+        import pandas as pd
+        from src.ranking.reranker import CrossEncoderReranker
+        from src.retrieval.bm25_micro import BM25MicroRetriever
+        from src.retrieval.bm25_pyvi import BM25PyViRetriever
+        from src.retrieval.dense_macro import DenseMacroRetriever
+        from src.retrieval.exact_matcher import ExactMatcher
+        from src.retrieval.question_memory import QuestionMemory, TrainQuestionMemory
+
+        data_dir = Path(data_dir)
+        index_dir = Path(index_dir)
+
+        docs_path = data_dir / "documents.parquet"
+        chunks_path = data_dir / "chunks.parquet"
+
+        doc_map = {}
+        valid_doc_ids = set()
+        if docs_path.exists():
+            docs_df = pd.read_parquet(docs_path, columns=["doc_id", "title", "name_raw", "legal_number"])
+            for r in docs_df.to_dict("records"):
+                did = str(r["doc_id"])
+                doc_map[did] = r
+                valid_doc_ids.add(did)
+
+        # 1. BM25 Micro (Legal / Raw)
+        bm25_path = index_dir / "bm25"
+        if bm25_path.exists():
+            bm25 = BM25MicroRetriever.load(bm25_path)
+        else:
+            bm25 = BM25MicroRetriever()
+
+        # 1b. BM25 PyVi
+        bm25_pyvi_path = index_dir / "bm25_pyvi"
+        if bm25_pyvi_path.exists():
+            bm25_pyvi = BM25PyViRetriever.load(bm25_pyvi_path)
+        else:
+            bm25_pyvi = None
+
+        # 2. DEk21 Dense Macro
+        dense_path = index_dir / "dense_dek21"
+        if not dense_path.exists():
+            dense_path = index_dir / "dense"
+        if dense_path.exists():
+            try:
+                dense = DenseMacroRetriever.load(dense_path, device=device)
+            except Exception:
+                dense = None
+        else:
+            dense = None
+
+        # 3. Question Memory
+        mem_path = index_dir / "question_memory"
+        if mem_path.exists():
+            memory = TrainQuestionMemory.load(mem_path, dense_retriever=dense)
+        else:
+            memory = TrainQuestionMemory()
+
+        # 4. Exact Matcher
+        exact = ExactMatcher(documents=list(doc_map.values()))
+
+        hybrid_engine = HybridSearchEngine(
+            bm25_retriever=bm25,
+            bm25_pyvi_retriever=bm25_pyvi,
+            dense_retriever=dense,
+            question_memory=memory,
+            exact_matcher=exact,
+        )
+
+        evidence_builder = EvidencePackBuilder(
+            chunks_path=chunks_path if chunks_path.exists() else None,
+            documents_path=docs_path if docs_path.exists() else None,
+            doc_metadata=doc_map,
+        )
+
+        # 5. Reranker
+        if use_reranker:
+            reranker = CrossEncoderReranker(
+                model_name="BAAI/bge-reranker-v2-m3",
+                device=device,
+            )
+        else:
+            reranker = None
+
+        selector = TopKSelector(
+            max_k=5,
+            min_k=1,
+            fallback_doc_ids=sorted(list(valid_doc_ids))[:5] if valid_doc_ids else None,
+        )
+
+        pipeline = cls(
+            hybrid_engine=hybrid_engine,
+            evidence_builder=evidence_builder,
+            reranker=reranker,
+            selector=selector,
+            valid_doc_ids=valid_doc_ids,
+        )
+
+        if audit_preflight or audit_output_json is not None:
+            pipeline.audit_parameters(output_json=audit_output_json, raise_on_violation=True)
+
+        return pipeline
+

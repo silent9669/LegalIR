@@ -1,0 +1,18 @@
+experiment: "reranker_lora"
+base_model_name: "BAAI/bge-reranker-v2-m3"
+output_dir: "artifacts/local/training/checkpoints"
+loss_type: "bce"
+use_lora: true
+lora:
+  r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  target_modules: ["query", "value", "key", "dense"]
+learning_rate: 2.0e-5
+batch_size: 16
+max_steps: 500
+warmup_ratio: 0.1
+gradient_accumulation_steps: 2
+max_length: 512
+fp16: true
+device: "auto"
