@@ -232,14 +232,20 @@ class LegalIRPipeline:
         cls,
         data_dir: str | Path = "artifacts/task1/data",
         index_dir: str | Path = "artifacts/task1/indexes",
+        reranker_adapter_path: str | Path | None = None,
+        fusion_model_path: str | Path | None = None,
         use_reranker: bool = True,
+        use_learned_fusion: bool | None = None,
         device: str | None = None,
         audit_preflight: bool = False,
         audit_output_json: str | Path | None = None,
+        reranker_model_name: str = "BAAI/bge-reranker-v2-m3",
     ) -> "LegalIRPipeline":
         """Load fully instantiated pipeline from index and data artifacts."""
         import json
         import pandas as pd
+        from src.ranking.evidence_pack import EvidencePackBuilder
+        from src.ranking.fusion import LightGBMRanker, ReciprocalRankFusion
         from src.ranking.reranker import CrossEncoderReranker
         from src.retrieval.bm25_micro import BM25MicroRetriever
         from src.retrieval.bm25_pyvi import BM25PyViRetriever
@@ -290,6 +296,8 @@ class LegalIRPipeline:
 
         # 3. Question Memory
         mem_path = index_dir / "question_memory"
+        if not mem_path.exists():
+            mem_path = data_dir / "question_memory"
         if mem_path.exists():
             memory = TrainQuestionMemory.load(mem_path, dense_retriever=dense)
         else:
@@ -308,18 +316,49 @@ class LegalIRPipeline:
 
         evidence_builder = EvidencePackBuilder(
             chunks_path=chunks_path if chunks_path.exists() else None,
-            documents_path=docs_path if docs_path.exists() else None,
             doc_metadata=doc_map,
+            max_chunks=3,
+            max_tokens=430,
         )
 
         # 5. Reranker
         if use_reranker:
+            if reranker_adapter_path is not None:
+                adapter_path = Path(reranker_adapter_path)
+                if not adapter_path.exists():
+                    raise FileNotFoundError(f"Reranker adapter path not found: {reranker_adapter_path}")
             reranker = CrossEncoderReranker(
-                model_name="BAAI/bge-reranker-v2-m3",
+                model_name=reranker_model_name,
+                adapter_path=reranker_adapter_path,
                 device=device,
             )
         else:
             reranker = None
+
+        # 6. Ranker / Fusion
+        if fusion_model_path is not None:
+            f_path = Path(fusion_model_path)
+            if not f_path.exists():
+                raise FileNotFoundError(f"Fusion model path not found: {fusion_model_path}")
+            if f_path.is_dir():
+                candidates = [
+                    f_path / "model.txt",
+                    f_path / "model_full.txt",
+                    f_path / "model.json",
+                    f_path / "model_full.json",
+                    f_path / "fusion_ranker.json",
+                    f_path / "fusion_model.json",
+                    f_path / "fusion_ranker.txt",
+                    f_path / "fusion_model.txt",
+                ]
+                actual_file = next((p for p in candidates if p.is_file()), f_path)
+            else:
+                actual_file = f_path
+            ranker = LightGBMRanker(model_file=actual_file)
+        elif use_learned_fusion:
+            ranker = LightGBMRanker()
+        else:
+            ranker = ReciprocalRankFusion()
 
         selector = TopKSelector(
             max_k=5,
@@ -331,6 +370,7 @@ class LegalIRPipeline:
             hybrid_engine=hybrid_engine,
             evidence_builder=evidence_builder,
             reranker=reranker,
+            ranker=ranker,
             selector=selector,
             valid_doc_ids=valid_doc_ids,
         )

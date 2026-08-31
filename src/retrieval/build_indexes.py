@@ -11,19 +11,74 @@ from src.retrieval.dense_macro import DenseMacroRetriever
 from src.retrieval.question_memory import TrainQuestionMemory
 
 
+def enrich_chunks_with_doc_metadata(
+    chunks_df: pd.DataFrame,
+    canonical_dir_or_docs_path: str | Path | pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """Enrich chunks DataFrame with document metadata (title, legal_number, year, doc_type, link)."""
+    if canonical_dir_or_docs_path is None:
+        return chunks_df
+
+    if isinstance(canonical_dir_or_docs_path, pd.DataFrame):
+        docs_df = canonical_dir_or_docs_path
+    else:
+        p = Path(canonical_dir_or_docs_path)
+        if p.is_dir():
+            docs_path = p / "documents.parquet"
+        else:
+            docs_path = p
+
+        if not docs_path.exists():
+            return chunks_df
+        docs_df = pd.read_parquet(docs_path)
+
+    meta_cols = ["title", "legal_number", "year", "doc_type", "link"]
+    available_meta = [c for c in meta_cols if c in docs_df.columns]
+    if not available_meta or "doc_id" not in docs_df.columns:
+        return chunks_df
+
+    # Ensure clean merging without duplicate columns
+    cols_to_merge = ["doc_id"]
+    for col in available_meta:
+        if col not in chunks_df.columns:
+            cols_to_merge.append(col)
+        elif chunks_df[col].isna().all() or (chunks_df[col] == "").all():
+            chunks_df = chunks_df.drop(columns=[col])
+            cols_to_merge.append(col)
+
+    if len(cols_to_merge) > 1:
+        chunks_df = chunks_df.copy()
+        docs_subset = docs_df[cols_to_merge].copy()
+        chunks_df["doc_id"] = chunks_df["doc_id"].astype(str)
+        docs_subset["doc_id"] = docs_subset["doc_id"].astype(str)
+        return chunks_df.merge(
+            docs_subset,
+            on="doc_id",
+            how="left",
+        )
+    return chunks_df
+
+
 def build_bm25_index(
-    canonical_dir: str | Path = "artifacts/shared/canonical/v2",
+    canonical_dir: str | Path | None = None,
     output_dir: str | Path = "artifacts/local/indexes/bm25",
+    documents_path: str | Path | None = None,
+    *,
+    data_dir: str | Path | None = None,
 ):
-    canonical_dir = Path(canonical_dir)
+    source_dir = Path(data_dir or canonical_dir or "artifacts/shared/canonical/v2")
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    chunks_path = canonical_dir / "chunks.parquet"
+    chunks_path = source_dir / "chunks.parquet"
     print(f"Loading micro chunks from {chunks_path}...")
 
     chunks_df = pd.read_parquet(chunks_path)
     micro_chunks_df = chunks_df[chunks_df["granularity"] == "micro"] if "granularity" in chunks_df.columns else chunks_df
+
+    # P1.5: Enrich micro chunks with document metadata before fitting
+    docs_source = documents_path or (source_dir / "documents.parquet")
+    micro_chunks_df = enrich_chunks_with_doc_metadata(micro_chunks_df, docs_source)
     print(f"Total micro chunks to index for Legal BM25: {len(micro_chunks_df)}")
 
     micro_chunks = micro_chunks_df.to_dict(orient="records")
@@ -46,18 +101,25 @@ def build_bm25_index(
 
 
 def build_bm25_pyvi_index(
-    canonical_dir: str | Path = "artifacts/shared/canonical/v2",
+    canonical_dir: str | Path | None = None,
     output_dir: str | Path = "artifacts/local/indexes/bm25_pyvi",
+    documents_path: str | Path | None = None,
+    *,
+    data_dir: str | Path | None = None,
 ):
-    canonical_dir = Path(canonical_dir)
+    source_dir = Path(data_dir or canonical_dir or "artifacts/shared/canonical/v2")
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    chunks_path = canonical_dir / "chunks.parquet"
+    chunks_path = source_dir / "chunks.parquet"
     print(f"Loading micro chunks from {chunks_path}...")
 
     chunks_df = pd.read_parquet(chunks_path)
     micro_chunks_df = chunks_df[chunks_df["granularity"] == "micro"] if "granularity" in chunks_df.columns else chunks_df
+
+    # P1.5: Enrich micro chunks with document metadata before fitting
+    docs_source = documents_path or (source_dir / "documents.parquet")
+    micro_chunks_df = enrich_chunks_with_doc_metadata(micro_chunks_df, docs_source)
     print(f"Total micro chunks to index for PyVi BM25: {len(micro_chunks_df)}")
 
     micro_chunks = micro_chunks_df.to_dict(orient="records")

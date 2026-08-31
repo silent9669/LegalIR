@@ -14,6 +14,7 @@ from src.training.train_reranker import train_reranker
 
 def main():
     parser = argparse.ArgumentParser(description="LegalIR LoRA Reranker Trainer")
+    parser.add_argument("--pairs-file", type=str, default=None, help="Path to reranker_pairs.parquet")
     parser.add_argument("--config", type=str, default="configs/experiments/reranker_lora.yaml", help="Path to reranker config")
     parser.add_argument("--fold", type=int, default=0, help="Fold index (0-4)")
     parser.add_argument("--output-dir", type=str, default=None, help="Output checkpoint directory")
@@ -24,14 +25,20 @@ def main():
     parser.add_argument("--lr", type=float, default=None, help="Learning rate")
     args = parser.parse_args()
 
+    pairs_file = args.pairs_file or f"artifacts/local/training/pairs/fold_{args.fold}/reranker_pairs.parquet"
+    out_dir = args.output_dir or f"artifacts/local/training/checkpoints/fold_{args.fold}"
+
     print("=" * 60)
     print(f"LegalIR: Training Cross-Encoder Reranker for Fold {args.fold}")
+    print(f"Pairs file: {pairs_file}")
+    print(f"Output dir: {out_dir}")
     print("=" * 60)
 
     report = train_reranker(
+        pairs_file=pairs_file,
+        output_dir=out_dir,
         config_path=args.config,
         fold=args.fold,
-        output_dir=args.output_dir,
         max_steps=args.max_steps,
         base_model_name=args.base_model,
         loss_type=args.loss_type,

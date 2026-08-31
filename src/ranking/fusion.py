@@ -390,6 +390,24 @@ class LightGBMRanker:
         if not file_path.exists():
             return
 
+        if file_path.is_dir():
+            candidates = [
+                file_path / "model.json",
+                file_path / "model_full.json",
+                file_path / "fusion_model.json",
+                file_path / "model.txt",
+                file_path / "model_full.txt",
+                file_path / "fusion_model.txt",
+            ]
+            file_path = next((p for p in candidates if p.is_file()), file_path)
+            if file_path.is_dir():
+                json_candidates = list(file_path.glob("*.json"))
+                txt_candidates = list(file_path.glob("*.txt"))
+                if json_candidates:
+                    file_path = json_candidates[0]
+                elif txt_candidates:
+                    file_path = txt_candidates[0]
+
         meta_path = file_path.with_suffix(".json")
         txt_path = file_path.with_suffix(".txt")
 

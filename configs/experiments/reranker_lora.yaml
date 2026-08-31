@@ -8,11 +8,14 @@ lora:
   lora_alpha: 32
   lora_dropout: 0.05
   target_modules: ["query", "value", "key", "dense"]
+lora_r: 16
+lora_alpha: 32
+gradient_checkpointing: true
 learning_rate: 2.0e-5
-batch_size: 16
+batch_size: 2
+gradient_accumulation_steps: 8
 max_steps: 500
 warmup_ratio: 0.1
-gradient_accumulation_steps: 2
 max_length: 512
 fp16: true
 device: "auto"

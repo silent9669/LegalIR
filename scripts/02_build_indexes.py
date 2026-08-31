@@ -12,6 +12,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from src.retrieval.bm25_micro import BM25MicroRetriever
 from src.retrieval.bm25_pyvi import BM25PyViRetriever
+from src.retrieval.build_indexes import enrich_chunks_with_doc_metadata
 from src.retrieval.dense_macro import DenseMacroRetriever
 from src.retrieval.question_memory import TrainQuestionMemory, QuestionMemory
 
@@ -25,6 +26,7 @@ def build_all_indexes(
     print("=" * 60)
 
     chunks_path = os.path.join(data_dir, "chunks.parquet")
+    docs_path = os.path.join(data_dir, "documents.parquet")
     queries_path = os.path.join(data_dir, "queries_train.parquet")
     qrels_path = os.path.join(data_dir, "qrels_train.parquet")
 
@@ -36,13 +38,17 @@ def build_all_indexes(
     df_chunks = pd.read_parquet(chunks_path)
     print(f"Total chunks loaded: {len(df_chunks):,}")
 
+    # P1.5: Enrich micro chunks with document metadata before fitting BM25
+    micro_chunks_df = df_chunks[df_chunks["granularity"] == "micro"] if "granularity" in df_chunks.columns else df_chunks
+    if os.path.exists(docs_path):
+        micro_chunks_df = enrich_chunks_with_doc_metadata(micro_chunks_df, docs_path)
+    print(f"Enriched micro chunks for BM25: {len(micro_chunks_df):,}")
+
+    bm25_corpus = micro_chunks_df.to_dict("records")
+
     # 1. Build Fielded Legal BM25 Index (Branch A)
     bm25_dir = os.path.join(index_dir, "bm25")
     print(f"\n[1/4] Building Fielded Legal BM25 Micro Index in {bm25_dir}...")
-    micro_chunks = df_chunks[df_chunks["granularity"] == "micro"] if "granularity" in df_chunks.columns else df_chunks
-    print(f"Micro chunks for Legal BM25: {len(micro_chunks):,}")
-
-    bm25_corpus = micro_chunks.to_dict("records")
     bm25 = BM25MicroRetriever(k1=1.5, b=0.75)
     t0 = time.time()
     bm25.fit(bm25_corpus)

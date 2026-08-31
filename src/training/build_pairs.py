@@ -6,11 +6,10 @@ import json
 import pandas as pd
 from tqdm import tqdm
 
-from src.core.config import load_pipeline_config
-from src.core.paths import ProjectPaths
 from src.evaluation.benchmark import build_memory_rows
 from src.ranking.evidence_pack import EvidencePackBuilder
 from src.retrieval.bm25_micro import BM25MicroRetriever
+from src.retrieval.build_indexes import enrich_chunks_with_doc_metadata
 from src.retrieval.exact_matcher import ExactMatcher
 from src.retrieval.hybrid_search import HybridSearchEngine
 from src.retrieval.question_memory import QuestionMemory
@@ -19,58 +18,115 @@ from src.training.positive_localizer import PositiveLocalizer
 
 
 def build_training_pairs(
-    config_path: str | Path = "configs/pipeline.yaml",
-    fold: int = 0,
-    output_dir: str | Path | None = None,
+    *,
+    data_dir: str | Path,
+    index_dir: str | Path,
+    output_dir: str | Path,
+    fold: int | None = 0,
+    use_all_queries: bool = False,
     limit: int | None = None,
     negatives_per_positive: int = 10,
-    max_evidence_chunks: int = 2,
+    max_evidence_chunks: int = 3,
+    include_dense_negatives: bool = True,
+    include_pyvi_negatives: bool = True,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Build fold-safe positive and multi-band hard negative pairs for cross-encoder training.
     Saves reranker_pairs.parquet, retriever_pairs.parquet, and manifest.json with full provenance.
     """
-    paths = ProjectPaths.from_repo()
-    cfg = load_pipeline_config(Path(config_path)) if Path(config_path).exists() else {}
-
-    canonical_dir = paths.canonical
-    output_dir = Path(output_dir) if output_dir else paths.repo / "artifacts" / "local" / "training" / "pairs" / f"fold_{fold}"
+    data_dir = Path(data_dir)
+    index_dir = Path(index_dir)
+    output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Loading canonical data for pair building from {canonical_dir}...")
-    docs_df = pd.read_parquet(canonical_dir / "documents.parquet")
-    chunks_df = pd.read_parquet(canonical_dir / "chunks.parquet")
-    queries_df = pd.read_parquet(canonical_dir / "queries_train.parquet")
-    qrels_df = pd.read_parquet(canonical_dir / "qrels_train.parquet")
+    print(f"Loading canonical data for pair building from {data_dir}...")
+    docs_df = pd.read_parquet(data_dir / "documents.parquet")
+    chunks_df = pd.read_parquet(data_dir / "chunks.parquet")
+    queries_df = pd.read_parquet(data_dir / "queries_train.parquet")
+    qrels_df = pd.read_parquet(data_dir / "qrels_train.parquet")
 
-    splits_dir = canonical_dir / "splits"
-    random_5fold_path = splits_dir / "random_5fold.json"
-    if random_5fold_path.exists():
-        random_5fold = json.loads(random_5fold_path.read_text(encoding="utf-8"))
-        fold_info = random_5fold[fold] if isinstance(random_5fold, list) and fold < len(random_5fold) else random_5fold.get(str(fold), {})
-        train_qids = [str(x) for x in fold_info.get("train_query_ids", fold_info.get("train", []))]
+    queries_dict = dict(zip(queries_df["query_id"].astype(str), queries_df.get("question_norm", queries_df.get("question_raw", ""))))
+    qrels_dict = qrels_df.groupby("query_id")["doc_id"].apply(lambda s: [str(x) for x in s]).to_dict()
+
+    if use_all_queries or fold is None:
+        train_qids = [str(x) for x in queries_df["query_id"].unique() if str(x) in qrels_dict and len(qrels_dict[str(x)]) > 0]
+        if not train_qids:
+            train_qids = [str(x) for x in queries_df["query_id"].unique()]
     else:
-        # Fallback to all queries if no split file
-        train_qids = [str(x) for x in queries_df["query_id"].unique()]
+        splits_dir = data_dir / "splits"
+        random_5fold_path = splits_dir / "random_5fold.json"
+        if not random_5fold_path.exists():
+            random_5fold_path = data_dir / "random_5fold.json"
+
+        if random_5fold_path.exists():
+            random_5fold = json.loads(random_5fold_path.read_text(encoding="utf-8"))
+            fold_info = (
+                random_5fold[fold]
+                if isinstance(random_5fold, list) and fold < len(random_5fold)
+                else random_5fold.get(str(fold), {})
+            )
+            train_qids = [str(x) for x in fold_info.get("train_query_ids", fold_info.get("train", []))]
+        else:
+            # Fallback to all queries if no split file
+            train_qids = [str(x) for x in queries_df["query_id"].unique()]
 
     if limit is not None:
         train_qids = train_qids[:limit]
 
-    queries_dict = dict(zip(queries_df["query_id"].astype(str), queries_df["question_norm"]))
-    qrels_dict = qrels_df.groupby("query_id")["doc_id"].apply(lambda s: [str(x) for x in s]).to_dict()
     docs_dict = {str(r["doc_id"]): r for r in docs_df.to_dict(orient="records")}
-
     macro_chunks = chunks_df[chunks_df["granularity"] == "macro"].to_dict(orient="records")
     localizer = PositiveLocalizer(macro_chunks)
-    evidence_builder = EvidencePackBuilder(macro_chunks=macro_chunks, doc_metadata=docs_dict)
+    evidence_builder = EvidencePackBuilder(macro_chunks=macro_chunks, doc_metadata=docs_dict, max_chunks=max_evidence_chunks)
 
-    # Load or fit BM25 and exact matcher
-    bm25_path = paths.local_indexes / "bm25" / "bm25_micro_index.pkl"
+    # 1. BM25 Micro
+    bm25_path = index_dir / "bm25" / "bm25_micro_index.pkl"
+    if not bm25_path.exists():
+        bm25_path = index_dir / "bm25"
+    if not bm25_path.exists():
+        bm25_path = index_dir / "bm25_micro_index.pkl"
+
     if bm25_path.exists():
         bm25 = BM25MicroRetriever.load(bm25_path)
     else:
-        micro_chunks = chunks_df[chunks_df["granularity"] == "micro"].to_dict(orient="records")
-        bm25 = BM25MicroRetriever().fit(micro_chunks)
+        micro_chunks_df = chunks_df[chunks_df["granularity"] == "micro"] if "granularity" in chunks_df.columns else chunks_df
+        micro_chunks_df = enrich_chunks_with_doc_metadata(micro_chunks_df, docs_df)
+        bm25 = BM25MicroRetriever().fit(micro_chunks_df.to_dict(orient="records"))
+
+    # 1b. BM25 PyVi
+    bm25_pyvi = None
+    if include_pyvi_negatives:
+        pyvi_path = index_dir / "bm25_pyvi" / "bm25_pyvi_index.pkl"
+        if not pyvi_path.exists():
+            pyvi_path = index_dir / "bm25_pyvi"
+        if not pyvi_path.exists():
+            pyvi_path = index_dir / "bm25_pyvi_index.pkl"
+        if pyvi_path.exists():
+            try:
+                from src.retrieval.bm25_pyvi import BM25PyViRetriever
+                bm25_pyvi = BM25PyViRetriever.load(pyvi_path)
+            except Exception:
+                bm25_pyvi = None
+        else:
+            try:
+                from src.retrieval.bm25_pyvi import BM25PyViRetriever
+                micro_chunks_df = chunks_df[chunks_df["granularity"] == "micro"] if "granularity" in chunks_df.columns else chunks_df
+                micro_chunks_df = enrich_chunks_with_doc_metadata(micro_chunks_df, docs_df)
+                bm25_pyvi = BM25PyViRetriever().fit(micro_chunks_df.to_dict(orient="records"))
+            except Exception:
+                bm25_pyvi = None
+
+    # 2. Dense DEk21 Macro
+    dense = None
+    if include_dense_negatives:
+        dense_path = index_dir / "dense_dek21"
+        if not dense_path.exists():
+            dense_path = index_dir / "dense"
+        if dense_path.exists():
+            try:
+                from src.retrieval.dense_macro import DenseMacroRetriever
+                dense = DenseMacroRetriever.load(dense_path)
+            except Exception:
+                dense = None
 
     exact = ExactMatcher(docs_df.to_dict(orient="records"))
     memory_rows = build_memory_rows(train_qids, queries_dict, qrels_dict)
@@ -78,13 +134,16 @@ def build_training_pairs(
 
     hybrid_engine = HybridSearchEngine(
         bm25_retriever=bm25,
-        exact_matcher=exact,
+        bm25_pyvi_retriever=bm25_pyvi,
+        dense_retriever=dense,
         question_memory=memory,
-        dense_retriever=None,
+        exact_matcher=exact,
     )
 
     # Build false-negative blacklist from duplicate groups
-    dup_path = canonical_dir / "duplicate_groups.json"
+    dup_path = data_dir / "duplicate_groups.json"
+    if not dup_path.exists():
+        dup_path = data_dir / "splits" / "duplicate_groups.json"
     dup_groups = json.loads(dup_path.read_text(encoding="utf-8")) if dup_path.exists() else {}
     doc_to_dups = defaultdict(set)
     for group in dup_groups.values():
@@ -102,8 +161,9 @@ def build_training_pairs(
     retriever_rows: list[dict[str, Any]] = []
     reranker_rows: list[dict[str, Any]] = []
 
-    print(f"Building training pairs for {len(train_qids)} queries in fold {fold}...")
-    for qid in tqdm(train_qids, desc=f"Mining pairs fold {fold}"):
+    fold_label = fold if fold is not None else "all"
+    print(f"Building training pairs for {len(train_qids)} queries (fold={fold_label}, use_all={use_all_queries})...")
+    for qid in tqdm(train_qids, desc=f"Mining pairs fold {fold_label}"):
         q_text = queries_dict.get(qid, "")
         gold_ids = qrels_dict.get(qid, [])
         if not gold_ids or not q_text:
@@ -111,12 +171,16 @@ def build_training_pairs(
 
         # Multi-band candidate generation
         # 1. Exact matches
-        exact_cands = exact.match(q_text, top_k=10) if exact else []
+        exact_cands = exact.search(q_text, top_k=10) if exact else []
         # 2. BM25 top candidates
         bm25_cands = bm25.search(q_text, top_k=50) if bm25 else []
-        # 3. Question memory candidates (fold-safe, excludes current qid)
+        # 2b. BM25 PyVi top candidates
+        pyvi_cands = bm25_pyvi.search(q_text, top_k=50) if bm25_pyvi else []
+        # 3. Dense top candidates
+        dense_cands = dense.retrieve(q_text, top_k=50) if dense else []
+        # 4. Question memory candidates (fold-safe, excludes current qid)
         mem_cands = memory.query(q_text, exclude_qid=qid, top_k=10) if memory else []
-        # 4. Hybrid pool
+        # 5. Hybrid pool
         hybrid_cands = hybrid_engine.search_candidates(q_text, exclude_qid=qid, top_k=80)
 
         # Medium negatives from lower-ranked hybrid candidates (ranks 20-80)
@@ -129,12 +193,20 @@ def build_training_pairs(
             "hybrid": [{"doc_id": c["doc_id"], "score": c.get("rrf_score", 0.0), "rank": i + 1} for i, c in enumerate(hybrid_cands[:30])],
             "medium_neg": [{"doc_id": c["doc_id"], "score": c.get("rrf_score", 0.0), "rank": i + 21} for i, c in enumerate(medium_cands)],
         }
+        per_source_limits = {"exact": 2, "bm25": 4, "memory": 2, "hybrid": 4, "medium_neg": 3}
+
+        if bm25_pyvi and include_pyvi_negatives:
+            candidates_by_source["bm25_pyvi"] = [{"doc_id": c["doc_id"], "score": c.get("bm25_score", 0.0), "rank": i + 1} for i, c in enumerate(pyvi_cands[:30])]
+            per_source_limits["bm25_pyvi"] = 3
+        if dense and include_dense_negatives:
+            candidates_by_source["dense"] = [{"doc_id": c["doc_id"], "score": c.get("dense_score", 0.0), "rank": i + 1} for i, c in enumerate(dense_cands[:30])]
+            per_source_limits["dense"] = 3
 
         mined_neg_records = miner.mine_multi_band_negatives(
             query_id=qid,
             candidates_by_source=candidates_by_source,
             gold_doc_ids=gold_ids,
-            per_source_limits={"exact": 2, "bm25": 4, "memory": 2, "hybrid": 4, "medium_neg": 3},
+            per_source_limits=per_source_limits,
             max_total=negatives_per_positive * len(gold_ids),
         )
 
@@ -154,7 +226,7 @@ def build_training_pairs(
                 "retrieval_score": 1.0,
                 "evidence_chunk_ids": json.dumps([pos_chunk_id] if pos_chunk_id else []),
                 "evidence_text": pos_evidence,
-                "fold": fold,
+                "fold": fold if fold is not None else 0,
             })
 
             for neg_record in mined_neg_records:
@@ -170,7 +242,7 @@ def build_training_pairs(
                     "pos_chunk_id": pos_chunk_id,
                     "neg_doc_id": neg_id,
                     "neg_chunk_id": neg_chunk_id,
-                    "fold": fold,
+                    "fold": fold if fold is not None else 0,
                 })
 
                 reranker_rows.append({
@@ -183,7 +255,7 @@ def build_training_pairs(
                     "retrieval_score": float(neg_record.get("retrieval_score", 0.0)),
                     "evidence_chunk_ids": json.dumps([neg_chunk_id] if neg_chunk_id else []),
                     "evidence_text": neg_evidence,
-                    "fold": fold,
+                    "fold": fold if fold is not None else 0,
                 })
 
     retriever_df = pd.DataFrame(retriever_rows)
@@ -198,6 +270,7 @@ def build_training_pairs(
 
     manifest = {
         "fold": fold,
+        "use_all_queries": use_all_queries,
         "total_queries": len(train_qids),
         "positive_pairs_count": pos_count,
         "negative_pairs_count": neg_count,
@@ -215,21 +288,29 @@ def build_training_pairs(
 
 def main():
     parser = argparse.ArgumentParser(description="LegalIR Training Pairs Generator")
-    parser.add_argument("--config", type=str, default="configs/pipeline.yaml")
+    parser.add_argument("--data-dir", type=str, default="artifacts/task1/data")
+    parser.add_argument("--index-dir", type=str, default="artifacts/task1/indexes")
+    parser.add_argument("--output-dir", type=str, default="artifacts/local/training/pairs/fold_0")
     parser.add_argument("--fold", type=int, default=0)
+    parser.add_argument("--use-all-queries", action="store_true")
     parser.add_argument("--limit", type=int, default=None)
-    parser.add_argument("--output-dir", type=str, default=None)
     parser.add_argument("--negatives", type=int, default=10)
-    parser.add_argument("--max-chunks", type=int, default=2)
+    parser.add_argument("--max-chunks", type=int, default=3)
+    parser.add_argument("--no-dense", action="store_true")
+    parser.add_argument("--no-pyvi", action="store_true")
     args = parser.parse_args()
 
     build_training_pairs(
-        config_path=args.config,
-        fold=args.fold,
+        data_dir=args.data_dir,
+        index_dir=args.index_dir,
         output_dir=args.output_dir,
+        fold=args.fold,
+        use_all_queries=args.use_all_queries,
         limit=args.limit,
         negatives_per_positive=args.negatives,
         max_evidence_chunks=args.max_chunks,
+        include_dense_negatives=not args.no_dense,
+        include_pyvi_negatives=not args.no_pyvi,
     )
 
 

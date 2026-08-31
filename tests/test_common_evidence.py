@@ -8,7 +8,8 @@ def test_evidence_pack_builder():
         {"article": "Điều 2", "text_raw": "Hiệu lực thi hành từ ngày 01/7/2023."}
     ]
     ev_text = builder.build_evidence_text("Giảm thuế GTGT bao nhiêu %?", doc_info, chunks)
-    assert "[QUESTION]" in ev_text
+    assert "[QUESTION]" not in ev_text
     assert "[DOCUMENT]" in ev_text
     assert "[EVIDENCE 1]" in ev_text
     assert "[EVIDENCE 2]" in ev_text
+

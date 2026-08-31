@@ -186,8 +186,15 @@ class EvidencePackBuilder:
             return []
         if isinstance(source, (str, Path)):
             import pandas as pd
+            import pyarrow.parquet as pq
 
-            frame = pd.read_parquet(source, columns=list(columns) if columns else None)
+            try:
+                parquet_file = pq.ParquetFile(source)
+                existing_cols = set(parquet_file.schema.names)
+                available = [c for c in columns if c in existing_cols] if columns else None
+                frame = pd.read_parquet(source, columns=available)
+            except Exception:
+                frame = pd.read_parquet(source)
             return [dict(row) for row in frame.to_dict(orient="records")]
         if hasattr(source, "to_dict"):
             try:
@@ -458,8 +465,16 @@ class EvidencePackBuilder:
             header += f" (Số: {legal_num})"
         return f"{header}\n[ĐIỀU KHOẢN]: {article}\n[NỘI DUNG]:\n{body}"
 
-    def build_evidence_text(self, query: str, doc_info: dict | None, chunks: list[dict] | None) -> str:
-        """Build multiline evidence text format for cross-encoder reranker."""
+    def build_evidence_text(
+        self,
+        query: str,
+        doc_info: dict | None,
+        chunks: list[dict] | None,
+        include_question: bool = False,
+    ) -> str:
+        """Build multiline evidence text format for cross-encoder reranker.
+        Defaults to include_question=False to avoid duplicating sequence A in sequence B.
+        """
         doc_info = doc_info or {}
         title = _text_value(doc_info.get("title"), prettify_doc_title(doc_info.get("name_raw", "")))
         legal_number = _text_value(doc_info.get("legal_number"))
@@ -468,10 +483,10 @@ class EvidencePackBuilder:
         if not doc_header:
             doc_header = "Văn bản quy phạm pháp luật"
 
-        sections = [
-            f"[QUESTION] {clean_legal_text(query)}",
-            f"[DOCUMENT] {doc_header}",
-        ]
+        sections = []
+        if include_question:
+            sections.append(f"[QUESTION] {clean_legal_text(query)}")
+        sections.append(f"[DOCUMENT] {doc_header}")
 
         valid_chunks = [c for c in (chunks or []) if c and isinstance(c, dict)][:self.max_chunks]
         if not valid_chunks:
@@ -496,12 +511,14 @@ class EvidencePackBuilder:
         max_chunks: int | None = None,
         max_chars: int | None = None,
         max_tokens: int | None = None,
-        include_question: bool = True,
+        include_question: bool = False,
         include_article_prefix: bool = False,
         *,
         candidate_chunks: Iterable[Mapping[str, Any]] | None = None,
     ) -> str:
-        """Build one structured document pack in the canonical format with token budget awareness."""
+        """Build one structured document pack in the canonical format with token budget awareness.
+        Defaults to include_question=False so cross-encoders do not duplicate the query in sequence B.
+        """
         if isinstance(doc_id, Mapping):
             if candidate_record is None:
                 candidate_record = doc_id
@@ -612,7 +629,7 @@ class EvidencePackBuilder:
         max_chunks: int | None = None,
         max_chars: int | None = None,
         max_tokens: int | None = None,
-        include_question: bool = True,
+        include_question: bool = False,
         *,
         candidate_chunks: Iterable[Mapping[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:

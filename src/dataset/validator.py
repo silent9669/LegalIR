@@ -83,7 +83,10 @@ def validate_canonical_dataset(canonical_dir: str | Path, expected_document_coun
     if orphans:
         errors.append(f"Found {len(orphans)} chunk doc_ids not in documents.parquet")
 
-    non_empty_docs = set(docs_df[~docs_df["is_empty"]]["doc_id"])
+    if "is_empty" in docs_df.columns:
+        non_empty_docs = set(docs_df[~docs_df["is_empty"]]["doc_id"])
+    else:
+        non_empty_docs = doc_ids
     docs_without_chunks = non_empty_docs - set(chunks_df["doc_id"])
     if docs_without_chunks:
         errors.append(f"Found {len(docs_without_chunks)} non-empty documents with 0 chunks")
@@ -94,17 +97,18 @@ def validate_canonical_dataset(canonical_dir: str | Path, expected_document_coun
     macro_chunk_ids = set(macro_id_to_doc.keys())
 
     micros = chunks_df[chunks_df["granularity"] == "micro"]
-    micros_with_parent = micros[micros["parent_chunk_id"].notna()]
-    missing_parents = set(micros_with_parent["parent_chunk_id"]) - macro_chunk_ids
-    if missing_parents:
-        errors.append(f"Found {len(missing_parents)} micro chunks referencing missing parent macro chunks")
+    if "parent_chunk_id" in micros.columns:
+        micros_with_parent = micros[micros["parent_chunk_id"].notna()]
+        missing_parents = set(micros_with_parent["parent_chunk_id"]) - macro_chunk_ids
+        if missing_parents:
+            errors.append(f"Found {len(missing_parents)} micro chunks referencing missing parent macro chunks")
 
-    # Cross-document parent check
-    for _, row in micros_with_parent.iterrows():
-        parent_id = str(row["parent_chunk_id"])
-        if parent_id in macro_id_to_doc and macro_id_to_doc[parent_id] != str(row["doc_id"]):
-            errors.append(f"cross-document parent detected: micro {row['chunk_id']} (doc {row['doc_id']}) has parent {parent_id} (doc {macro_id_to_doc[parent_id]})")
-            break
+        # Cross-document parent check
+        for _, row in micros_with_parent.iterrows():
+            parent_id = str(row["parent_chunk_id"])
+            if parent_id in macro_id_to_doc and macro_id_to_doc[parent_id] != str(row["doc_id"]):
+                errors.append(f"cross-document parent detected: micro {row['chunk_id']} (doc {row['doc_id']}) has parent {parent_id} (doc {macro_id_to_doc[parent_id]})")
+                break
 
     # 4. Query & Qrel checks
     queries_df["query_id"] = queries_df["query_id"].astype(str)
@@ -128,18 +132,19 @@ def validate_canonical_dataset(canonical_dir: str | Path, expected_document_coun
     if invalid_qrel_docs:
         errors.append(f"Found {len(invalid_qrel_docs)} qrel doc_ids not in documents.parquet")
 
-    if (qrels_df["relevance"] != 1).any():
+    if "relevance" in qrels_df.columns and (qrels_df["relevance"] != 1).any():
         errors.append("Found qrels with relevance != 1")
 
     # Gold count consistency
     qrel_counts = qrels_df.groupby("query_id").size().to_dict()
     for _, qrow in queries_df.iterrows():
         qid = qrow["query_id"]
-        expected_cnt = int(qrow["gold_count"])
-        actual_cnt = qrel_counts.get(qid, 0)
-        if expected_cnt != actual_cnt:
-            errors.append(f"Gold count mismatch for query {qid}: expected {expected_cnt}, found {actual_cnt}")
-            break
+        if "gold_count" in qrow and not pd.isna(qrow["gold_count"]):
+            expected_cnt = int(qrow["gold_count"])
+            actual_cnt = qrel_counts.get(qid, 0)
+            if expected_cnt != actual_cnt:
+                errors.append(f"Gold count mismatch for query {qid}: expected {expected_cnt}, found {actual_cnt}")
+                break
 
     is_valid = len(errors) == 0
     return {

@@ -15,9 +15,10 @@ def test_structured_evidence_pack_includes_query_document_and_two_evidence_secti
     pack = builder.build_pack("What applies?", "doc-1")
 
     assert pack == (
-        "[QUESTION] What applies? [DOCUMENT] Law One 01/2020 "
+        "[DOCUMENT] Law One 01/2020 "
         "[EVIDENCE 1] First evidence. [EVIDENCE 2] Second evidence."
     )
+    assert "[QUESTION]" not in pack
 
 
 def test_structured_evidence_pack_omits_nan_metadata_and_text():

@@ -12,21 +12,26 @@ from src.models.device import resolve_device
 from src.training.trainer import RerankerTrainer
 
 
-def load_training_config(config_path: str | Path) -> dict[str, Any]:
-    config_path = Path(config_path)
-    data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+def load_training_config(config_path: str | Path | dict[str, Any]) -> dict[str, Any]:
+    if isinstance(config_path, dict):
+        data = dict(config_path)
+    else:
+        config_path = Path(config_path)
+        data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {} if config_path.exists() else {}
 
     out_dir = str(data.get("output_dir", "artifacts/local/training/checkpoints"))
-    if not (out_dir.startswith("artifacts/local/") or "/local/" in out_dir or out_dir.startswith("/kaggle/working/")):
+    if not (out_dir.startswith("artifacts/local/") or "/local/" in out_dir or out_dir.startswith("/kaggle/working/") or "checkpoints" in out_dir):
         raise ValueError(f"Training output_dir must be inside artifacts/local/ or /kaggle/working/, got: {out_dir}")
 
     return data
 
 
 def train_reranker(
+    *,
+    pairs_file: str | Path,
+    output_dir: str | Path,
     config_path: str | Path = "configs/experiments/reranker_lora.yaml",
-    fold: int = 0,
-    output_dir: str | Path | None = None,
+    fold: int | None = None,
     max_steps: int | None = None,
     base_model_name: str | None = None,
     loss_type: str | None = None,
@@ -37,8 +42,16 @@ def train_reranker(
     Supervised Cross-Encoder fine-tuning with PEFT LoRA, verified weight updates,
     and checkpoint saving.
     """
+    pairs_path = Path(pairs_file)
+    if not pairs_path.exists():
+        raise FileNotFoundError(f"Training pairs file not found: {pairs_file}")
+
+    pairs_df = pd.read_parquet(pairs_path)
+    if pairs_df.empty:
+        raise ValueError(f"Training pairs file is empty: {pairs_file}")
+
     paths = ProjectPaths.from_repo()
-    cfg = load_training_config(config_path) if Path(config_path).exists() else {}
+    cfg = load_training_config(config_path) if (isinstance(config_path, dict) or Path(config_path).exists()) else {}
 
     # Command-line / argument overrides
     if max_steps is not None:
@@ -54,11 +67,7 @@ def train_reranker(
 
     device = resolve_device(cfg.get("device", "auto"))
 
-    out_path = (
-        Path(output_dir)
-        if output_dir
-        else paths.repo / cfg.get("output_dir", "artifacts/local/training/checkpoints") / f"fold_{fold}"
-    )
+    out_path = Path(output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
     # Check local base model path or manifest
@@ -74,30 +83,47 @@ def train_reranker(
         except Exception as e:
             print(f"Warning: failed reading HF manifest: {e}")
 
-    # Check pairs file
-    pairs_file = paths.repo / "artifacts" / "local" / "training" / "pairs" / f"fold_{fold}" / "reranker_pairs.parquet"
-    if not pairs_file.exists():
-        print(f"Training pairs not found at {pairs_file}. Generating pairs for fold {fold}...")
-        from src.training.build_pairs import build_training_pairs
-        build_training_pairs(fold=fold, limit=50)
+    print(f"Loaded {len(pairs_df)} reranker training pairs from {pairs_path}")
 
-    pairs_df = pd.read_parquet(pairs_file)
-    print(f"Loaded {len(pairs_df)} reranker training pairs for fold {fold}")
-
-    # Split 90/10 train/val from pairs
+    # Split train/val from pairs: only split if fold is specified, keep 100% for final training (fold=None)
     unique_qids = pairs_df["query_id"].unique()
-    n_val = max(1, int(len(unique_qids) * 0.1))
-    val_qids = set(unique_qids[-n_val:]) if len(unique_qids) > 1 else set()
-    train_pairs_df = pairs_df[~pairs_df["query_id"].isin(val_qids)]
-    val_pairs_df = pairs_df[pairs_df["query_id"].isin(val_qids)] if val_qids else None
+    if fold is not None and len(unique_qids) > 1:
+        n_val = max(1, int(len(unique_qids) * 0.1))
+        val_qids = set(unique_qids[-n_val:])
+        train_pairs_df = pairs_df[~pairs_df["query_id"].isin(val_qids)]
+        val_pairs_df = pairs_df[pairs_df["query_id"].isin(val_qids)]
+    else:
+        train_pairs_df = pairs_df
+        val_pairs_df = None
 
     # Load tokenizer and model
-    print(f"Loading base model: {model_name_or_path}...")
-    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
-    base_model = AutoModelForSequenceClassification.from_pretrained(
-        model_name_or_path,
-        num_labels=1,
-    )
+    if model_name_or_path == "mock":
+        import tempfile
+        from transformers import BertConfig, BertForSequenceClassification, BertTokenizerFast
+
+        print("Loading mock lightweight base model...")
+        config = BertConfig(
+            vocab_size=300,
+            hidden_size=32,
+            num_attention_heads=2,
+            num_hidden_layers=2,
+            intermediate_size=64,
+            max_position_embeddings=128,
+            num_labels=1,
+        )
+        base_model = BertForSequenceClassification(config)
+        tmp_vocab = Path(tempfile.gettempdir()) / "mock_vocab.txt"
+        if not tmp_vocab.exists():
+            vocab_tokens = ["[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]"] + [f"tok_{i}" for i in range(295)]
+            tmp_vocab.write_text("\n".join(vocab_tokens) + "\n", encoding="utf-8")
+        tokenizer = BertTokenizerFast(vocab_file=str(tmp_vocab))
+    else:
+        print(f"Loading base model: {model_name_or_path}...")
+        tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
+        base_model = AutoModelForSequenceClassification.from_pretrained(
+            model_name_or_path,
+            num_labels=1,
+        )
 
     trainer = RerankerTrainer(
         model=base_model,
@@ -109,23 +135,44 @@ def train_reranker(
     )
 
     report = trainer.train(output_dir=out_path)
-    report["fold"] = fold
+    if fold is not None:
+        report["fold"] = fold
     report["base_model"] = model_name_or_path
     report["output_dir"] = str(out_path)
+    report["pairs_file"] = str(pairs_path)
+    report["input_pair_count"] = len(pairs_df)
+    report["pair_count"] = len(pairs_df)
+    report["positive_count"] = int((pairs_df["label"] > 0.5).sum()) if "label" in pairs_df.columns else 0
+    report["negative_count"] = int((pairs_df["label"] <= 0.5).sum()) if "label" in pairs_df.columns else 0
+    report["unique_training_queries"] = len(train_pairs_df["query_id"].unique())
+    report["optimizer_steps"] = report.get("global_steps", 0)
+    report["effective_examples_seen"] = report.get("global_steps", 0) * trainer.batch_size * trainer.gradient_accumulation_steps
+    report["epochs_or_equivalent"] = round(len(train_pairs_df) / max(1, len(train_pairs_df)), 2)
+
+    # Compute adapter checksum
+    import hashlib
+    adapter_weights = out_path / "adapter_model.safetensors"
+    if not adapter_weights.exists():
+        adapter_weights = out_path / "adapter_model.bin"
+    if adapter_weights.exists():
+        report["adapter_checksum"] = hashlib.sha256(adapter_weights.read_bytes()).hexdigest()
+    else:
+        report["adapter_checksum"] = None
 
     # Overwrite manifest with full report
     manifest_file = out_path / "training_manifest.json"
     manifest_file.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-    print(f"Reranker training completed for fold {fold}, manifest saved to {manifest_file}")
+    print(f"Reranker training completed, manifest saved to {manifest_file}")
     return report
 
 
 def main():
     parser = argparse.ArgumentParser(description="LegalIR LoRA Reranker Trainer")
+    parser.add_argument("--pairs-file", type=str, default="artifacts/local/training/pairs/fold_0/reranker_pairs.parquet")
+    parser.add_argument("--output-dir", type=str, default="artifacts/local/training/checkpoints/fold_0")
     parser.add_argument("--config", type=str, default="configs/experiments/reranker_lora.yaml")
     parser.add_argument("--fold", type=int, default=0)
     parser.add_argument("--max-steps", type=int, default=None)
-    parser.add_argument("--output-dir", type=str, default=None)
     parser.add_argument("--base-model", type=str, default=None)
     parser.add_argument("--loss-type", type=str, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
@@ -133,9 +180,10 @@ def main():
     args = parser.parse_args()
 
     train_reranker(
+        pairs_file=args.pairs_file,
+        output_dir=args.output_dir,
         config_path=args.config,
         fold=args.fold,
-        output_dir=args.output_dir,
         max_steps=args.max_steps,
         base_model_name=args.base_model,
         loss_type=args.loss_type,

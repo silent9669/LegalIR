@@ -103,6 +103,9 @@ def train_and_evaluate_fusion_cv(
 
     rrf_baseline = ReciprocalRankFusion(weights=rrf_weights)
 
+    all_learned_preds: dict[str, list[str]] = {}
+    all_rrf_preds: dict[str, list[str]] = {}
+
     for f_idx in unique_folds:
         train_mask = oof_df["fold"] != f_idx
         val_mask = oof_df["fold"] == f_idx
@@ -144,14 +147,16 @@ def train_and_evaluate_fusion_cv(
         trained_fold_models[f"fold_{f_idx}"] = str(fold_model_file)
 
         # 2. Evaluate Learned Ranker on Validation Fold f
-        _, learned_m = evaluate_features_with_ranker(val_data, ranker, qrels_dict)
+        learned_p, learned_m = evaluate_features_with_ranker(val_data, ranker, qrels_dict)
         learned_m["fold"] = int(f_idx)
         learned_fold_metrics.append(learned_m)
+        all_learned_preds.update(learned_p)
 
         # 3. Evaluate Weighted RRF on Validation Fold f
-        _, rrf_m = evaluate_features_with_ranker(val_data, rrf_baseline, qrels_dict)
+        rrf_p, rrf_m = evaluate_features_with_ranker(val_data, rrf_baseline, qrels_dict)
         rrf_m["fold"] = int(f_idx)
         rrf_fold_metrics.append(rrf_m)
+        all_rrf_preds.update(rrf_p)
 
         print(
             f"Fold {f_idx}: "
@@ -159,35 +164,50 @@ def train_and_evaluate_fusion_cv(
             f"RRF Recall@5 = {rrf_m['recall@5'] * 100:.2f}% (Prec@5 = {rrf_m['precision@5'] * 100:.2f}%)"
         )
 
-    # Aggregate Metrics
-    learned_mean_rec5 = float(np.mean([m["recall@5"] for m in learned_fold_metrics]))
-    learned_std_rec5 = float(np.std([m["recall@5"] for m in learned_fold_metrics]))
-    learned_mean_prec5 = float(np.mean([m["precision@5"] for m in learned_fold_metrics]))
+    # Concat predictions across all held-out folds and evaluate full OOF metrics
+    all_val_qrels = {str(qid): qrels_dict.get(str(qid), []) for qid in all_learned_preds.keys()}
+    learned_overall = evaluate_predictions(y_pred=all_learned_preds, y_true=all_val_qrels)
+    rrf_overall = evaluate_predictions(y_pred=all_rrf_preds, y_true=all_val_qrels)
 
-    rrf_mean_rec5 = float(np.mean([m["recall@5"] for m in rrf_fold_metrics]))
-    rrf_std_rec5 = float(np.std([m["recall@5"] for m in rrf_fold_metrics]))
-    rrf_mean_prec5 = float(np.mean([m["precision@5"] for m in rrf_fold_metrics]))
+    learned_overall_rec5 = float(learned_overall.get("recall@5", 0.0))
+    learned_overall_prec5 = float(learned_overall.get("precision@5", 0.0))
+    rrf_overall_rec5 = float(rrf_overall.get("recall@5", 0.0))
+    rrf_overall_prec5 = float(rrf_overall.get("precision@5", 0.0))
+
+    # Cross-fold summary metrics
+    learned_mean_rec5 = float(np.mean([m["recall@5"] for m in learned_fold_metrics])) if learned_fold_metrics else 0.0
+    learned_std_rec5 = float(np.std([m["recall@5"] for m in learned_fold_metrics])) if learned_fold_metrics else 0.0
+    learned_mean_prec5 = float(np.mean([m["precision@5"] for m in learned_fold_metrics])) if learned_fold_metrics else 0.0
+
+    rrf_mean_rec5 = float(np.mean([m["recall@5"] for m in rrf_fold_metrics])) if rrf_fold_metrics else 0.0
+    rrf_std_rec5 = float(np.std([m["recall@5"] for m in rrf_fold_metrics])) if rrf_fold_metrics else 0.0
+    rrf_mean_prec5 = float(np.mean([m["precision@5"] for m in rrf_fold_metrics])) if rrf_fold_metrics else 0.0
 
     # Model Selection Gate
-    # Primary criterion: Official Task 1 Recall@5
-    if learned_mean_rec5 >= rrf_mean_rec5:
+    # Primary criterion: Official Task 1 Recall@5 across concatenated held-out folds
+    learned_wins = (
+        learned_overall_rec5 > rrf_overall_rec5
+        or (np.isclose(learned_overall_rec5, rrf_overall_rec5, atol=1e-6) and learned_overall_prec5 > rrf_overall_prec5)
+    )
+
+    if learned_wins:
         winning_method = "learned_ranker"
-        winning_model_type = ranker.model_type
-        winner_rec5 = learned_mean_rec5
-        winner_prec5 = learned_mean_prec5
-        gate_decision = f"Learned Ranker selected (+{(learned_mean_rec5 - rrf_mean_rec5) * 100:.4f}% vs RRF)"
+        winning_model_type = "lightgbm"
+        winner_rec5 = learned_overall_rec5
+        winner_prec5 = learned_overall_prec5
+        gate_decision = f"Learned Ranker selected (+{(learned_overall_rec5 - rrf_overall_rec5) * 100:.4f}% Recall@5 vs RRF)"
     else:
         winning_method = "reciprocal_rank_fusion"
         winning_model_type = "rrf_weighted"
-        winner_rec5 = rrf_mean_rec5
-        winner_prec5 = rrf_mean_prec5
-        gate_decision = f"Weighted RRF selected (+{(rrf_mean_rec5 - learned_mean_rec5) * 100:.4f}% vs Learned)"
+        winner_rec5 = rrf_overall_rec5
+        winner_prec5 = rrf_overall_prec5
+        gate_decision = f"Weighted RRF selected (+{(rrf_overall_rec5 - learned_overall_rec5) * 100:.4f}% Recall@5 vs Learned)"
 
     print("\n" + "=" * 70)
-    print(">> FUSION MODEL SELECTION GATE SUMMARY:")
-    print(f"   Learned Ranker Mean Recall@5 : {learned_mean_rec5 * 100:.4f}% (+/- {learned_std_rec5 * 100:.4f}%)")
-    print(f"   Weighted RRF   Mean Recall@5 : {rrf_mean_rec5 * 100:.4f}% (+/- {rrf_std_rec5 * 100:.4f}%)")
-    print(f"   Winning Method               : {winning_method} ({gate_decision})")
+    print(">> FUSION MODEL SELECTION GATE SUMMARY (5-Fold Cross-Fitted):")
+    print(f"   Learned Ranker Full OOF Recall@5 : {learned_overall_rec5 * 100:.4f}% (Mean across folds: {learned_mean_rec5 * 100:.4f}% +/- {learned_std_rec5 * 100:.4f}%)")
+    print(f"   Weighted RRF   Full OOF Recall@5 : {rrf_overall_rec5 * 100:.4f}% (Mean across folds: {rrf_mean_rec5 * 100:.4f}% +/- {rrf_std_rec5 * 100:.4f}%)")
+    print(f"   Winning Method                   : {winning_method} ({gate_decision})")
     print("=" * 70)
 
     # 4. Train Final Model on All Folds
@@ -208,6 +228,12 @@ def train_and_evaluate_fusion_cv(
     full_ranker.save(full_model_file)
     trained_fold_models["full"] = str(full_model_file)
 
+    # If output_dir is not already fusion_final, also export to checkpoints/fusion_final
+    fusion_final_dir = output_dir / "fusion_final" if output_dir.name != "fusion_final" else output_dir
+    fusion_final_dir.mkdir(parents=True, exist_ok=True)
+    full_ranker.save(fusion_final_dir / "model.txt")
+    trained_fold_models["fusion_final"] = str(fusion_final_dir / "model.txt")
+
     # 5. Export artifacts & manifests
     comparison_report = {
         "winning_method": winning_method,
@@ -216,12 +242,16 @@ def train_and_evaluate_fusion_cv(
         "winner_mean_precision@5": winner_prec5,
         "gate_decision": gate_decision,
         "learned_ranker": {
+            "overall_recall@5": learned_overall_rec5,
+            "overall_precision@5": learned_overall_prec5,
             "mean_recall@5": learned_mean_rec5,
             "std_recall@5": learned_std_rec5,
             "mean_precision@5": learned_mean_prec5,
             "folds": learned_fold_metrics,
         },
         "reciprocal_rank_fusion": {
+            "overall_recall@5": rrf_overall_rec5,
+            "overall_precision@5": rrf_overall_prec5,
             "mean_recall@5": rrf_mean_rec5,
             "std_recall@5": rrf_std_rec5,
             "mean_precision@5": rrf_mean_prec5,

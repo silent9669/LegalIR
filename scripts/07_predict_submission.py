@@ -21,6 +21,8 @@ def generate_submission(
     data_dir: str = "artifacts/task1/data",
     index_dir: str = "artifacts/task1/indexes",
     out_dir: str = "artifacts/task1/submissions",
+    reranker_adapter_path: str | None = None,
+    fusion_model_path: str | None = None,
     use_reranker: bool = True,
     device: str | None = None,
     top_k_candidates: int = 150,
@@ -48,6 +50,8 @@ def generate_submission(
     pipeline = LegalIRPipeline.load_pipeline(
         data_dir=data_dir,
         index_dir=index_dir,
+        reranker_adapter_path=reranker_adapter_path,
+        fusion_model_path=fusion_model_path,
         use_reranker=use_reranker,
         device=device,
     )
@@ -132,6 +136,8 @@ def main():
     parser.add_argument("--data-dir", type=str, default="artifacts/task1/data")
     parser.add_argument("--index-dir", type=str, default="artifacts/task1/indexes")
     parser.add_argument("--out-dir", type=str, default="artifacts/task1/submissions")
+    parser.add_argument("--reranker-adapter", type=str, default=None)
+    parser.add_argument("--fusion-model", type=str, default=None)
     parser.add_argument("--use-reranker", action="store_true")
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--candidate-k", type=int, default=150)
@@ -143,6 +149,8 @@ def main():
         data_dir=args.data_dir,
         index_dir=args.index_dir,
         out_dir=args.out_dir,
+        reranker_adapter_path=args.reranker_adapter,
+        fusion_model_path=args.fusion_model,
         use_reranker=args.use_reranker,
         device=args.device,
         top_k_candidates=args.candidate_k,

@@ -7,20 +7,21 @@ import random
 import pandas as pd
 
 
-def generate_random_5fold_split(queries: list, seed: int = 42) -> list[dict[str, Any]]:
-    """Generate 5-fold cross-validation query splits with deterministic ordering."""
+def generate_random_5fold_split(queries: list, seed: int = 42, num_folds: int = 5) -> list[dict[str, Any]]:
+    """Generate k-fold cross-validation query splits with deterministic ordering."""
     qids = sorted(list(set(str(q["query_id"]) if isinstance(q, dict) else str(q) for q in queries)))
     rng = random.Random(seed)
     shuffled_qids = list(qids)
     rng.shuffle(shuffled_qids)
 
     n = len(shuffled_qids)
-    fold_size = n // 5
+    k = max(2, min(num_folds, n))
+    fold_size = max(1, n // k)
     folds = []
 
-    for i in range(5):
+    for i in range(k):
         val_start = i * fold_size
-        val_end = (i + 1) * fold_size if i < 4 else n
+        val_end = (i + 1) * fold_size if i < k - 1 else n
         val_qids = sorted(shuffled_qids[val_start:val_end])
         val_set = set(val_qids)
         train_qids = sorted([qid for qid in qids if qid not in val_set])

@@ -203,6 +203,7 @@ def create_submission_manifest(
     all_answers_valid: bool = True,
     all_ids_valid: bool = True,
     extra_metadata: dict[str, Any] | None = None,
+    metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Create submission_manifest.json with integrity hashes and metadata."""
     json_path = Path(submission_json_path)
@@ -233,6 +234,8 @@ def create_submission_manifest(
         "created_utc": datetime.now(timezone.utc).isoformat(),
     }
 
+    if metadata:
+        manifest.update(metadata)
     if extra_metadata:
         manifest.update(extra_metadata)
 

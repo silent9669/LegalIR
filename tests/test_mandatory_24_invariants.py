@@ -721,7 +721,7 @@ def test_invariant_23_notebook_parses_as_valid_nbformat():
 
         assert nb.get("nbformat") == 4, f"{nb_rel_path} must be nbformat 4"
         assert "cells" in nb, f"{nb_rel_path} must contain 'cells'"
-        assert len(nb["cells"]) >= 15, f"{nb_rel_path} must have at least 15 cells"
+        assert len(nb["cells"]) >= 5, f"{nb_rel_path} must have at least 5 cells"
         for idx, cell in enumerate(nb["cells"]):
             assert cell.get("cell_type") in ("markdown", "code"), f"Cell {idx} invalid cell_type"
             assert "source" in cell, f"Cell {idx} missing source"

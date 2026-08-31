@@ -87,6 +87,11 @@ class BM25MicroRetriever:
         self.doc_years: dict[str, set[str]] = defaultdict(set)
         self.doc_types: dict[str, set[str]] = defaultdict(set)
 
+    @property
+    def corpus(self) -> list[str]:
+        """Backward-compatibility property returning indexed chunk IDs."""
+        return self.chunk_ids
+
     def fit(self, chunks: Any, show_progress: bool = False) -> "BM25MicroRetriever":
         """Fit BM25 inverted index on micro chunk records or DataFrame."""
         if isinstance(chunks, pd.DataFrame):

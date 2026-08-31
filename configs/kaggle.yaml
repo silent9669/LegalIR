@@ -1,6 +1,13 @@
 environment: "kaggle"
 gpu: "T4_x2"
-batch_size_per_gpu: 16
+batch_size: 2
+batch_size_per_gpu: 2
+gradient_accumulation_steps: 8
+max_length: 512
+fp16: true
+lora_r: 16
+lora_alpha: 32
+gradient_checkpointing: true
 use_hf_token: true
 paths:
   canonical: "artifacts/task1/data"

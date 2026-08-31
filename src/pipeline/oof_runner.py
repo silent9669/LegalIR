@@ -6,6 +6,7 @@ official Codabench scorer parity, and full metrics reporting.
 
 from collections import defaultdict
 from datetime import datetime, timezone
+import gc
 import json
 import os
 from pathlib import Path
@@ -13,6 +14,7 @@ import time
 from typing import Any, Mapping
 import numpy as np
 import pandas as pd
+import torch
 from tqdm import tqdm
 
 from src.core.paths import ProjectPaths
@@ -37,6 +39,7 @@ from src.ranking.oof_features import extract_candidate_features
 from src.ranking.reranker import CrossEncoderReranker
 from src.ranking.selector import TopKSelector
 from src.retrieval.bm25_micro import BM25MicroRetriever
+from src.retrieval.bm25_pyvi import BM25PyViRetriever
 from src.retrieval.dense_macro import DenseMacroRetriever
 from src.retrieval.exact_matcher import ExactMatcher
 from src.retrieval.hybrid_search import HybridSearchEngine
@@ -51,7 +54,7 @@ class OOFRunner:
         self,
         data_dir: str | Path = "artifacts/task1/data",
         index_dir: str | Path = "artifacts/task1/indexes",
-        splits_path: str | Path = "artifacts/shared/canonical/v2/splits/random_5fold.json",
+        splits_path: str | Path | None = None,
         output_dir: str | Path = "artifacts/local/cv",
         config_path: str | Path | None = "configs/pipeline.yaml",
         num_folds: int = 5,
@@ -64,11 +67,19 @@ class OOFRunner:
         smoke: bool = False,
         smoke_sample_size: int = 20,
         doc_disjoint: bool = False,
-        doc_disjoint_splits_path: str | Path = "artifacts/shared/canonical/v2/splits/doc_disjoint_split.json",
+        doc_disjoint_splits_path: str | Path | None = None,
     ):
         self.data_dir = Path(data_dir)
         self.index_dir = Path(index_dir)
-        self.splits_path = Path(splits_path)
+        if splits_path is not None and Path(splits_path).exists():
+            self.splits_path = Path(splits_path)
+        elif (self.data_dir / "splits" / "random_5fold.json").exists():
+            self.splits_path = self.data_dir / "splits" / "random_5fold.json"
+        elif splits_path is not None:
+            self.splits_path = Path(splits_path)
+        else:
+            self.splits_path = Path("artifacts/shared/canonical/v2/splits/random_5fold.json")
+
         self.output_dir = Path(output_dir)
         self.config_path = Path(config_path) if config_path else None
         self.num_folds = int(num_folds)
@@ -81,7 +92,15 @@ class OOFRunner:
         self.smoke = bool(smoke)
         self.smoke_sample_size = int(smoke_sample_size)
         self.doc_disjoint = bool(doc_disjoint)
-        self.doc_disjoint_splits_path = Path(doc_disjoint_splits_path)
+
+        if doc_disjoint_splits_path is not None and Path(doc_disjoint_splits_path).exists():
+            self.doc_disjoint_splits_path = Path(doc_disjoint_splits_path)
+        elif (self.data_dir / "splits" / "doc_disjoint_split.json").exists():
+            self.doc_disjoint_splits_path = self.data_dir / "splits" / "doc_disjoint_split.json"
+        elif doc_disjoint_splits_path is not None:
+            self.doc_disjoint_splits_path = Path(doc_disjoint_splits_path)
+        else:
+            self.doc_disjoint_splits_path = Path("artifacts/shared/canonical/v2/splits/doc_disjoint_split.json")
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -92,8 +111,10 @@ class OOFRunner:
         self.doc_map: dict[str, dict[str, Any]] = {}
         self.queries_map: dict[str, str] = {}
         self.qrels_map: dict[str, list[str]] = defaultdict(list)
+        self.train_query_embeddings: dict[str, np.ndarray] = {}
         self.evidence_builder: EvidencePackBuilder | None = None
         self.bm25: BM25MicroRetriever | None = None
+        self.bm25_pyvi: BM25PyViRetriever | None = None
         self.dense: DenseMacroRetriever | None = None
         self.exact: ExactMatcher | None = None
         self.selector = TopKSelector(max_k=5)
@@ -151,9 +172,30 @@ class OOFRunner:
                 chunks_path = self.data_dir / "chunks.parquet"
                 if chunks_path.exists():
                     chunks_df = pd.read_parquet(chunks_path)
-                    micro_chunks = chunks_df[chunks_df["granularity"] == "micro"].to_dict("records")
+                    micro_chunks = chunks_df[chunks_df["granularity"] == "micro"] if "granularity" in chunks_df.columns else chunks_df
+                    if self.docs_df is not None:
+                        from src.retrieval.build_indexes import enrich_chunks_with_doc_metadata
+                        micro_chunks = enrich_chunks_with_doc_metadata(micro_chunks, self.docs_df)
                     self.bm25 = BM25MicroRetriever()
-                    self.bm25.fit(micro_chunks, show_progress=False)
+                    self.bm25.fit(micro_chunks.to_dict("records"), show_progress=False)
+
+        if self.bm25_pyvi is None:
+            bm25_pyvi_index_dir = self.index_dir / "bm25_pyvi"
+            bm25_pyvi_file = bm25_pyvi_index_dir / "bm25_pyvi_index.pkl"
+            if bm25_pyvi_file.exists():
+                self.bm25_pyvi = BM25PyViRetriever.load(bm25_pyvi_file)
+            elif bm25_pyvi_index_dir.exists() and list(bm25_pyvi_index_dir.glob("*.pkl")):
+                self.bm25_pyvi = BM25PyViRetriever.load(bm25_pyvi_index_dir)
+            else:
+                chunks_path = self.data_dir / "chunks.parquet"
+                if chunks_path.exists():
+                    chunks_df = pd.read_parquet(chunks_path)
+                    micro_chunks = chunks_df[chunks_df["granularity"] == "micro"] if "granularity" in chunks_df.columns else chunks_df
+                    if self.docs_df is not None:
+                        from src.retrieval.build_indexes import enrich_chunks_with_doc_metadata
+                        micro_chunks = enrich_chunks_with_doc_metadata(micro_chunks, self.docs_df)
+                    self.bm25_pyvi = BM25PyViRetriever()
+                    self.bm25_pyvi.fit(micro_chunks.to_dict("records"), show_progress=False)
 
         if self.dense is None:
             dense_dek21 = self.index_dir / "dense_dek21"
@@ -166,15 +208,34 @@ class OOFRunner:
                     print(f"Warning: Dense retriever could not be loaded from {dense_path}: {e}")
                     self.dense = None
 
+    def precompute_train_query_embeddings(self) -> dict[str, np.ndarray]:
+        """Precompute normalized dense query embeddings once on GPU 0 and index by query_id."""
+        if self.train_query_embeddings:
+            return self.train_query_embeddings
+        if self.dense is not None and self.queries_map:
+            qids = list(self.queries_map.keys())
+            texts = [self.queries_map[qid] for qid in qids]
+            try:
+                embs = self.dense.encode_queries(texts, batch_size=64)
+                for qid, emb in zip(qids, embs):
+                    self.train_query_embeddings[str(qid)] = emb
+                print(f"[+] Precomputed and cached {len(self.train_query_embeddings):,} train query dense embeddings on GPU.")
+            except Exception as e:
+                print(f"[-] Warning: query embedding precomputation skipped: {e}")
+        return self.train_query_embeddings
+
     def get_splits(self) -> list[dict[str, Any]]:
         """Load or generate 5-fold cross-validation splits and verify isolation."""
         if self.splits_path.exists():
             with open(self.splits_path, "r", encoding="utf-8") as f:
                 folds = json.load(f)
+        elif (self.data_dir / "splits/random_5fold.json").exists():
+            with open(self.data_dir / "splits/random_5fold.json", "r", encoding="utf-8") as f:
+                folds = json.load(f)
         else:
-            print(f"Splits not found at {self.splits_path}; generating fresh 5-fold split...")
+            print(f"Splits not found at {self.splits_path}; generating fresh split...")
             queries_list = [{"query_id": qid} for qid in self.queries_map.keys()]
-            folds = generate_random_5fold_split(queries_list, seed=42)
+            folds = generate_random_5fold_split(queries_list, seed=42, num_folds=self.num_folds)
             self.splits_path.parent.mkdir(parents=True, exist_ok=True)
             with open(self.splits_path, "w", encoding="utf-8") as f:
                 json.dump(folds, f, indent=2)
@@ -204,7 +265,12 @@ class OOFRunner:
         if self.smoke:
             val_ids = val_ids[: self.smoke_sample_size]
 
-        fold_train_queries = {qid: self.queries_map[qid] for qid in train_ids if qid in self.queries_map}
+        fold_train_queries = [
+            (qid, self.queries_map[qid], self.train_query_embeddings.get(qid))
+            if qid in self.train_query_embeddings
+            else (qid, self.queries_map[qid], None)
+            for qid in train_ids if qid in self.queries_map
+        ]
         fold_train_qrels = {qid: self.qrels_map[qid] for qid in train_ids if qid in self.qrels_map}
 
         # Build fold-isolated question memory
@@ -218,6 +284,7 @@ class OOFRunner:
 
         hybrid_engine = HybridSearchEngine(
             bm25_retriever=self.bm25,
+            bm25_pyvi_retriever=self.bm25_pyvi,
             dense_retriever=self.dense,
             question_memory=memory,
             exact_matcher=self.exact,
@@ -232,11 +299,13 @@ class OOFRunner:
         for qid in tqdm(val_ids, desc=f"Fold {fold_idx} OOF Inference", leave=False):
             q_text = self.queries_map.get(qid, "")
             t_q0 = time.time()
+            q_emb = self.train_query_embeddings.get(qid)
 
             candidates: list[CandidateRecord] = hybrid_engine.search_candidates(
                 query=q_text,
                 top_k=self.candidate_k,
                 exclude_qid=str(qid),
+                q_emb=q_emb,
             )
             cand_ids = [str(c["doc_id"]) for c in candidates]
             fold_candidates[qid] = cand_ids
@@ -310,12 +379,13 @@ class OOFRunner:
 
         self.load_data()
         self.load_retrievers()
+        self.precompute_train_query_embeddings()
         folds = self.get_splits()
 
-        reranker: CrossEncoderReranker | None = None
-        if self.use_reranker:
+        global_reranker: CrossEncoderReranker | None = None
+        if self.use_reranker and not self.train_reranker_per_fold:
             print(f"Initializing CrossEncoderReranker: {self.reranker_model}...")
-            reranker = CrossEncoderReranker(model_name=self.reranker_model, device=self.device)
+            global_reranker = CrossEncoderReranker(model_name=self.reranker_model, device=self.device)
 
         all_oof_predictions: dict[str, list[str]] = {}
         all_candidate_pools: dict[str, list[str]] = {}
@@ -328,11 +398,64 @@ class OOFRunner:
 
         for f_idx, fold_info in enumerate(active_folds):
             print(f"\n>>> Running Fold {f_idx + 1}/{len(active_folds)} (Fold {f_idx})...")
+
+            fold_reranker: CrossEncoderReranker | None = None
+            if self.train_reranker_per_fold:
+                print(f"--- Training fold-specific LoRA reranker for Fold {f_idx} ---")
+                fold_dir = self.output_dir / f"fold_{f_idx}"
+                fold_dir.mkdir(parents=True, exist_ok=True)
+                pairs_dir = fold_dir / "pairs"
+
+                from src.training.build_pairs import build_training_pairs
+                from src.training.train_reranker import train_reranker
+
+                _, pairs_df = build_training_pairs(
+                    data_dir=self.data_dir,
+                    index_dir=self.index_dir,
+                    output_dir=pairs_dir,
+                    fold=f_idx,
+                    use_all_queries=False,
+                    limit=self.smoke_sample_size if self.smoke else None,
+                )
+
+                adapter_dir = fold_dir / "reranker_adapter"
+                reranker_cfg = self.config_path or "configs/experiments/reranker_lora.yaml"
+                base_m_name = self.reranker_model if self.reranker_model != "mock" else None
+                train_report = train_reranker(
+                    pairs_file=pairs_dir / "reranker_pairs.parquet",
+                    config_path=reranker_cfg,
+                    output_dir=adapter_dir,
+                    fold=f_idx,
+                    base_model_name=base_m_name,
+                    max_steps=5 if self.smoke else None,
+                )
+
+                fold_reranker = CrossEncoderReranker(
+                    model_name=self.reranker_model,
+                    adapter_path=adapter_dir,
+                    device=self.device,
+                )
+            elif self.use_reranker:
+                fold_reranker = global_reranker
+
             f_preds, f_cands, f_feat_dfs, f_metrics, f_runtimes = self.run_fold(
                 fold_idx=f_idx,
                 fold_info=fold_info,
-                reranker=reranker,
+                reranker=fold_reranker,
             )
+
+            if self.train_reranker_per_fold and fold_reranker is not None:
+                train_ids = set(str(x) for x in fold_info.get("train_query_ids", fold_info.get("train", [])))
+                f_metrics["training_queries"] = len(train_ids)
+                f_metrics["training_pairs"] = len(pairs_df)
+                f_metrics["adapter_path"] = str(adapter_dir)
+                f_metrics["adapter_checksum"] = train_report.get("adapter_checksum")
+                f_metrics["param_diff"] = train_report.get("param_diff")
+
+                del fold_reranker
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
             all_oof_predictions.update(f_preds)
             all_candidate_pools.update(f_cands)
@@ -451,7 +574,7 @@ class OOFRunner:
         # 4. Optional Document-Disjoint Robustness Split Evaluation
         if self.doc_disjoint:
             print("\n>>> Running Document-Disjoint Robustness Split Evaluation...")
-            self.run_document_disjoint_evaluation(reranker=reranker)
+            self.run_document_disjoint_evaluation(reranker=global_reranker)
 
         # Print final summary
         print("\n" + "=" * 70)
@@ -479,6 +602,9 @@ class OOFRunner:
         if self.doc_disjoint_splits_path.exists():
             with open(self.doc_disjoint_splits_path, "r", encoding="utf-8") as f:
                 disjoint_split = json.load(f)
+        elif (self.data_dir / "splits/doc_disjoint_split.json").exists():
+            with open(self.data_dir / "splits/doc_disjoint_split.json", "r", encoding="utf-8") as f:
+                disjoint_split = json.load(f)
         else:
             print("Generating fresh document-disjoint split...")
             queries_list = [{"query_id": qid} for qid in self.queries_map.keys()]
@@ -505,6 +631,7 @@ class OOFRunner:
 
         hybrid_engine = HybridSearchEngine(
             bm25_retriever=self.bm25,
+            bm25_pyvi_retriever=self.bm25_pyvi,
             dense_retriever=self.dense,
             question_memory=memory,
             exact_matcher=self.exact,
@@ -557,3 +684,17 @@ class OOFRunner:
 
         print(f"Document-Disjoint Split Recall@5: {metrics['recall@5'] * 100:.2f}% | Precision@5: {metrics['precision@5'] * 100:.2f}%")
         return metrics
+
+    def run_fusion_evaluation(self, output_dir: str | Path | None = None) -> dict[str, Any]:
+        """Run cross-fitted fusion evaluation on generated oof_features.parquet."""
+        from src.ranking.train_fusion import train_and_evaluate_fusion_cv
+
+        oof_feat_path = self.output_dir / "oof_features.parquet"
+        if not oof_feat_path.exists():
+            raise FileNotFoundError(f"OOF features not found: {oof_feat_path}")
+        oof_df = pd.read_parquet(oof_feat_path)
+        if oof_df.empty or "fold" not in oof_df.columns:
+            raise ValueError(f"OOF features DataFrame at {oof_feat_path} is empty or missing 'fold' column.")
+        qrels_dict = self.qrels_map
+        fusion_out = Path(output_dir) if output_dir else self.output_dir / "fusion"
+        return train_and_evaluate_fusion_cv(oof_df=oof_df, qrels_dict=qrels_dict, output_dir=fusion_out)

@@ -104,19 +104,56 @@ class CrossEncoderReranker:
                 except Exception:
                     pass
 
-            try:
-                self.tokenizer = AutoTokenizer.from_pretrained(str(adapter_dir), **load_kwargs)
-            except Exception:
-                self.tokenizer = AutoTokenizer.from_pretrained(base_model_source, **load_kwargs)
+            if base_model_source == "mock":
+                import tempfile
+                from transformers import BertConfig, BertForSequenceClassification, BertTokenizerFast
+                config = BertConfig(
+                    vocab_size=300,
+                    hidden_size=32,
+                    num_attention_heads=2,
+                    num_hidden_layers=2,
+                    intermediate_size=64,
+                    max_position_embeddings=128,
+                    num_labels=1,
+                )
+                base_model = BertForSequenceClassification(config)
+                tmp_vocab = Path(tempfile.gettempdir()) / "mock_vocab.txt"
+                if not tmp_vocab.exists():
+                    vocab_tokens = ["[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]"] + [f"tok_{i}" for i in range(295)]
+                    tmp_vocab.write_text("\n".join(vocab_tokens) + "\n", encoding="utf-8")
+                self.tokenizer = BertTokenizerFast(vocab_file=str(tmp_vocab))
+            else:
+                try:
+                    self.tokenizer = AutoTokenizer.from_pretrained(str(adapter_dir), **load_kwargs)
+                except Exception:
+                    self.tokenizer = AutoTokenizer.from_pretrained(base_model_source, **load_kwargs)
 
-            base_model = AutoModelForSequenceClassification.from_pretrained(
-                base_model_source,
-                num_labels=1,
-                **load_kwargs,
-            )
+                base_model = AutoModelForSequenceClassification.from_pretrained(
+                    base_model_source,
+                    num_labels=1,
+                    **load_kwargs,
+                )
             from peft import PeftModel
 
             self.model = PeftModel.from_pretrained(base_model, str(adapter_dir), **load_kwargs)
+        elif self.model_name == "mock":
+            import tempfile
+            from transformers import BertConfig, BertForSequenceClassification, BertTokenizerFast
+            config = BertConfig(
+                vocab_size=300,
+                hidden_size=32,
+                num_attention_heads=2,
+                num_hidden_layers=2,
+                intermediate_size=64,
+                max_position_embeddings=128,
+                num_labels=1,
+            )
+            self.model = BertForSequenceClassification(config)
+            tmp_vocab = Path(tempfile.gettempdir()) / "mock_vocab.txt"
+            if not tmp_vocab.exists():
+                vocab_tokens = ["[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]"] + [f"tok_{i}" for i in range(295)]
+                tmp_vocab.write_text("\n".join(vocab_tokens) + "\n", encoding="utf-8")
+            self.tokenizer = BertTokenizerFast(vocab_file=str(tmp_vocab))
         else:
             model_source = str(self.model_path) if self.model_path is not None else self.model_name
             self.tokenizer = AutoTokenizer.from_pretrained(model_source, **load_kwargs)
@@ -295,7 +332,7 @@ class CrossEncoderReranker:
             if evidence_builder is None:
                 records = [{
                     "chunk_id": f"{doc_id}_fallback",
-                    "reranker_text": f"[QUESTION] {query} [DOCUMENT] {doc_id} [EVIDENCE 1] {doc_id}",
+                    "reranker_text": f"[DOCUMENT] {doc_id} [EVIDENCE 1] {doc_id}",
                 }]
             else:
                 records = evidence_builder.build(

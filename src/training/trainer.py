@@ -281,6 +281,14 @@ class RerankerTrainer:
         else:
             self.model = model
 
+        if self.config.get("gradient_checkpointing", False):
+            if hasattr(self.model, "gradient_checkpointing_enable"):
+                self.model.gradient_checkpointing_enable()
+            elif hasattr(self.model, "base_model") and hasattr(self.model.base_model, "gradient_checkpointing_enable"):
+                self.model.base_model.gradient_checkpointing_enable()
+            if hasattr(self.model, "enable_input_require_grads"):
+                self.model.enable_input_require_grads()
+
         self.model.to(self.device)
 
         # Build datasets and loaders

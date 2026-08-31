@@ -66,6 +66,11 @@ class BM25PyViRetriever:
         self.idf: dict[str, float] = {}
         self.postings: dict[str, tuple[np.ndarray, np.ndarray]] = {}
 
+    @property
+    def corpus(self) -> list[str]:
+        """Backward-compatibility property returning indexed chunk IDs."""
+        return self.chunk_ids
+
     def fit(self, chunks: Any, show_progress: bool = False) -> "BM25PyViRetriever":
         """Fit BM25 index on micro chunks using PyVi tokenization."""
         if isinstance(chunks, pd.DataFrame):

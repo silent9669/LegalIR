@@ -1,5 +1,6 @@
 from src.retrieval.bm25_micro import BM25MicroRetriever, tokenize_legal
 from src.retrieval.bm25_pyvi import BM25PyViRetriever, tokenize_pyvi
+from src.retrieval.build_indexes import enrich_chunks_with_doc_metadata
 from src.retrieval.candidate_union import (
     DEFAULT_CANDIDATE_CUTOFFS,
     build_candidate_features,
@@ -24,6 +25,7 @@ __all__ = [
     "QuestionMemory",
     "TrainQuestionMemory",
     "build_candidate_features",
+    "enrich_chunks_with_doc_metadata",
     "evaluate_candidate_recall",
     "tokenize_legal",
     "tokenize_pyvi",
