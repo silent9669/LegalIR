@@ -59,6 +59,7 @@ selected-contexts/
 # Local data, parquet, indexes, and pickle artifacts
 artifacts/task1/indexes/
 artifacts/task1/checkpoints/
+artifacts/task1/smoke_run/
 data/task1_canonical/
 artifacts/data/
 artifacts/indexes/

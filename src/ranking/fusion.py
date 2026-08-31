@@ -164,11 +164,23 @@ class LinearRanker:
         self.model = Ridge(alpha=self.alpha, fit_intercept=True)
         self.model.fit(X_mat, y_arr)
 
-    def predict(self, candidate_records: list[dict[str, Any]], **kwargs) -> list[dict[str, Any]]:
+    def predict(
+        self,
+        candidate_records: list[dict[str, Any]],
+        query_id: str | None = None,
+        query_text: str | None = None,
+        doc_freq_map: Mapping[str, float] | None = None,
+        **kwargs,
+    ) -> list[dict[str, Any]]:
         if self.model is None or not candidate_records:
             return ReciprocalRankFusion().rank_candidates(candidate_records)
 
-        df = extract_candidate_features(candidate_records=candidate_records)
+        df = extract_candidate_features(
+            query_id=query_id,
+            candidate_records=candidate_records,
+            query_text=query_text,
+            doc_freq_map=doc_freq_map,
+        )
         for c in self.feature_cols:
             if c not in df.columns:
                 df[c] = 0.0
@@ -329,7 +341,13 @@ class LightGBMRanker:
             return rrf.rank_candidates(candidate_records)
 
         if self.fallback_model is not None:
-            return self.fallback_model.predict(candidate_records)
+            return self.fallback_model.predict(
+                candidate_records,
+                query_id=query_id,
+                query_text=query_text,
+                doc_freq_map=doc_freq_map,
+                **kwargs,
+            )
 
         df = extract_candidate_features(
             query_id=query_id,

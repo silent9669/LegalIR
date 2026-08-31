@@ -70,6 +70,8 @@ class OOFRunner:
         smoke_sample_size: int = 20,
         doc_disjoint: bool = False,
         doc_disjoint_splits_path: str | Path | None = None,
+        train_query_embeddings: Any | None = None,
+        reranker_config_path: str | Path | None = None,
     ):
         self.data_dir = Path(data_dir)
         self.index_dir = Path(index_dir)
@@ -84,6 +86,7 @@ class OOFRunner:
 
         self.output_dir = Path(output_dir)
         self.config_path = Path(config_path) if config_path else None
+        self.reranker_config_path = Path(reranker_config_path) if reranker_config_path else self.config_path
         self.num_folds = int(num_folds)
         self.candidate_k = int(candidate_k)
         self.rerank_k = int(rerank_k)
@@ -115,7 +118,11 @@ class OOFRunner:
         self.doc_map: dict[str, dict[str, Any]] = {}
         self.queries_map: dict[str, str] = {}
         self.qrels_map: dict[str, list[str]] = defaultdict(list)
-        self.train_query_embeddings: dict[str, np.ndarray] = {}
+        self.train_query_embeddings: dict[str, np.ndarray] = (
+            {str(k): np.asarray(v) for k, v in train_query_embeddings.items()}
+            if train_query_embeddings is not None
+            else {}
+        )
         self.evidence_builder: EvidencePackBuilder | None = None
         self.bm25: BM25MicroRetriever | None = None
         self.bm25_pyvi: BM25PyViRetriever | None = None
@@ -431,7 +438,7 @@ class OOFRunner:
                 )
 
                 adapter_dir = fold_dir / "reranker_adapter"
-                reranker_cfg = self.config_path or "configs/experiments/reranker_lora.yaml"
+                reranker_cfg = self.reranker_config_path or self.config_path or "configs/experiments/reranker_lora.yaml"
                 base_m_name = self.reranker_model if self.reranker_model != "mock" else None
                 train_report = train_reranker(
                     pairs_file=pairs_dir / "reranker_pairs.parquet",
@@ -704,7 +711,7 @@ class OOFRunner:
             )
 
             doc_disjoint_adapter_dir = doc_disjoint_dir / "reranker_adapter"
-            reranker_cfg = self.config_path or "configs/experiments/reranker_lora.yaml"
+            reranker_cfg = self.reranker_config_path or self.config_path or "configs/experiments/reranker_lora.yaml"
             base_m_name = self.reranker_model if self.reranker_model != "mock" else None
             train_reranker(
                 pairs_file=pairs_dir / "reranker_pairs.parquet",

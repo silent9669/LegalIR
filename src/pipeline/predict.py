@@ -25,6 +25,7 @@ class LegalIRPipeline:
         rerank_k: int = 50,
         fallback_doc_ids: list[str] | None = None,
         valid_doc_ids: Iterable[str] | None = None,
+        doc_freq_map: Any | None = None,
         *,
         retriever: Any | None = None,
     ):
@@ -38,6 +39,7 @@ class LegalIRPipeline:
         self.selector = selector or TopKSelector(max_k=5)
         self.candidate_k = int(candidate_k)
         self.rerank_k = int(rerank_k)
+        self.doc_freq_map = dict(doc_freq_map) if doc_freq_map is not None else {}
         self.valid_doc_ids = (
             {str(doc_id) for doc_id in valid_doc_ids}
             if valid_doc_ids is not None
@@ -86,29 +88,57 @@ class LegalIRPipeline:
                     break
         return answer
 
-    def predict_one(self, query_id: str, question: str | None) -> list[str]:
+    def predict_one(
+        self,
+        query_id: str,
+        question: str | None,
+        q_emb: Any | None = None,
+    ) -> list[str]:
         """Run all configured retrieval/ranking stages for one query."""
         question = "" if question is None else str(question)
         if not question.strip():
             return self._fallback_answer()
 
         if hasattr(self.hybrid_engine, "search_candidates"):
-            candidates = self.hybrid_engine.search_candidates(
-                query=question,
-                exclude_qid=str(query_id) if query_id else None,
-                top_k=self.candidate_k,
-            )
+            try:
+                candidates = self.hybrid_engine.search_candidates(
+                    query=question,
+                    exclude_qid=str(query_id) if query_id else None,
+                    top_k=self.candidate_k,
+                    q_emb=q_emb,
+                )
+            except TypeError:
+                candidates = self.hybrid_engine.search_candidates(
+                    query=question,
+                    exclude_qid=str(query_id) if query_id else None,
+                    top_k=self.candidate_k,
+                )
         elif hasattr(self.hybrid_engine, "retrieve_candidates"):
-            candidates = self.hybrid_engine.retrieve_candidates(
-                query=question,
-                top_k=self.candidate_k,
-            )
+            try:
+                candidates = self.hybrid_engine.retrieve_candidates(
+                    query=question,
+                    top_k=self.candidate_k,
+                    q_emb=q_emb,
+                )
+            except TypeError:
+                candidates = self.hybrid_engine.retrieve_candidates(
+                    query=question,
+                    top_k=self.candidate_k,
+                )
         elif hasattr(self.hybrid_engine, "search"):
-            candidates = self.hybrid_engine.search(
-                query=question,
-                top_k_candidates=self.candidate_k,
-                exclude_qid=str(query_id) if query_id else None,
-            )
+            try:
+                candidates = self.hybrid_engine.search(
+                    query=question,
+                    top_k_candidates=self.candidate_k,
+                    exclude_qid=str(query_id) if query_id else None,
+                    q_emb=q_emb,
+                )
+            except TypeError:
+                candidates = self.hybrid_engine.search(
+                    query=question,
+                    top_k_candidates=self.candidate_k,
+                    exclude_qid=str(query_id) if query_id else None,
+                )
         else:
             candidates = []
 
@@ -131,7 +161,12 @@ class LegalIRPipeline:
                 )
 
         if hasattr(self.ranker, "predict"):
-            ranked = self.ranker.predict(candidates)
+            ranked = self.ranker.predict(
+                candidates,
+                query_id=str(query_id),
+                query_text=question,
+                doc_freq_map=self.doc_freq_map,
+            )
         elif hasattr(self.ranker, "rank_candidates"):
             ranked = self.ranker.rank_candidates(candidates)
         else:
@@ -149,18 +184,22 @@ class LegalIRPipeline:
         from src.models.parameter_audit import audit_system_parameters
 
         models_to_audit = []
-        if hasattr(self.hybrid_engine, "dense_retriever") and self.hybrid_engine.dense_retriever is not None:
-            dense_ret = self.hybrid_engine.dense_retriever
+        dense_ret = getattr(self.hybrid_engine, "dense_retriever", None) or getattr(self.hybrid_engine, "dense", None)
+        if dense_ret is not None:
             if hasattr(dense_ret, "model") and dense_ret.model is not None:
-                models_to_audit.append((dense_ret.model, getattr(dense_ret, "model_name", "dense_embedding"), "dense_embedding"))
+                models_to_audit.append((dense_ret.model, getattr(dense_ret, "model_name", "CODE4LIFEOFFICIAL/huydang-dek21-embedding-v2"), "dense_embedding"))
             elif getattr(dense_ret, "model_name", None):
                 models_to_audit.append({"name": str(dense_ret.model_name), "role": "dense_embedding"})
+            else:
+                models_to_audit.append({"name": "CODE4LIFEOFFICIAL/huydang-dek21-embedding-v2", "role": "dense_embedding"})
 
         if self.reranker is not None:
             if hasattr(self.reranker, "model") and self.reranker.model is not None:
-                models_to_audit.append((self.reranker.model, getattr(self.reranker, "model_name", "cross_encoder_reranker"), "cross_encoder_reranker"))
+                models_to_audit.append((self.reranker.model, getattr(self.reranker, "model_name", "BAAI/bge-reranker-v2-m3"), "cross_encoder_reranker"))
             elif getattr(self.reranker, "model_name", None):
                 models_to_audit.append({"name": str(self.reranker.model_name), "role": "cross_encoder_reranker"})
+            else:
+                models_to_audit.append({"name": "BAAI/bge-reranker-v2-m3", "role": "cross_encoder_reranker"})
 
         if not models_to_audit:
             models_to_audit = None
@@ -178,6 +217,7 @@ class LegalIRPipeline:
         query_id: str | None = None,
         top_k_candidates: int | None = None,
         top_k_rerank: int | None = None,
+        q_emb: Any | None = None,
     ) -> list[str]:
         """Predict top document IDs for a single query."""
         old_cand_k = self.candidate_k
@@ -187,7 +227,7 @@ class LegalIRPipeline:
                 self.candidate_k = int(top_k_candidates)
             if top_k_rerank is not None:
                 self.rerank_k = int(top_k_rerank)
-            return self.predict_one(query_id=query_id or "0", question=query)
+            return self.predict_one(query_id=query_id or "0", question=query, q_emb=q_emb)
         finally:
             self.candidate_k = old_cand_k
             self.rerank_k = old_rerank_k
@@ -195,6 +235,7 @@ class LegalIRPipeline:
     def predict_batch(
         self,
         queries: dict[str, str] | list[dict[str, Any]],
+        query_embeddings: Any | None = None,
         show_progress: bool = False,
     ) -> dict[str, dict[str, list[str]]]:
         """Return ``{query_id: {"answer": [document_id, ...]}}``."""
@@ -222,8 +263,10 @@ class LegalIRPipeline:
             iterator = tqdm(iterator, desc="Generating predictions")
 
         for query_id, question in iterator:
-            answer = self.predict_one(str(query_id), question)
-            results[str(query_id)] = {"answer": answer}
+            qid_str = str(query_id)
+            q_emb = query_embeddings.get(qid_str) if query_embeddings is not None else None
+            answer = self.predict_one(qid_str, question, q_emb=q_emb)
+            results[qid_str] = {"answer": answer}
 
         return results
 
@@ -264,6 +307,16 @@ class LegalIRPipeline:
 
         docs_path = data_dir / "documents.parquet"
         chunks_path = data_dir / "chunks.parquet"
+        qrels_train_path = data_dir / "qrels_train.parquet"
+
+        doc_freq_map: dict[str, float] = {}
+        if qrels_train_path.exists():
+            try:
+                from src.ranking.oof_features import compute_training_doc_frequencies
+                df_qrels = pd.read_parquet(qrels_train_path)
+                doc_freq_map = compute_training_doc_frequencies(df_qrels)
+            except Exception as e:
+                print(f"Warning: failed loading qrels for doc frequency: {e}")
 
         doc_map = {}
         valid_doc_ids = set()
@@ -321,7 +374,13 @@ class LegalIRPipeline:
                 raise FileNotFoundError(f"Strict artifact check failed: Legal BM25 index at {bm25_path} is missing or empty")
             if bm25_pyvi is None or not bm25_pyvi_path.exists() or len(getattr(bm25_pyvi, "corpus", [])) == 0:
                 raise FileNotFoundError(f"Strict artifact check failed: PyVi BM25 index at {bm25_pyvi_path} is missing or empty")
-            if dense is None or not (dense_path / "embeddings.npy").exists():
+            if (
+                dense is None
+                or not (dense_path / "embeddings.npy").exists()
+                or not (dense_path / "chunks_meta.parquet").exists()
+                or len(getattr(dense, "embeddings", [])) == 0
+                or len(getattr(dense, "doc_ids", [])) == 0
+            ):
                 raise FileNotFoundError(f"Strict artifact check failed: Dense index at {dense_path} is missing or empty")
             if len(memory.qids) == 0:
                 raise FileNotFoundError(f"Strict artifact check failed: Question Memory at {mem_path} has 0 indexed queries")
@@ -335,20 +394,35 @@ class LegalIRPipeline:
                 if not has_weights:
                     raise FileNotFoundError(f"Strict artifact check failed: adapter weights (safetensors/bin) missing in {ad_path}")
                 ad_manifest = ad_path / "training_manifest.json"
-                if ad_manifest.exists():
-                    m_data = json.loads(ad_manifest.read_text(encoding="utf-8"))
-                    if m_data.get("status") != "completed":
-                        raise ValueError(f"Strict artifact check failed: adapter training status is {m_data.get('status')}")
-                    if m_data.get("param_diff", 1) is not None and m_data.get("param_diff", 1) <= 0:
-                        raise ValueError("Strict artifact check failed: adapter param_diff <= 0")
-                    if not m_data.get("adapter_checksum"):
-                        raise ValueError("Strict artifact check failed: adapter checksum is missing")
+                if not ad_manifest.exists():
+                    raise FileNotFoundError(f"Strict artifact check failed: training_manifest.json missing in {ad_path}")
+                m_data = json.loads(ad_manifest.read_text(encoding="utf-8"))
+                if m_data.get("status") != "completed":
+                    raise ValueError(f"Strict artifact check failed: adapter training status is {m_data.get('status')}")
+                if m_data.get("param_diff") is None or m_data.get("param_diff") <= 0:
+                    raise ValueError("Strict artifact check failed: adapter param_diff <= 0 or missing")
+                if not m_data.get("adapter_checksum"):
+                    raise ValueError("Strict artifact check failed: adapter checksum is missing")
+                if m_data.get("unique_training_queries", 0) <= 0:
+                    raise ValueError("Strict artifact check failed: unique_training_queries <= 0")
+                if m_data.get("optimizer_steps", 0) <= 0:
+                    raise ValueError("Strict artifact check failed: optimizer_steps <= 0")
             if use_learned_fusion:
                 if fusion_model_path is None:
                     raise FileNotFoundError("Strict artifact check failed: learned fusion requested but fusion_model_path is None")
                 f_p = Path(fusion_model_path)
                 if not f_p.exists():
                     raise FileNotFoundError(f"Strict artifact check failed: fusion model path {f_p} does not exist")
+                f_dir = f_p if f_p.is_dir() else f_p.parent
+                f_manifest = f_dir / "manifest.json"
+                if not f_manifest.exists() and (f_dir.parent / "manifest.json").exists():
+                    f_manifest = f_dir.parent / "manifest.json"
+                if f_manifest.exists():
+                    f_mdata = json.loads(f_manifest.read_text(encoding="utf-8"))
+                    if f_mdata.get("winning_method") and f_mdata.get("winning_method") != "learned_ranker":
+                        raise ValueError(f"Strict artifact check failed: winning_method in manifest is {f_mdata.get('winning_method')}, expected learned_ranker")
+                    if f_mdata.get("feature_training_stage") and f_mdata.get("feature_training_stage") != "post_rerank":
+                        raise ValueError(f"Strict artifact check failed: feature_training_stage is {f_mdata.get('feature_training_stage')}, expected post_rerank")
 
         # 4. Exact Matcher
         exact = ExactMatcher(documents=list(doc_map.values()))
@@ -420,6 +494,7 @@ class LegalIRPipeline:
             ranker=ranker,
             selector=selector,
             valid_doc_ids=valid_doc_ids,
+            doc_freq_map=doc_freq_map,
         )
 
         if audit_preflight or audit_output_json is not None:

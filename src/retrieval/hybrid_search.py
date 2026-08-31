@@ -78,6 +78,31 @@ class HybridSearchEngine:
                     raise ValueError("branch weights must be non-negative")
                 self.branch_weights[branch] = float(weight)
 
+    @property
+    def dense_retriever(self) -> DenseMacroRetriever | None:
+        """Expose dense retriever attribute for parameter audits and inspections."""
+        return self.dense
+
+    @property
+    def bm25_retriever(self) -> BM25MicroRetriever | None:
+        """Expose BM25 legal retriever attribute."""
+        return self.bm25
+
+    @property
+    def bm25_pyvi_retriever(self) -> BM25PyViRetriever | None:
+        """Expose BM25 PyVi retriever attribute."""
+        return self.bm25_pyvi
+
+    @property
+    def question_memory(self) -> QuestionMemory | TrainQuestionMemory | None:
+        """Expose question memory attribute."""
+        return self.memory
+
+    @property
+    def exact_matcher(self) -> ExactMatcher | None:
+        """Expose exact matcher attribute."""
+        return self.exact
+
     def search(
         self,
         query: str,

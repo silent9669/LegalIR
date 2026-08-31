@@ -84,6 +84,16 @@ class KaggleRunResult:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
+def resolve_repo_path(value: str | Path | None, repo_root: str | Path) -> Path:
+    """Resolve a path relative to the repo root if it is not already absolute."""
+    if value is None:
+        return Path(repo_root)
+    p = Path(value)
+    if not p.is_absolute():
+        p = Path(repo_root) / p
+    return p.resolve()
+
+
 def resolve_kaggle_devices(devices: list[str] | None = None) -> tuple[str, str]:
     """
     Allocate multi-GPU devices intentionally:
@@ -336,15 +346,30 @@ def run_kaggle_pipeline(
     print(f"[+] Dataset Loaded: {len(df_docs):,} documents | {len(df_chunks):,} chunks | {len(df_queries):,} train queries")
 
     # 4. Strict Parameter Budget Preflight Audit (<4B Rule)
-    resolved_runtime_config = Path(runtime_config_path) if runtime_config_path else (root_path / "configs/kaggle.yaml")
-    if config_path and not runtime_config_path:
-        resolved_runtime_config = Path(config_path)
-    if not resolved_runtime_config.exists():
-        resolved_runtime_config = root_path / "configs/pipeline.yaml"
+    if runtime_config_path:
+        resolved_runtime_config = resolve_repo_path(runtime_config_path, root_path)
+    elif config_path:
+        resolved_runtime_config = resolve_repo_path(config_path, root_path)
+    else:
+        resolved_runtime_config = resolve_repo_path("configs/kaggle.yaml", root_path)
 
-    resolved_reranker_config = Path(reranker_config_path) if reranker_config_path else (root_path / "configs/experiments/reranker_lora.yaml")
+    if not resolved_runtime_config.exists():
+        fallback_cfg = resolve_repo_path("configs/pipeline.yaml", root_path)
+        if fallback_cfg.exists():
+            resolved_runtime_config = fallback_cfg
+
+    if reranker_config_path:
+        resolved_reranker_config = resolve_repo_path(reranker_config_path, root_path)
+    else:
+        resolved_reranker_config = resolve_repo_path("configs/experiments/reranker_lora.yaml", root_path)
+
+    if (is_full or is_gpu_smoke) and not resolved_reranker_config.is_file():
+        raise FileNotFoundError(
+            f"Reranker training config not found at: {resolved_reranker_config}"
+        )
+
     if not resolved_reranker_config.exists():
-        resolved_reranker_config = root_path / "configs/pipeline.yaml"
+        resolved_reranker_config = resolve_repo_path("configs/pipeline.yaml", root_path)
 
     audit_json_path = working_path / "parameter_audit.json"
     audit_report = audit_system_parameters(
@@ -365,6 +390,10 @@ def run_kaggle_pipeline(
         effective_max_steps = reranker_cfg.get("max_steps", 500)
         if effective_max_steps is None:
             raise ValueError("Full reranker training requires explicit max_steps")
+        print(f"[+] Effective Reranker Config: model={reranker_cfg.get('base_model_name', 'BAAI/bge-reranker-v2-m3')}, "
+              f"batch_size={reranker_cfg.get('batch_size', 2)}, grad_accum={reranker_cfg.get('gradient_accumulation_steps', 8)}, "
+              f"max_length={reranker_cfg.get('max_length', 512)}, max_steps={effective_max_steps}, "
+              f"fp16={reranker_cfg.get('fp16', True)}, device={reranker_device}")
     elif is_gpu_smoke:
         effective_max_steps = 3
     else:
@@ -459,8 +488,9 @@ def run_kaggle_pipeline(
         output_dir=cv_dir,
         splits_path=canonical_data_dir / "splits/random_5fold.json" if (canonical_data_dir / "splits/random_5fold.json").exists() else None,
         doc_disjoint_splits_path=canonical_data_dir / "splits/doc_disjoint_split.json" if (canonical_data_dir / "splits/doc_disjoint_split.json").exists() else None,
-        config_path=resolved_reranker_config,
-        num_folds=1 if is_gpu_smoke else (2 if is_smoke else 5),
+        config_path=resolved_runtime_config,
+        reranker_config_path=resolved_reranker_config,
+        num_folds=2 if (is_smoke or is_gpu_smoke) else 5,
         candidate_k=20 if (is_smoke or is_gpu_smoke) else 150,
         rerank_k=10 if (is_smoke or is_gpu_smoke) else 50,
         use_reranker=True,
@@ -471,6 +501,7 @@ def run_kaggle_pipeline(
         smoke=(is_smoke or is_gpu_smoke),
         smoke_sample_size=20 if (is_smoke or is_gpu_smoke) else 50,
         doc_disjoint=True,
+        train_query_embeddings=train_query_embs,
     )
     cv_report = oof_runner.run()
 
@@ -615,13 +646,34 @@ def run_kaggle_pipeline(
     if (is_smoke or is_gpu_smoke) and len(q_items) > 20:
         q_items = q_items[:20]
 
+    # Precompute public query dense embeddings once on GPU0
+    public_q_embs: dict[str, np.ndarray] = {}
+    dense_ret = getattr(pipeline.hybrid_engine, "dense_retriever", None) or getattr(pipeline.hybrid_engine, "dense", None)
+    if dense_ret is not None and len(q_items) > 0:
+        print(f"[*] Precomputing public query dense embeddings for {len(q_items)} queries on {dense_device}...")
+        try:
+            q_texts = [
+                (q_val.get("question", "") if isinstance(q_val, dict) else str(q_val))
+                for _, q_val in q_items
+            ]
+            q_embs_array = dense_ret.encode_queries(
+                q_texts, batch_size=32 if is_full else 16
+            )
+            for (qid, _), emb in zip(q_items, q_embs_array):
+                public_q_embs[str(qid)] = emb
+            print(f"[+] Precomputed {len(public_q_embs):,} public query embeddings for reuse.")
+        except Exception as e:
+            print(f"[-] Warning: public query embedding precomputation skipped: {e}")
+
     for idx, (qid, q_val) in enumerate(q_items, start=1):
         q_text = q_val.get("question", "") if isinstance(q_val, dict) else str(q_val)
+        q_emb = public_q_embs.get(str(qid))
         pred_docs = pipeline.predict_single(
             query=q_text,
             query_id=str(qid),
             top_k_candidates=150 if is_full else 20,
             top_k_rerank=50 if is_full else 10,
+            q_emb=q_emb,
         )
         predictions[str(qid)] = {"answer": pred_docs}
         if idx % 100 == 0 or idx == len(q_items):
@@ -644,18 +696,6 @@ def run_kaggle_pipeline(
 
     is_submission_valid = bool(val_res.get("is_valid") and zip_val_res.get("is_valid"))
     print(f"[+] Submission Validation: JSON = {val_res.get('is_valid')} | ZIP = {zip_val_res.get('is_valid')} | Overall = {is_submission_valid}")
-
-    # Copy files to /kaggle/working root if running in Kaggle environment and in full mode
-    if is_full and Path("/kaggle/working").exists() and is_submission_valid:
-        try:
-            import shutil
-            shutil.copy2(sub_json, Path("/kaggle/working/submission.json"))
-            shutil.copy2(sub_zip, Path("/kaggle/working/submission.zip"))
-            if (submissions_dir / "submission_manifest.json").exists():
-                shutil.copy2(submissions_dir / "submission_manifest.json", Path("/kaggle/working/submission_manifest.json"))
-            print("[+] Copied submission.json, submission.zip, and manifest to /kaggle/working/ root.")
-        except Exception as e:
-            print(f"[-] Warning: Failed to copy submission to /kaggle/working: {e}")
 
     # 13. Manifest, Hashes, Reports & Parameter Audits
     git_sha = get_git_commit(root_path)
@@ -682,6 +722,17 @@ def run_kaggle_pipeline(
         },
     )
 
+    # Copy files to /kaggle/working root if running in Kaggle environment and in full mode AFTER manifest creation
+    if is_full and Path("/kaggle/working").exists() and is_submission_valid:
+        try:
+            import shutil
+            shutil.copy2(sub_json, Path("/kaggle/working/submission.json"))
+            shutil.copy2(sub_zip, Path("/kaggle/working/submission.zip"))
+            shutil.copy2(manifest_path, Path("/kaggle/working/submission_manifest.json"))
+            print("[+] Copied submission.json, submission.zip, and submission_manifest.json to /kaggle/working/ root.")
+        except Exception as e:
+            print(f"[-] Warning: Failed to copy submission to /kaggle/working: {e}")
+
     # Save ablation row
     ablation_csv = working_path / "ablation_report.csv"
     ablation_df = pd.DataFrame([
@@ -705,7 +756,30 @@ def run_kaggle_pipeline(
     ablation_df.to_csv(ablation_csv, index=False)
     print(f"[+] Saved ablation report to {ablation_csv}")
 
+    fusion_winner_rec5 = fusion_report.get("winner_mean_recall@5", cv_report.get("mean_recall@5", 0.0))
+    fusion_winner_prec5 = fusion_report.get("comparison", {}).get("winner_mean_precision@5", cv_report.get("mean_precision@5", 0.0))
+    doc_disjoint_rec5 = (
+        oof_runner.doc_disjoint_report.get("trained_reranker_system", {}).get("recall@5", 0.0)
+        if hasattr(oof_runner, "doc_disjoint_report") and oof_runner.doc_disjoint_report
+        else 0.0
+    )
+
     total_runtime = time.time() - t_start
+    print("\n" + "=" * 80)
+    print(f"LEGALIR TASK 1 PIPELINE RUN COMPLETE in {total_runtime:.2f}s")
+    print(f"  - Validation Status                      : {'PASS' if is_submission_valid else 'FAIL'}")
+    print(f"  - Submission JSON                        : {sub_json}")
+    print(f"  - Submission ZIP                         : {sub_zip} ({sub_zip.stat().st_size:,} bytes)")
+    print(f"  - Manifest JSON                          : {manifest_path}")
+    print(f"  - Reranker OOF Recall@5                  : {cv_report.get('mean_recall@5', 0.0) * 100:.4f}%")
+    print(f"  - Fusion Winner                          : {winning_fusion_method}")
+    print(f"  - Fusion Winner Cross-Fitted Recall@5    : {fusion_winner_rec5 * 100:.4f}%")
+    print(f"  - Fusion Winner Precision@5              : {fusion_winner_prec5 * 100:.4f}%")
+    print(f"  - Candidate Recall@150                   : {cv_report.get('mean_candidate@150', 0.0) * 100:.4f}%")
+    if doc_disjoint_rec5 > 0:
+        print(f"  - Doc-Disjoint Trained Reranker Recall@5 : {doc_disjoint_rec5 * 100:.4f}%")
+    print(f"  - Parameter Utilization                  : {audit_report.get('total_learned_parameters', 0):,} / 4,000,000,000 ({audit_report.get('budget_utilization_pct', 0.0):.2f}%)")
+    print("=" * 80)
     print("\n" + "=" * 80)
     print(f"LEGALIR TASK 1 PIPELINE RUN COMPLETE in {total_runtime:.2f}s")
     print(f"  - Validation Status     : {'PASS' if is_submission_valid else 'FAIL'}")

@@ -83,6 +83,10 @@ def train_and_evaluate_fusion_cv(
     if oof_df.empty or "fold" not in oof_df.columns:
         raise ValueError("oof_df must be non-empty and contain a 'fold' column.")
 
+    unique_folds = sorted(oof_df["fold"].unique())
+    if len(unique_folds) < 2:
+        raise ValueError("Cross-fitted fusion requires at least 2 folds")
+
     output_dir = Path(output_dir) if output_dir else Path("artifacts/local/training/fusion")
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -93,7 +97,6 @@ def train_and_evaluate_fusion_cv(
         available_cols = [c for c in CORE_FEATURE_COLUMNS if c in oof_df.columns]
 
     target_col = "label" if "label" in oof_df.columns else "target"
-    unique_folds = sorted(oof_df["fold"].unique())
 
     learned_fold_metrics = []
     rrf_fold_metrics = []
@@ -264,6 +267,7 @@ def train_and_evaluate_fusion_cv(
 
     manifest = {
         "schema_version": FEATURE_SCHEMA_VERSION,
+        "feature_training_stage": "post_rerank",
         "feature_columns": available_cols,
         "total_oof_rows": len(oof_df),
         "winning_method": winning_method,
