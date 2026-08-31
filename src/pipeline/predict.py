@@ -193,6 +193,7 @@ class LegalIRPipeline:
         self,
         output_json: str | Path | None = None,
         raise_on_violation: bool = True,
+        require_loaded_models: bool = False,
     ) -> dict[str, Any]:
         """Perform a strict parameter audit of all models in this pipeline against the 4B limit."""
         from src.models.parameter_audit import audit_system_parameters
@@ -203,10 +204,13 @@ class LegalIRPipeline:
             if hasattr(dense_ret, "ensure_loaded"):
                 try:
                     dense_ret.ensure_loaded()
-                except Exception:
-                    pass
+                except Exception as e:
+                    if require_loaded_models:
+                        raise RuntimeError(f"Strict parameter audit: failed to force-load Dense model: {e}") from e
             if hasattr(dense_ret, "model") and dense_ret.model is not None:
                 models_to_audit.append((dense_ret.model, getattr(dense_ret, "model_name", "CODE4LIFEOFFICIAL/huydang-dek21-embedding-v2"), "dense_embedding"))
+            elif require_loaded_models:
+                raise RuntimeError("Strict parameter audit: Dense retriever model is not loaded (model is None)")
             elif getattr(dense_ret, "model_name", None):
                 models_to_audit.append({"name": str(dense_ret.model_name), "role": "dense_embedding"})
             else:
@@ -216,10 +220,13 @@ class LegalIRPipeline:
             if hasattr(self.reranker, "ensure_loaded"):
                 try:
                     self.reranker.ensure_loaded()
-                except Exception:
-                    pass
+                except Exception as e:
+                    if require_loaded_models:
+                        raise RuntimeError(f"Strict parameter audit: failed to force-load Reranker model/adapter: {e}") from e
             if hasattr(self.reranker, "model") and self.reranker.model is not None:
                 models_to_audit.append((self.reranker.model, getattr(self.reranker, "model_name", "BAAI/bge-reranker-v2-m3"), "cross_encoder_reranker"))
+            elif require_loaded_models:
+                raise RuntimeError("Strict parameter audit: CrossEncoder reranker model is not loaded (model is None)")
             elif getattr(self.reranker, "model_name", None):
                 models_to_audit.append({"name": str(self.reranker.model_name), "role": "cross_encoder_reranker"})
             else:
@@ -233,6 +240,7 @@ class LegalIRPipeline:
             output_json=output_json,
             raise_on_violation=raise_on_violation,
             offline_fallback=True,
+            require_loaded_models=require_loaded_models,
         )
 
     def predict_single(

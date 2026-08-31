@@ -193,26 +193,6 @@ def train_and_evaluate_fusion_cv(
         or (np.isclose(learned_overall_rec5, rrf_overall_rec5, atol=1e-6) and learned_overall_prec5 > rrf_overall_prec5)
     )
 
-    if learned_wins:
-        winning_method = "learned_ranker"
-        winning_model_type = "lightgbm"
-        winner_rec5 = learned_overall_rec5
-        winner_prec5 = learned_overall_prec5
-        gate_decision = f"Learned Ranker selected (+{(learned_overall_rec5 - rrf_overall_rec5) * 100:.4f}% Recall@5 vs RRF)"
-    else:
-        winning_method = "reciprocal_rank_fusion"
-        winning_model_type = "rrf_weighted"
-        winner_rec5 = rrf_overall_rec5
-        winner_prec5 = rrf_overall_prec5
-        gate_decision = f"Weighted RRF selected (+{(rrf_overall_rec5 - learned_overall_rec5) * 100:.4f}% Recall@5 vs Learned)"
-
-    print("\n" + "=" * 70)
-    print(">> FUSION MODEL SELECTION GATE SUMMARY (5-Fold Cross-Fitted):")
-    print(f"   Learned Ranker Full OOF Recall@5 : {learned_overall_rec5 * 100:.4f}% (Mean across folds: {learned_mean_rec5 * 100:.4f}% +/- {learned_std_rec5 * 100:.4f}%)")
-    print(f"   Weighted RRF   Full OOF Recall@5 : {rrf_overall_rec5 * 100:.4f}% (Mean across folds: {rrf_mean_rec5 * 100:.4f}% +/- {rrf_std_rec5 * 100:.4f}%)")
-    print(f"   Winning Method                   : {winning_method} ({gate_decision})")
-    print("=" * 70)
-
     # 4. Train Final Model on All Folds
     print("\nTraining Final Fusion Model on All Folds...")
     all_sorted = oof_df.sort_values("query_id")
@@ -236,6 +216,27 @@ def train_and_evaluate_fusion_cv(
     fusion_final_dir.mkdir(parents=True, exist_ok=True)
     full_ranker.save(fusion_final_dir / "model.txt")
     trained_fold_models["fusion_final"] = str(fusion_final_dir / "model.txt")
+
+    if learned_wins:
+        winning_method = "learned_ranker"
+        winning_model_type = getattr(full_ranker, "model_type", "lightgbm")
+        winner_rec5 = learned_overall_rec5
+        winner_prec5 = learned_overall_prec5
+        gate_decision = f"Learned Ranker selected (+{(learned_overall_rec5 - rrf_overall_rec5) * 100:.4f}% Recall@5 vs RRF)"
+    else:
+        winning_method = "reciprocal_rank_fusion"
+        winning_model_type = "rrf_weighted"
+        winner_rec5 = rrf_overall_rec5
+        winner_prec5 = rrf_overall_prec5
+        gate_decision = f"Weighted RRF selected (+{(rrf_overall_rec5 - learned_overall_rec5) * 100:.4f}% Recall@5 vs Learned)"
+
+    print("\n" + "=" * 70)
+    print(">> FUSION MODEL SELECTION GATE SUMMARY (5-Fold Cross-Fitted):")
+    print(f"   Learned Ranker Full OOF Recall@5 : {learned_overall_rec5 * 100:.4f}% (Mean across folds: {learned_mean_rec5 * 100:.4f}% +/- {learned_std_rec5 * 100:.4f}%)")
+    print(f"   Weighted RRF   Full OOF Recall@5 : {rrf_overall_rec5 * 100:.4f}% (Mean across folds: {rrf_mean_rec5 * 100:.4f}% +/- {rrf_std_rec5 * 100:.4f}%)")
+    print(f"   Winning Method                   : {winning_method} ({gate_decision})")
+    print(f"   Winning Model Type               : {winning_model_type}")
+    print("=" * 70)
 
     # 5. Export artifacts & manifests
     comparison_report = {

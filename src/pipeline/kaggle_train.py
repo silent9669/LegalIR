@@ -388,15 +388,29 @@ def run_kaggle_pipeline(
             f"Canonical dataset parquet files missing in {canonical_data_dir}"
         )
 
-    val_report = validate_canonical_dataset(canonical_data_dir)
-    print(f"[+] Canonical Dataset Validation: is_valid = {val_report.get('is_valid')}")
-    if not val_report.get("is_valid") and (is_full or is_gpu_smoke):
-        raise ValueError(f"Canonical dataset validation failed in {run_mode_str.upper()} mode: {val_report.get('errors')}")
-
     df_docs = pd.read_parquet(docs_path)
     df_chunks = pd.read_parquet(chunks_path)
     df_queries = pd.read_parquet(queries_train_path) if queries_train_path.exists() else pd.DataFrame()
     df_qrels = pd.read_parquet(qrels_train_path) if qrels_train_path.exists() else pd.DataFrame()
+
+    if is_full or is_gpu_smoke:
+        if len(df_docs) != 8532:
+            raise ValueError(
+                f"{run_mode_str.upper()} mode requires official Task 1 dataset with exactly 8,532 documents, got {len(df_docs)}"
+            )
+        if len(df_queries) != 7000:
+            raise ValueError(
+                f"{run_mode_str.upper()} mode requires official Task 1 dataset with exactly 7,000 training queries, got {len(df_queries)}"
+            )
+
+    val_report = validate_canonical_dataset(
+        canonical_data_dir,
+        expected_document_count=8532 if (is_full or is_gpu_smoke) else None,
+    )
+    print(f"[+] Canonical Dataset Validation: is_valid = {val_report.get('is_valid')}")
+    if not val_report.get("is_valid") and (is_full or is_gpu_smoke):
+        raise ValueError(f"Canonical dataset validation failed in {run_mode_str.upper()} mode: {val_report.get('errors')}")
+
     print(f"[+] Dataset Loaded: {len(df_docs):,} documents | {len(df_chunks):,} chunks | {len(df_queries):,} train queries")
 
     # 4. Strict Parameter Budget Preflight Audit (<4B Rule)
@@ -517,6 +531,13 @@ def run_kaggle_pipeline(
                 raise RuntimeError(f"Failed to build DEk21 Dense index on {dense_device} in {run_mode_str.upper()} mode: {e}") from e
             print(f"[-] Warning: Dense index building failed: {e}")
             dense_retriever = None
+
+    if is_full or is_gpu_smoke:
+        if dense_retriever is None or getattr(dense_retriever, "_faiss_index", None) is None:
+            raise RuntimeError(
+                f"FAISS production backend enforcement failed in {run_mode_str.upper()} mode: "
+                "dense_retriever._faiss_index is None (NumPy fallback is not allowed in production)."
+            )
 
     # 7. Precompute Train Query Dense Embeddings on GPU 0 (P1.10)
     train_query_embs: dict[str, np.ndarray] = {}
@@ -655,6 +676,15 @@ def run_kaggle_pipeline(
     )
     print(f"[+] Final Reranker Training Status: {final_reranker_report.get('status')} | Checkpoint: {final_reranker_dir}")
 
+    if is_full:
+        min_coverage = 99.0
+        actual_cov = final_reranker_report.get("actual_query_coverage_pct", 0.0)
+        if actual_cov < min_coverage:
+            raise RuntimeError(
+                f"FULL mode requires actual_query_coverage_pct >= {min_coverage}%, got {actual_cov}% "
+                f"({final_reranker_report.get('actual_unique_queries_seen')}/{final_reranker_report.get('eligible_training_queries')} queries seen)."
+            )
+
     # 11. Public Test Inference with Fully Loaded Final Production Pipeline (P0.3, P0.4, P1.8)
     print("\n" + "=" * 70)
     print("[*] Executing Public Test Batch Inference with Final Production Pipeline (P1.8)...")
@@ -666,6 +696,10 @@ def run_kaggle_pipeline(
             raise FileNotFoundError(f"{run_mode_str.upper()} mode requires official public-official.json; refusing to generate submission")
         with open(public_test_file, "r", encoding="utf-8") as f:
             public_data = json.load(f)
+        if len(public_data) != 999:
+            raise ValueError(
+                f"{run_mode_str.upper()} mode requires official public-official.json with exactly 999 queries, got {len(public_data)}"
+            )
     elif public_test_file and public_test_file.exists():
         print(f"[+] Found Public Test Queries: {public_test_file}")
         with open(public_test_file, "r", encoding="utf-8") as f:
@@ -707,6 +741,7 @@ def run_kaggle_pipeline(
     final_audit_report = pipeline.audit_parameters(
         output_json=final_audit_json,
         raise_on_violation=True,
+        require_loaded_models=(is_full or is_gpu_smoke),
     )
 
     t0_infer = time.time()
@@ -831,7 +866,10 @@ def run_kaggle_pipeline(
 
         oof_reranker_oom = sum(f.get("reranker_oom_events", 0) for f in cv_report.get("folds", []))
         final_reranker_oom = int(getattr(pipeline.reranker, "oom_events", 0)) if pipeline.reranker is not None else 0
-        dense_oom = int(getattr(dense_retriever, "dense_oom_events", 0)) if dense_retriever is not None else 0
+        pipeline_dense = getattr(pipeline.hybrid_engine, "dense_retriever", None) or getattr(pipeline.hybrid_engine, "dense", None)
+        public_dense_oom = int(getattr(pipeline_dense, "dense_oom_events", 0)) if pipeline_dense is not None and pipeline_dense is not dense_retriever else 0
+        corpus_dense_oom = int(getattr(dense_retriever, "dense_oom_events", 0)) if dense_retriever is not None else 0
+        dense_oom = corpus_dense_oom + public_dense_oom
         total_reranker_oom = oof_reranker_oom + final_reranker_oom
         total_oom_events = total_reranker_oom + dense_oom
 
@@ -849,6 +887,9 @@ def run_kaggle_pipeline(
             "gpu1_peak_reserved_bytes": int(gpu1_res),
             "dense_initial_batch_size": int(getattr(dense_retriever, "dense_initial_batch_size", 32)) if dense_retriever is not None else 32,
             "dense_min_successful_batch_size": int(getattr(dense_retriever, "dense_min_successful_batch_size", 32)) if dense_retriever is not None else 32,
+            "dense_corpus_oom_events": corpus_dense_oom,
+            "dense_public_query_oom_events": public_dense_oom,
+            "dense_total_oom_events": dense_oom,
             "dense_oom_events": dense_oom,
             "oof_reranker_oom_events": oof_reranker_oom,
             "final_reranker_oom_events": final_reranker_oom,
@@ -871,17 +912,27 @@ def run_kaggle_pipeline(
         # Runtime projection calculation
         q_infer_time = float(time.time() - t0_infer)
         q_infer_rate = len(q_items) / max(0.001, q_infer_time)
-        projected_public_infer_sec = 999.0 / max(0.1, q_infer_rate)
+        total_public_count = float(len(public_data))
+        projected_public_infer_sec = total_public_count / max(0.1, q_infer_rate)
 
         oof_q_sec = float(cv_report.get("queries_per_second", 1.0))
-        projected_5fold_oof_sec = (7000.0 * 5) / max(0.1, oof_q_sec) if is_full else (7000.0 * 2) / max(0.1, oof_q_sec)
-        projected_final_train_sec = float(final_reranker_report.get("training_time_sec", 10.0)) * (500.0 / max(1.0, float(final_reranker_report.get("global_steps", 1))))
+        total_oof_queries = float(len(df_queries)) if not df_queries.empty else 7000.0
+        # In 5-fold OOF, each training query is evaluated as held-out validation query once (total = 7000 queries)
+        oof_infer_sec = total_oof_queries / max(0.1, oof_q_sec)
+        final_train_unit_sec = float(final_reranker_report.get("training_time_sec", 10.0))
+        steps_ratio = 500.0 / max(1.0, float(final_reranker_report.get("global_steps", 1))) if is_full else 1.0
+        projected_final_train_sec = final_train_unit_sec * steps_ratio
+        oof_folds_train_sec = 5.0 * projected_final_train_sec if is_full else 2.0 * final_train_unit_sec
+        projected_5fold_oof_sec = oof_infer_sec + oof_folds_train_sec
 
         projected_total_sec = projected_5fold_oof_sec + projected_final_train_sec + projected_public_infer_sec + 300.0
 
         runtime_proj = {
             "public_queries_per_second": round(q_infer_rate, 2),
             "oof_queries_per_second": round(oof_q_sec, 2),
+            "total_oof_validation_queries": int(total_oof_queries),
+            "projected_oof_inference_seconds": round(oof_infer_sec, 2),
+            "projected_oof_training_seconds": round(oof_folds_train_sec, 2),
             "projected_5fold_oof_seconds": round(projected_5fold_oof_sec, 2),
             "projected_5fold_oof_hours": round(projected_5fold_oof_sec / 3600.0, 3),
             "projected_final_training_seconds": round(projected_final_train_sec, 2),

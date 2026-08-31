@@ -45,6 +45,7 @@ class CrossEncoderReranker:
         self.oom_events: int = 0
         self.initial_batch_size: int = 16
         self.min_successful_batch_size: int = 16
+        self.last_successful_batch_size: int = 16
 
     def _resolve_model_path(
         self,
@@ -226,9 +227,14 @@ class CrossEncoderReranker:
         self._load_model()
         import torch
 
+        self.initial_batch_size = batch_size
+        current_batch = batch_size
         all_scores: list[float] = []
-        for start in range(0, len(pairs), batch_size):
-            batch = pairs[start : start + batch_size]
+        idx = 0
+        n_pairs = len(pairs)
+
+        while idx < n_pairs:
+            batch = pairs[idx : idx + current_batch]
             queries = [str(pair[0]) for pair in batch]
             passages = [str(pair[1]) for pair in batch]
             try:
@@ -250,19 +256,19 @@ class CrossEncoderReranker:
                         f"model returned {len(batch_scores)} scores for {len(batch)} pairs"
                     )
                 all_scores.extend(float(score) for score in batch_scores)
+                self.min_successful_batch_size = min(self.min_successful_batch_size, len(batch))
+                self.last_successful_batch_size = len(batch)
+                idx += len(batch)
             except RuntimeError as exc:
                 message = str(exc).lower()
                 if ("out of memory" in message or "cuda error: out of memory" in message or "mps" in message):
                     self.oom_events += 1
-                    if batch_size == 1:
+                    if current_batch == 1:
                         raise
-                    half_batch_size = max(1, batch_size // 2)
-                    self.min_successful_batch_size = min(self.min_successful_batch_size, half_batch_size)
+                    current_batch = max(1, current_batch // 2)
+                    self.min_successful_batch_size = min(self.min_successful_batch_size, current_batch)
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
-                    all_scores.extend(
-                        self.score_pairs(batch, batch_size=half_batch_size, max_length=max_length)
-                    )
                 else:
                     raise
         return all_scores

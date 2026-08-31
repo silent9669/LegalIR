@@ -319,6 +319,8 @@ class LightGBMRanker:
             self.fallback_model = None
 
         except Exception as e:
+            if self.strict:
+                raise RuntimeError(f"Strict LightGBM training failed: {e}") from e
             # Fallback to linear ranker if LightGBM fails or cannot be imported
             print(f"Warning: LightGBM training failed or unavailable ({e}); falling back to LinearRanker.")
             self.fallback_model = LinearRanker(feature_cols=available_cols)

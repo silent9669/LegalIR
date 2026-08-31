@@ -134,49 +134,86 @@ class ExactMatcher:
             if isinstance(chunks, (str, Path)):
                 p = Path(chunks)
                 if p.is_file():
-                    chunks = pd.read_parquet(p)
+                    try:
+                        chunks = pd.read_parquet(p, columns=["doc_id", "article", "clause", "point"])
+                    except Exception:
+                        chunks = pd.read_parquet(p)
                 else:
                     chunks = []
+
             if isinstance(chunks, pd.DataFrame):
-                chunk_records = chunks[["doc_id", "article", "clause", "point"]].dropna(how="all").to_dict(orient="records") if set(["doc_id", "article", "clause", "point"]).issubset(chunks.columns) else chunks.to_dict(orient="records")
-            else:
-                chunk_records = list(chunks)
+                cols = [c for c in ["doc_id", "article", "clause", "point"] if c in chunks.columns]
+                if "doc_id" in cols:
+                    subset = chunks[cols].dropna(subset=["doc_id"])
+                    has_statutory = pd.Series(False, index=subset.index)
+                    for col in ["article", "clause", "point"]:
+                        if col in subset.columns:
+                            has_statutory |= subset[col].notna() & (subset[col].astype(str).str.strip() != "")
+                    valid_df = subset[has_statutory]
+                    for row in valid_df.itertuples(index=False):
+                        row_dict = row._asdict()
+                        did = str(row_dict.get("doc_id", "")).strip()
+                        if not did:
+                            continue
+                        art = row_dict.get("article")
+                        if art is not None and not (isinstance(art, float) and pd.isna(art)):
+                            norm_art = normalize_text(art)
+                            if norm_art:
+                                self.doc_articles[did].add(norm_art)
+                                art_num = re.sub(r"^[^\d]*", "", norm_art)
+                                if art_num:
+                                    self.doc_articles[did].add(f"điều {art_num}")
 
-            for c in chunk_records:
-                did = str(c.get("doc_id", ""))
-                if not did:
-                    continue
-                art = c.get("article")
-                if art is not None and not (isinstance(art, float) and pd.isna(art)):
-                    norm_art = normalize_text(art)
-                    if norm_art:
-                        self.doc_articles[did].add(norm_art)
-                        art_num = re.sub(r"^[^\d]*", "", norm_art)
-                        if art_num:
-                            self.doc_articles[did].add(f"điều {art_num}")
+                        cl = row_dict.get("clause")
+                        if cl is not None and not (isinstance(cl, float) and pd.isna(cl)):
+                            norm_cl = normalize_text(cl)
+                            if norm_cl:
+                                self.doc_clauses[did].add(norm_cl)
+                                cl_num = re.sub(r"^[^\d]*", "", norm_cl)
+                                if cl_num:
+                                    self.doc_clauses[did].add(f"khoản {cl_num}")
 
-                cl = c.get("clause")
-                if cl is not None and not (isinstance(cl, float) and pd.isna(cl)):
-                    norm_cl = normalize_text(cl)
-                    if norm_cl:
-                        self.doc_clauses[did].add(norm_cl)
-                        cl_num = re.sub(r"^[^\d]*", "", norm_cl)
-                        if cl_num:
-                            self.doc_clauses[did].add(f"khoản {cl_num}")
+                        pt = row_dict.get("point")
+                        if pt is not None and not (isinstance(pt, float) and pd.isna(pt)):
+                            norm_pt = normalize_text(pt)
+                            if norm_pt:
+                                self.doc_points[did].add(norm_pt)
+                                pt_clean = re.sub(r"^[^\w]*", "", norm_pt)
+                                if pt_clean:
+                                    self.doc_points[did].add(f"điểm {pt_clean}")
+            elif isinstance(chunks, list):
+                for c in chunks:
+                    if not isinstance(c, (dict, Mapping)):
+                        continue
+                    did = str(c.get("doc_id", "")).strip()
+                    if not did:
+                        continue
+                    art = c.get("article")
+                    if art is not None and not (isinstance(art, float) and pd.isna(art)):
+                        norm_art = normalize_text(art)
+                        if norm_art:
+                            self.doc_articles[did].add(norm_art)
+                            art_num = re.sub(r"^[^\d]*", "", norm_art)
+                            if art_num:
+                                self.doc_articles[did].add(f"điều {art_num}")
 
-                pt = c.get("point")
-                if pt is not None and not (isinstance(pt, float) and pd.isna(pt)):
-                    norm_pt = normalize_text(pt)
-                    if norm_pt:
-                        self.doc_points[did].add(norm_pt)
-                        pt_clean = re.sub(r"^[^\w]*", "", norm_pt)
-                        if pt_clean:
-                            self.doc_points[did].add(f"điểm {pt_clean}")
-                self.doc_clauses[doc_id].add(normalize_text(cl))
+                    cl = c.get("clause")
+                    if cl is not None and not (isinstance(cl, float) and pd.isna(cl)):
+                        norm_cl = normalize_text(cl)
+                        if norm_cl:
+                            self.doc_clauses[did].add(norm_cl)
+                            cl_num = re.sub(r"^[^\d]*", "", norm_cl)
+                            if cl_num:
+                                self.doc_clauses[did].add(f"khoản {cl_num}")
 
-            pt = d.get("point")
-            if pt is not None and not (isinstance(pt, float) and pd.isna(pt)):
-                self.doc_points[doc_id].add(normalize_text(pt))
+                    pt = c.get("point")
+                    if pt is not None and not (isinstance(pt, float) and pd.isna(pt)):
+                        norm_pt = normalize_text(pt)
+                        if norm_pt:
+                            self.doc_points[did].add(norm_pt)
+                            pt_clean = re.sub(r"^[^\w]*", "", norm_pt)
+                            if pt_clean:
+                                self.doc_points[did].add(f"điểm {pt_clean}")
 
     def match(self, query: str) -> dict[str, dict[str, Any]]:
         """Extract statutory references and match against indexed documents.

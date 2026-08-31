@@ -238,9 +238,15 @@ def audit_model_parameters(
     adapter_p = 0
 
     if isinstance(model_or_config, nn.Module):
-        if hasattr(model_or_config, "peft_config") or hasattr(model_or_config, "base_model") or any("lora" in n.lower() for n, _ in model_or_config.named_parameters()):
+        # Strong PEFT / LoRA detection (avoid marking plain HF models as PEFT just because base_model or mixins exist)
+        has_peft_config = bool(getattr(model_or_config, "peft_config", None))
+        has_lora_params = any("lora_" in n.lower() for n, _ in model_or_config.named_parameters())
+        class_name = model_or_config.__class__.__name__
+        is_peft_class = "PeftModel" in class_name or getattr(model_or_config, "is_peft_model", False)
+
+        if has_peft_config or has_lora_params or is_peft_class:
             is_peft = True
-            lora_p = sum(p.numel() for n, p in model_or_config.named_parameters() if "lora" in n.lower() or p.requires_grad)
+            lora_p = sum(p.numel() for n, p in model_or_config.named_parameters() if "lora_" in n.lower() or (has_peft_config and p.requires_grad))
             adapter_p = lora_p
             base_p = max(0, total_p - adapter_p)
             trainable_p = lora_p
@@ -310,6 +316,7 @@ def audit_system_parameters(
     output_json: str | Path | None = "parameter_audit.json",
     raise_on_violation: bool = True,
     offline_fallback: bool = True,
+    require_loaded_models: bool = False,
 ) -> dict[str, Any]:
     """Audit the total learned parameters of the LegalIR system and verify compliance (<4B budget).
 
@@ -319,6 +326,7 @@ def audit_system_parameters(
         output_json: Path to save parameter_audit.json (set None to skip file writing).
         raise_on_violation: If True, raises ParameterBudgetExceededError when total >= 4B.
         offline_fallback: If True, uses pinned known counts and offline config estimation when needed.
+        require_loaded_models: If True, strictly requires instantiated PyTorch modules and active adapters.
 
     Returns:
         Structured audit report dictionary with per-model breakdown and compliance status.
@@ -352,6 +360,13 @@ def audit_system_parameters(
 
         for entry in extracted:
             model_entries.append((entry["name"], entry["name"], entry.get("role", "model")))
+
+    if require_loaded_models:
+        for model_obj, name, role in model_entries:
+            if not isinstance(model_obj, nn.Module):
+                raise RuntimeError(
+                    f"Strict parameter audit requires loaded nn.Module, but component '{name}' ({role}) is {type(model_obj)}"
+                )
 
     model_reports: dict[str, Any] = {}
     total_params = 0

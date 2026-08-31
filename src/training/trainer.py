@@ -23,6 +23,7 @@ from src.training.losses import get_loss_function
 
 
 import random
+from torch.utils.data import DataLoader, Dataset, Sampler
 
 
 def balance_pairs_by_query(records: list[dict[str, Any]], seed: int = 42) -> list[dict[str, Any]]:
@@ -58,6 +59,140 @@ def balance_pairs_by_query(records: list[dict[str, Any]], seed: int = 42) -> lis
                 has_items = True
 
     return balanced
+
+
+class QueryBalancedSampler(Sampler[int]):
+    """Deterministic query-aware sampler guaranteeing that every eligible query's primary pair
+
+    (1 positive + 1 hard negative) is scheduled in the first cycle before any query is oversampled.
+    Survives DataLoader iteration without shuffle=True interference.
+    """
+
+    def __init__(self, dataset: Dataset, seed: int = 42):
+        self.dataset = dataset
+        self.seed = seed
+        self.epoch = 0
+
+        # Extract records from dataset
+        if hasattr(dataset, "records"):
+            records = dataset.records
+        elif hasattr(dataset, "data"):
+            records = dataset.data
+        else:
+            records = [dataset[i] for i in range(len(dataset))]
+
+        self.pos_indices: dict[str, list[int]] = defaultdict(list)
+        self.neg_indices: dict[str, list[int]] = defaultdict(list)
+        self.all_query_ids: set[str] = set()
+
+        for idx, item in enumerate(records):
+            qid = str(item.get("query_id", "")).strip()
+            if not qid:
+                continue
+            self.all_query_ids.add(qid)
+            lbl = float(item.get("label", 0.0))
+            if lbl > 0.5:
+                self.pos_indices[qid].append(idx)
+            else:
+                self.neg_indices[qid].append(idx)
+
+        # Eligible queries have at least 1 positive and 1 negative (or at least 1 pair)
+        self.eligible_query_ids: set[str] = set(
+            qid for qid in self.all_query_ids
+            if len(self.pos_indices[qid]) > 0 and len(self.neg_indices[qid]) > 0
+        )
+        if not self.eligible_query_ids:
+            self.eligible_query_ids = set(self.all_query_ids)
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def __iter__(self):
+        rng = random.Random(self.seed + self.epoch)
+        # Separate eligible queries and others
+        eligible_sorted = sorted(list(self.eligible_query_ids))
+        rng.shuffle(eligible_sorted)
+        other_sorted = sorted(list(self.all_query_ids - self.eligible_query_ids))
+        rng.shuffle(other_sorted)
+        qids = eligible_sorted + other_sorted
+
+        # Deep copy index lists for consumption
+        pos_map = {q: list(self.pos_indices[q]) for q in qids}
+        neg_map = {q: list(self.neg_indices[q]) for q in qids}
+
+        ordered_indices: list[int] = []
+
+        # Pass 1: 1 positive + 1 negative for every query in scheduled order
+        for q in qids:
+            if pos_map[q]:
+                ordered_indices.append(pos_map[q].pop(0))
+            if neg_map[q]:
+                ordered_indices.append(neg_map[q].pop(0))
+
+        # Pass 2: cycle through remaining items round-robin until all are scheduled
+        has_more = True
+        while has_more:
+            has_more = False
+            for q in qids:
+                if pos_map[q]:
+                    ordered_indices.append(pos_map[q].pop(0))
+                    has_more = True
+                if neg_map[q]:
+                    ordered_indices.append(neg_map[q].pop(0))
+                    has_more = True
+
+        return iter(ordered_indices)
+
+
+class QueryBalancedGroupSampler(Sampler[int]):
+    """Deterministic query-aware sampler for RerankerGroupDataset."""
+
+    def __init__(self, dataset: Dataset, seed: int = 42):
+        self.dataset = dataset
+        self.seed = seed
+        self.epoch = 0
+
+        items = getattr(dataset, "items", [])
+        self.query_indices: dict[str, list[int]] = defaultdict(list)
+        for idx, item in enumerate(items):
+            qid = str(item.get("query_id", "")).strip()
+            if qid:
+                self.query_indices[qid].append(idx)
+
+        self.eligible_query_ids: set[str] = set(self.query_indices.keys())
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def __iter__(self):
+        rng = random.Random(self.seed + self.epoch)
+        qids = sorted(list(self.eligible_query_ids))
+        rng.shuffle(qids)
+
+        q_map = {q: list(self.query_indices[q]) for q in qids}
+        ordered: list[int] = []
+
+        # Pass 1: 1 group per query
+        for q in qids:
+            if q_map[q]:
+                ordered.append(q_map[q].pop(0))
+
+        # Pass 2: remaining groups
+        has_more = True
+        while has_more:
+            has_more = False
+            for q in qids:
+                if q_map[q]:
+                    ordered.append(q_map[q].pop(0))
+                    has_more = True
+
+        return iter(ordered)
 
 
 class RerankerPairDataset(Dataset):
@@ -337,22 +472,29 @@ class RerankerTrainer:
 
         self.model.to(self.device)
 
-        # Build datasets and loaders
+        # Build datasets and loaders with QueryBalancedSampler
         if self.loss_type in ("listwise", "listwise_ce", "pairwise_logistic", "pairwise_margin"):
             self.train_dataset = RerankerGroupDataset(train_data)
             self.train_collator = RerankerGroupCollator(self.tokenizer, max_length=self.max_length)
+            self.train_sampler = QueryBalancedGroupSampler(self.train_dataset, seed=42)
+            self.train_loader = DataLoader(
+                self.train_dataset,
+                batch_size=self.batch_size,
+                sampler=self.train_sampler,
+                collate_fn=self.train_collator,
+            )
             self.is_group_mode = True
         else:
-            self.train_dataset = RerankerPairDataset(train_data)
+            self.train_dataset = RerankerPairDataset(train_data, balanced=False)
             self.train_collator = RerankerPairCollator(self.tokenizer, max_length=self.max_length)
+            self.train_sampler = QueryBalancedSampler(self.train_dataset, seed=42)
+            self.train_loader = DataLoader(
+                self.train_dataset,
+                batch_size=self.batch_size,
+                sampler=self.train_sampler,
+                collate_fn=self.train_collator,
+            )
             self.is_group_mode = False
-
-        self.train_loader = DataLoader(
-            self.train_dataset,
-            batch_size=self.batch_size,
-            shuffle=True,
-            collate_fn=self.train_collator,
-        )
 
         self.val_loader = None
         if val_data is not None and len(val_data) > 0:
@@ -404,7 +546,9 @@ class RerankerTrainer:
         loss_history: list[float] = []
         accumulated_loss = 0.0
         optimizer.zero_grad()
-        seen_query_ids = set()
+        seen_query_ids: set[str] = set()
+        positive_queries_seen: set[str] = set()
+        queries_with_negative_seen: set[str] = set()
         nonfinite_loss_count = 0
 
         # AMP GradScaler for stable mixed precision training on CUDA
@@ -412,14 +556,32 @@ class RerankerTrainer:
 
         print(f"Starting training: {total_training_steps} steps, device={self.device}, fp16={self.fp16}")
 
+        epoch = 0
         while global_step < total_training_steps:
+            if hasattr(self.train_sampler, "set_epoch"):
+                self.train_sampler.set_epoch(epoch)
+            epoch += 1
+
             for batch_idx, batch in enumerate(self.train_loader):
                 if global_step >= total_training_steps:
                     break
 
-                for qid in batch.get("query_ids", []):
-                    if qid:
-                        seen_query_ids.add(str(qid))
+                if self.is_group_mode:
+                    for qid in batch.get("query_ids", []):
+                        if qid:
+                            qid_str = str(qid)
+                            seen_query_ids.add(qid_str)
+                            positive_queries_seen.add(qid_str)
+                            queries_with_negative_seen.add(qid_str)
+                else:
+                    for qid, lbl in zip(batch.get("query_ids", []), batch.get("labels", [])):
+                        if qid:
+                            qid_str = str(qid)
+                            seen_query_ids.add(qid_str)
+                            if float(lbl) > 0.5:
+                                positive_queries_seen.add(qid_str)
+                            else:
+                                queries_with_negative_seen.add(qid_str)
 
                 inputs = {
                     k: v.to(self.device)
@@ -499,9 +661,15 @@ class RerankerTrainer:
         elapsed_time = time.time() - start_time
         final_train_loss = loss_history[-1] if loss_history else 0.0
 
-        total_input_queries = len(getattr(self.train_dataset, "unique_query_ids", set())) or len(seen_query_ids)
+        eligible_qids = getattr(self.train_sampler, "eligible_query_ids", None)
+        if eligible_qids is None:
+            eligible_qids = getattr(self.train_dataset, "eligible_query_ids", None)
+        if eligible_qids is None:
+            eligible_qids = getattr(self.train_dataset, "unique_query_ids", set())
+
+        eligible_count = len(eligible_qids) if eligible_qids else len(seen_query_ids)
         actual_seen_count = len(seen_query_ids)
-        coverage_pct = round((actual_seen_count / max(1, total_input_queries)) * 100.0, 2)
+        coverage_pct = round((actual_seen_count / max(1, eligible_count)) * 100.0, 2)
 
         report = {
             "status": "completed",
@@ -514,8 +682,11 @@ class RerankerTrainer:
             "total_params": self.peft_meta.get("total_params", sum(p.numel() for p in self.model.parameters())),
             "trainable_percent": self.peft_meta.get("trainable_percent", 100.0),
             "param_diff": float(param_diff),
-            "actual_unique_queries_seen": actual_seen_count,
-            "actual_query_coverage_pct": coverage_pct,
+            "eligible_training_queries": int(eligible_count),
+            "actual_unique_queries_seen": int(actual_seen_count),
+            "actual_query_coverage_pct": float(coverage_pct),
+            "positive_queries_seen": int(len(positive_queries_seen)),
+            "queries_with_negative_seen": int(len(queries_with_negative_seen)),
             "actual_examples_seen": global_step * self.batch_size * self.gradient_accumulation_steps,
             "nonfinite_loss_count": nonfinite_loss_count,
             "weight_norm_before": float(weight_norm_before),

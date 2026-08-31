@@ -338,10 +338,23 @@ def main():
 
     # 3. Setup data directory
     data_dir_path = Path(args.data_dir) if args.data_dir else None
-    if args.tiny or data_dir_path is None or not (data_dir_path / "documents.parquet").exists():
+    if args.tiny:
+        if args.run_mode in ("gpu_smoke", "full"):
+            raise ValueError(
+                f"Cannot use --tiny with run_mode='{args.run_mode}'. "
+                f"Production {args.run_mode.upper()} mode strictly requires the official 8,532-document Task 1 dataset."
+            )
         toy_data_dir = working_dir / "toy_data"
         print(f"[*] Creating toy canonical dataset in {toy_data_dir} for tiny smoke verification...")
         data_dir_path = create_toy_canonical_dataset(toy_data_dir)
+    elif data_dir_path is None or not (data_dir_path / "documents.parquet").exists():
+        if args.run_mode in ("gpu_smoke", "full"):
+            # Attempt official discovery or fail
+            pass
+        else:
+            toy_data_dir = working_dir / "toy_data"
+            print(f"[*] Creating toy canonical dataset in {toy_data_dir} for tiny smoke verification...")
+            data_dir_path = create_toy_canonical_dataset(toy_data_dir)
 
     print("\n" + "=" * 80)
     print("LEGALIR TASK 1: PRODUCTION KAGGLE PIPELINE SMOKE VERIFICATION")
