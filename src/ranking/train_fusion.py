@@ -272,6 +272,7 @@ def train_and_evaluate_fusion_cv(
         "feature_columns": available_cols,
         "total_oof_rows": len(oof_df),
         "winning_method": winning_method,
+        "winning_model_type": winning_model_type,
         "winning_metrics": {
             "mean_recall@5": winner_rec5,
             "mean_precision@5": winner_prec5,

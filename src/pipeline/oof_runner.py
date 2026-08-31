@@ -423,6 +423,11 @@ class OOFRunner:
             print(f"\n>>> Running Fold {f_idx + 1}/{len(active_folds)} (Fold {f_idx})...")
 
             fold_reranker: CrossEncoderReranker | None = None
+            pair_mining_sec = 0.0
+            train_sec = 0.0
+            opt_steps = 0
+            train_report = {}
+
             if self.train_reranker_per_fold:
                 print(f"--- Training fold-specific LoRA reranker for Fold {f_idx} ---")
                 fold_dir = self.output_dir / f"fold_{f_idx}"
@@ -432,6 +437,7 @@ class OOFRunner:
                 from src.training.build_pairs import build_training_pairs
                 from src.training.train_reranker import train_reranker
 
+                t_pm0 = time.time()
                 _, pairs_df = build_training_pairs(
                     data_dir=self.data_dir,
                     index_dir=self.index_dir,
@@ -441,10 +447,13 @@ class OOFRunner:
                     limit=self.smoke_sample_size if self.smoke else None,
                     query_embeddings=self.train_query_embeddings,
                 )
+                pair_mining_sec = time.time() - t_pm0
 
                 adapter_dir = fold_dir / "reranker_adapter"
                 reranker_cfg = self.reranker_config_path or self.config_path or "configs/experiments/reranker_lora.yaml"
                 base_m_name = self.reranker_model if self.reranker_model != "mock" else None
+
+                t_tr0 = time.time()
                 train_report = train_reranker(
                     pairs_file=pairs_dir / "reranker_pairs.parquet",
                     config_path=reranker_cfg,
@@ -454,6 +463,8 @@ class OOFRunner:
                     max_steps=5 if self.smoke else None,
                     device=self.reranker_device,
                 )
+                train_sec = time.time() - t_tr0
+                opt_steps = int(train_report.get("optimizer_steps", train_report.get("global_steps", 0)))
 
                 fold_reranker = CrossEncoderReranker(
                     model_name=self.reranker_model,
@@ -463,11 +474,20 @@ class OOFRunner:
             elif self.use_reranker:
                 fold_reranker = global_reranker
 
+            t_inf0 = time.time()
             f_preds, f_cands, f_feat_dfs, f_metrics, f_runtimes = self.run_fold(
                 fold_idx=f_idx,
                 fold_info=fold_info,
                 reranker=fold_reranker,
             )
+            infer_sec = time.time() - t_inf0
+            val_q_count = len(f_preds)
+            f_metrics["pair_mining_seconds"] = round(pair_mining_sec, 3)
+            f_metrics["reranker_training_seconds"] = round(train_sec, 3)
+            f_metrics["reranker_optimizer_steps"] = opt_steps
+            f_metrics["heldout_inference_seconds"] = round(infer_sec, 3)
+            f_metrics["heldout_queries"] = val_q_count
+            f_metrics["heldout_queries_per_second"] = round(val_q_count / max(0.001, infer_sec), 2)
 
             if fold_reranker is not None:
                 f_metrics["reranker_oom_events"] = int(getattr(fold_reranker, "oom_events", 0))
@@ -539,6 +559,13 @@ class OOFRunner:
             for k in DEFAULT_CANDIDATE_CUTOFFS
         }
 
+        heldout_inf_sec_total = sum(f.get("heldout_inference_seconds", 0.0) for f in fold_records)
+        heldout_q_total = sum(f.get("heldout_queries", 0) for f in fold_records)
+        heldout_inf_qps = round(heldout_q_total / max(0.001, heldout_inf_sec_total), 2)
+        rerank_train_sec_total = sum(f.get("reranker_training_seconds", 0.0) for f in fold_records)
+        rerank_opt_steps_total = sum(f.get("reranker_optimizer_steps", 0) for f in fold_records)
+        pair_mining_sec_total = sum(f.get("pair_mining_seconds", 0.0) for f in fold_records)
+
         cv_report = {
             "mean_recall@5": float(np.mean(rec5_scores)),
             "std_recall@5": float(np.std(rec5_scores)),
@@ -553,6 +580,12 @@ class OOFRunner:
             "overall_aggregate_metrics": overall_metrics,
             "total_evaluated_queries": len(all_oof_predictions),
             "total_runtime_seconds": overall_elapsed,
+            "heldout_inference_seconds_total": round(heldout_inf_sec_total, 3),
+            "heldout_queries_total": heldout_q_total,
+            "heldout_inference_queries_per_second": heldout_inf_qps,
+            "reranker_training_seconds_total": round(rerank_train_sec_total, 3),
+            "reranker_optimizer_steps_total": rerank_opt_steps_total,
+            "pair_mining_seconds_total": round(pair_mining_sec_total, 3),
             "runtime_per_query_ms": float(np.mean(list(all_runtimes.values()))) * 1000.0 if all_runtimes else 0.0,
             "queries_per_second": (len(all_oof_predictions) / overall_elapsed) if overall_elapsed > 0 else 0.0,
             "official_scorer_parity_verified": True,
@@ -698,6 +731,10 @@ class OOFRunner:
         retrieval_metrics["elapsed_seconds"] = time.time() - t0
         retrieval_metrics["val_queries"] = len(val_ids)
 
+        dj_pair_mining_sec = 0.0
+        dj_train_sec = 0.0
+        dj_opt_steps = 0
+
         active_reranker = reranker
         doc_disjoint_adapter_dir: Path | None = None
         if active_reranker is None and self.train_reranker_per_fold:
@@ -709,6 +746,7 @@ class OOFRunner:
             from src.training.build_pairs import build_training_pairs
             from src.training.train_reranker import train_reranker
 
+            t_dj_pm0 = time.time()
             _, pairs_df = build_training_pairs(
                 data_dir=self.data_dir,
                 index_dir=self.index_dir,
@@ -718,11 +756,14 @@ class OOFRunner:
                 limit=self.smoke_sample_size if self.smoke else None,
                 query_embeddings=self.train_query_embeddings,
             )
+            dj_pair_mining_sec = time.time() - t_dj_pm0
 
             doc_disjoint_adapter_dir = doc_disjoint_dir / "reranker_adapter"
             reranker_cfg = self.reranker_config_path or self.config_path or "configs/experiments/reranker_lora.yaml"
             base_m_name = self.reranker_model if self.reranker_model != "mock" else None
-            train_reranker(
+
+            t_dj_tr0 = time.time()
+            dj_train_report = train_reranker(
                 pairs_file=pairs_dir / "reranker_pairs.parquet",
                 config_path=reranker_cfg,
                 output_dir=doc_disjoint_adapter_dir,
@@ -730,6 +771,8 @@ class OOFRunner:
                 max_steps=5 if self.smoke else None,
                 device=self.reranker_device,
             )
+            dj_train_sec = time.time() - t_dj_tr0
+            dj_opt_steps = int(dj_train_report.get("optimizer_steps", dj_train_report.get("global_steps", 0)))
 
             active_reranker = CrossEncoderReranker(
                 model_name=self.reranker_model,
@@ -766,6 +809,8 @@ class OOFRunner:
             preds_system[qid] = top5
             runtimes_system[qid] = time.time() - t_q0
 
+        dj_infer_sec = time.time() - t1
+
         trained_system_metrics = evaluate_predictions(
             y_pred=preds_system,
             y_true=gold,
@@ -786,7 +831,13 @@ class OOFRunner:
             "mrr": trained_system_metrics.get("mrr", 0.0),
             "map": trained_system_metrics.get("map", 0.0),
             "ndcg@5": trained_system_metrics.get("ndcg@5", 0.0),
+            "doc_disjoint_pair_mining_seconds": round(dj_pair_mining_sec, 3),
+            "doc_disjoint_training_seconds": round(dj_train_sec, 3),
+            "doc_disjoint_optimizer_steps": dj_opt_steps,
+            "doc_disjoint_inference_seconds": round(dj_infer_sec, 3),
             "adapter_path": str(doc_disjoint_adapter_dir) if doc_disjoint_adapter_dir else None,
+            "is_smoke_mode": self.smoke,
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         }
 
         report_path = self.output_dir / "doc_disjoint_report.json"

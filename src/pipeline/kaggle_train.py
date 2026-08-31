@@ -265,6 +265,7 @@ def run_kaggle_pipeline(
     dense_device: str | None = None,
     reranker_device: str | None = None,
     strict_artifacts: bool | None = None,
+    allow_nonstandard_production_devices: bool = False,
 ) -> KaggleRunResult:
     """
     Execute the complete 24-step high-score LegalIR production pipeline on Kaggle.
@@ -300,14 +301,6 @@ def run_kaggle_pipeline(
     is_gpu_smoke = run_mode_str == "gpu_smoke"
     is_full = run_mode_str == "full"
 
-    if is_gpu_smoke:
-        if not torch.cuda.is_available():
-            raise RuntimeError("gpu_smoke mode requires CUDA but torch.cuda.is_available() is False")
-        if torch.cuda.device_count() < 2:
-            raise RuntimeError(
-                f"gpu_smoke mode requires Kaggle T4 x2 / >=2 CUDA devices (found {torch.cuda.device_count()} device(s))"
-            )
-
     if strict_artifacts is None:
         strict_artifacts = is_full or is_gpu_smoke
 
@@ -338,12 +331,31 @@ def run_kaggle_pipeline(
     submissions_dir = working_path / "submissions"
     submissions_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1b. Fail-Fast Early Public Test Check in FULL or GPU_SMOKE mode
+    # 1b. Fail-Fast Early Canonical Dataset & Public Test Discovery
     public_test_file = discover_public_test_file(public_json_path, repo_root=root_path)
     if (is_full or is_gpu_smoke) and (public_test_file is None or not public_test_file.exists()):
-        raise FileNotFoundError(f"{run_mode_str.upper()} mode requires official public-official.json; refusing to proceed")
+        raise FileNotFoundError(f"{run_mode_str} mode requires official public-official.json; refusing to proceed")
+
+    canonical_data_dir = discover_data_dir(data_dir, repo_root=root_path)
+    docs_path = canonical_data_dir / "documents.parquet"
+    chunks_path = canonical_data_dir / "chunks.parquet"
+    queries_train_path = canonical_data_dir / "queries_train.parquet"
+    qrels_train_path = canonical_data_dir / "qrels_train.parquet"
+
+    if not (docs_path.exists() and chunks_path.exists()):
+        raise FileNotFoundError(
+            f"Canonical dataset parquet files missing in {canonical_data_dir}"
+        )
 
     # 2. Hardware and GPU Device Allocation (P1.10)
+    if (is_gpu_smoke or is_full) and not allow_nonstandard_production_devices:
+        if not torch.cuda.is_available():
+            raise RuntimeError(f"{run_mode_str} mode requires CUDA but torch.cuda.is_available() is False")
+        if torch.cuda.device_count() < 2:
+            raise RuntimeError(
+                f"{run_mode_str} mode requires Kaggle T4 x2 / >=2 CUDA devices (found {torch.cuda.device_count()} device(s))"
+            )
+
     from src.models.device import resolve_device
 
     if dense_device is None or reranker_device is None:
@@ -360,11 +372,11 @@ def run_kaggle_pipeline(
         dense_device = "cpu"
         reranker_device = "cpu"
 
-    if is_gpu_smoke:
+    if (is_gpu_smoke or is_full) and not allow_nonstandard_production_devices:
         if dense_device != "cuda:0":
-            raise RuntimeError(f"gpu_smoke mode requires dense_device == 'cuda:0', got '{dense_device}'")
+            raise RuntimeError(f"{run_mode_str} mode requires dense_device == 'cuda:0', got '{dense_device}'")
         if reranker_device != "cuda:1":
-            raise RuntimeError(f"gpu_smoke mode requires reranker_device == 'cuda:1', got '{reranker_device}'")
+            raise RuntimeError(f"{run_mode_str} mode requires reranker_device == 'cuda:1', got '{reranker_device}'")
 
     print(f"[+] Device Allocation (P1.10 Multi-GPU Utilization):")
     print(f"    - Dense Embedding & Question Encoding : {dense_device}")
@@ -374,19 +386,8 @@ def run_kaggle_pipeline(
     if hf_token:
         os.environ["HF_TOKEN"] = str(hf_token)
 
-    # 3. Canonical Data Discovery & Validation (P1.5)
-    canonical_data_dir = discover_data_dir(data_dir, repo_root=root_path)
+    # 3. Canonical Dataset Loading & Validation (P1.5)
     print(f"[+] Canonical Data Directory: {canonical_data_dir}")
-
-    docs_path = canonical_data_dir / "documents.parquet"
-    chunks_path = canonical_data_dir / "chunks.parquet"
-    queries_train_path = canonical_data_dir / "queries_train.parquet"
-    qrels_train_path = canonical_data_dir / "qrels_train.parquet"
-
-    if not (docs_path.exists() and chunks_path.exists()):
-        raise FileNotFoundError(
-            f"Canonical dataset parquet files missing in {canonical_data_dir}"
-        )
 
     df_docs = pd.read_parquet(docs_path)
     df_chunks = pd.read_parquet(chunks_path)
@@ -453,18 +454,34 @@ def run_kaggle_pipeline(
     )
 
     # Validate explicit reranker training config
+    from src.training.trainer import compute_coverage_required_steps
+
     reranker_cfg = yaml.safe_load(resolved_reranker_config.read_text(encoding="utf-8")) if resolved_reranker_config.exists() else {}
     if is_full:
-        effective_max_steps = reranker_cfg.get("max_steps", 500)
-        if effective_max_steps is None:
+        configured_max_steps = reranker_cfg.get("max_steps", 500)
+        if configured_max_steps is None:
             raise ValueError("Full reranker training requires explicit max_steps")
+        n_train_queries = len(df_queries) if not df_queries.empty else 7000
+        coverage_req_steps = compute_coverage_required_steps(
+            eligible_query_count=n_train_queries,
+            batch_size=int(reranker_cfg.get("batch_size", 2)),
+            gradient_accumulation_steps=int(reranker_cfg.get("gradient_accumulation_steps", 8)),
+            target_coverage_pct=0.99,
+            require_pos_and_neg=True,
+        )
+        effective_max_steps = max(int(configured_max_steps), coverage_req_steps)
         print(f"[+] Effective Reranker Config: model={reranker_cfg.get('base_model_name', 'BAAI/bge-reranker-v2-m3')}, "
               f"batch_size={reranker_cfg.get('batch_size', 2)}, grad_accum={reranker_cfg.get('gradient_accumulation_steps', 8)}, "
-              f"max_length={reranker_cfg.get('max_length', 512)}, max_steps={effective_max_steps}, "
+              f"max_length={reranker_cfg.get('max_length', 512)}, configured_steps={configured_max_steps}, "
+              f"coverage_required_steps={coverage_req_steps}, effective_max_steps={effective_max_steps}, "
               f"fp16={reranker_cfg.get('fp16', True)}, device={reranker_device}")
     elif is_gpu_smoke:
+        configured_max_steps = 3
+        coverage_req_steps = 3
         effective_max_steps = 3
     else:
+        configured_max_steps = 5
+        coverage_req_steps = 5
         effective_max_steps = 5
 
     # 5. Build / Load Dual BM25 Indexes with Metadata Enrichment (P1.5)
@@ -678,11 +695,29 @@ def run_kaggle_pipeline(
 
     if is_full:
         min_coverage = 99.0
+        uniq_cov = final_reranker_report.get("unique_query_coverage_pct", 0.0)
+        pos_cov = final_reranker_report.get("positive_query_coverage_pct", 0.0)
+        neg_cov = final_reranker_report.get("negative_query_coverage_pct", 0.0)
         actual_cov = final_reranker_report.get("actual_query_coverage_pct", 0.0)
+
+        if uniq_cov < min_coverage:
+            raise RuntimeError(
+                f"FULL mode requires unique_query_coverage_pct >= {min_coverage}%, got {uniq_cov}% "
+                f"({final_reranker_report.get('actual_unique_queries_seen')}/{final_reranker_report.get('eligible_training_queries')} queries seen)."
+            )
+        if pos_cov < min_coverage:
+            raise RuntimeError(
+                f"FULL mode requires positive_query_coverage_pct >= {min_coverage}%, got {pos_cov}% "
+                f"({final_reranker_report.get('positive_queries_seen')}/{final_reranker_report.get('eligible_training_queries')} queries with positive seen)."
+            )
+        if neg_cov < min_coverage:
+            raise RuntimeError(
+                f"FULL mode requires negative_query_coverage_pct >= {min_coverage}%, got {neg_cov}% "
+                f"({final_reranker_report.get('queries_with_negative_seen')}/{final_reranker_report.get('eligible_training_queries')} queries with negative seen)."
+            )
         if actual_cov < min_coverage:
             raise RuntimeError(
-                f"FULL mode requires actual_query_coverage_pct >= {min_coverage}%, got {actual_cov}% "
-                f"({final_reranker_report.get('actual_unique_queries_seen')}/{final_reranker_report.get('eligible_training_queries')} queries seen)."
+                f"FULL mode requires actual_query_coverage_pct >= {min_coverage}%, got {actual_cov}%."
             )
 
     # 11. Public Test Inference with Fully Loaded Final Production Pipeline (P0.3, P0.4, P1.8)
@@ -852,11 +887,11 @@ def run_kaggle_pipeline(
             except Exception:
                 reranker_actual_dev = str(getattr(pipeline.reranker, "device", "cpu"))
 
-    if is_gpu_smoke and torch.cuda.is_available() and torch.cuda.device_count() >= 2:
+    if (is_gpu_smoke or is_full) and not allow_nonstandard_production_devices and torch.cuda.is_available() and torch.cuda.device_count() >= 2:
         if dense_device == "cuda:0" and not dense_actual_dev.startswith("cuda:0"):
-            raise RuntimeError(f"Dense model device mismatch: requested {dense_device}, actual {dense_actual_dev}")
+            raise RuntimeError(f"Dense model device mismatch in {run_mode_str.upper()}: requested {dense_device}, actual {dense_actual_dev}")
         if reranker_device == "cuda:1" and not reranker_actual_dev.startswith("cuda:1"):
-            raise RuntimeError(f"Reranker model device mismatch: requested {reranker_device}, actual {reranker_actual_dev}")
+            raise RuntimeError(f"Reranker model device mismatch in {run_mode_str.upper()}: requested {reranker_device}, actual {reranker_actual_dev}")
 
     if is_gpu_smoke or is_full:
         gpu0_alloc = torch.cuda.max_memory_allocated(0) if torch.cuda.is_available() and torch.cuda.device_count() > 0 else 0
@@ -915,28 +950,70 @@ def run_kaggle_pipeline(
         total_public_count = float(len(public_data))
         projected_public_infer_sec = total_public_count / max(0.1, q_infer_rate)
 
-        oof_q_sec = float(cv_report.get("queries_per_second", 1.0))
+        # OOF pure inference throughput
+        heldout_qps = float(cv_report.get("heldout_inference_queries_per_second", cv_report.get("queries_per_second", 1.0)))
         total_oof_queries = float(len(df_queries)) if not df_queries.empty else 7000.0
-        # In 5-fold OOF, each training query is evaluated as held-out validation query once (total = 7000 queries)
-        oof_infer_sec = total_oof_queries / max(0.1, oof_q_sec)
-        final_train_unit_sec = float(final_reranker_report.get("training_time_sec", 10.0))
-        steps_ratio = 500.0 / max(1.0, float(final_reranker_report.get("global_steps", 1))) if is_full else 1.0
-        projected_final_train_sec = final_train_unit_sec * steps_ratio
-        oof_folds_train_sec = 5.0 * projected_final_train_sec if is_full else 2.0 * final_train_unit_sec
-        projected_5fold_oof_sec = oof_infer_sec + oof_folds_train_sec
+        projected_oof_inference_sec = total_oof_queries / max(0.1, heldout_qps)
 
-        projected_total_sec = projected_5fold_oof_sec + projected_final_train_sec + projected_public_infer_sec + 300.0
+        # Training rate per optimizer step
+        measured_final_steps = int(final_reranker_report.get("optimizer_steps", final_reranker_report.get("global_steps", 1)))
+        final_training_sec = float(final_reranker_report.get("training_time_sec", 10.0))
+        sec_per_final_step = final_training_sec / max(1, measured_final_steps)
+
+        fold_opt_steps_total = int(cv_report.get("reranker_optimizer_steps_total", 0))
+        fold_train_sec_total = float(cv_report.get("reranker_training_seconds_total", 0.0))
+        sec_per_fold_step = (fold_train_sec_total / max(1, fold_opt_steps_total)) if fold_opt_steps_total > 0 else sec_per_final_step
+
+        sec_per_train_step = sec_per_final_step if sec_per_final_step > 0 else (sec_per_fold_step if sec_per_fold_step > 0 else 0.5)
+
+        # Production step counts (scale smoke steps to full production coverage requirements)
+        full_final_steps = int(effective_max_steps if is_full else 875)
+        full_fold_steps = int(effective_max_steps if is_full else 875)
+
+        projected_final_training_sec = full_final_steps * sec_per_train_step
+        avg_pair_mining_sec = float(cv_report.get("pair_mining_seconds_total", 5.0)) / max(1, len(cv_report.get("folds", [])))
+        projected_5fold_training_sec = 5.0 * (full_fold_steps * sec_per_train_step + avg_pair_mining_sec)
+        projected_5fold_oof_sec = projected_oof_inference_sec + projected_5fold_training_sec
+
+        # Document disjoint projection
+        dj_report = getattr(oof_runner, "doc_disjoint_report", {}) or {}
+        dj_mining_sec = float(dj_report.get("doc_disjoint_pair_mining_seconds", 5.0))
+        dj_training_sec = full_fold_steps * sec_per_train_step
+        dj_infer_sec = float(dj_report.get("doc_disjoint_inference_seconds", 5.0))
+        projected_doc_disjoint_sec = dj_mining_sec + dj_training_sec + dj_infer_sec
+
+        # Setup and overhead
+        setup_overhead_sec = 300.0
+
+        projected_total_sec = (
+            projected_5fold_oof_sec
+            + projected_final_training_sec
+            + projected_doc_disjoint_sec
+            + projected_public_infer_sec
+            + setup_overhead_sec
+        )
 
         runtime_proj = {
             "public_queries_per_second": round(q_infer_rate, 2),
-            "oof_queries_per_second": round(oof_q_sec, 2),
+            "oof_pure_inference_qps": round(heldout_qps, 2),
+            "sec_per_optimizer_step": round(sec_per_train_step, 4),
+            "measured_gpu_smoke_fold_steps": fold_opt_steps_total // max(1, len(cv_report.get("folds", []))),
+            "projected_full_fold_steps": full_fold_steps,
+            "measured_final_steps": measured_final_steps,
+            "projected_final_steps": full_final_steps,
+            "projected_num_folds": 5,
             "total_oof_validation_queries": int(total_oof_queries),
-            "projected_oof_inference_seconds": round(oof_infer_sec, 2),
-            "projected_oof_training_seconds": round(oof_folds_train_sec, 2),
+            "public_queries": int(total_public_count),
+            "includes_doc_disjoint": True,
+            "includes_dense_build": True,
+            "projected_oof_inference_seconds": round(projected_oof_inference_sec, 2),
+            "projected_5fold_training_seconds": round(projected_5fold_training_sec, 2),
             "projected_5fold_oof_seconds": round(projected_5fold_oof_sec, 2),
             "projected_5fold_oof_hours": round(projected_5fold_oof_sec / 3600.0, 3),
-            "projected_final_training_seconds": round(projected_final_train_sec, 2),
+            "projected_final_training_seconds": round(projected_final_training_sec, 2),
+            "projected_doc_disjoint_seconds": round(projected_doc_disjoint_sec, 2),
             "projected_public_inference_seconds": round(projected_public_infer_sec, 2),
+            "projected_total_runtime_seconds": round(projected_total_sec, 2),
             "projected_total_runtime_hours": round(projected_total_sec / 3600.0, 3),
             "fits_kaggle_session_limit": bool(projected_total_sec < 32400.0),
         }

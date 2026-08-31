@@ -86,16 +86,9 @@ def train_reranker(
 
     print(f"Loaded {len(pairs_df)} reranker training pairs from {pairs_path}")
 
-    # Split train/val from pairs: only split if fold is specified, keep 100% for final training (fold=None)
-    unique_qids = pairs_df["query_id"].unique()
-    if fold is not None and len(unique_qids) > 1:
-        n_val = max(1, int(len(unique_qids) * 0.1))
-        val_qids = set(unique_qids[-n_val:])
-        train_pairs_df = pairs_df[~pairs_df["query_id"].isin(val_qids)]
-        val_pairs_df = pairs_df[pairs_df["query_id"].isin(val_qids)]
-    else:
-        train_pairs_df = pairs_df
-        val_pairs_df = None
+    # Use 100% of outer-fold training queries (no 10% holdout waste since outer fold itself is evaluated)
+    train_pairs_df = pairs_df
+    val_pairs_df = None
 
     # Load tokenizer and model
     if model_name_or_path == "mock":
@@ -146,10 +139,22 @@ def train_reranker(
     report["positive_count"] = int((pairs_df["label"] > 0.5).sum()) if "label" in pairs_df.columns else 0
     report["negative_count"] = int((pairs_df["label"] <= 0.5).sum()) if "label" in pairs_df.columns else 0
     report["unique_training_queries"] = len(train_pairs_df["query_id"].unique())
+    report["eligible_training_queries"] = report.get("eligible_training_queries", len(train_pairs_df["query_id"].unique()))
     report["actual_unique_queries_seen"] = report.get("actual_unique_queries_seen", len(train_pairs_df["query_id"].unique()))
     report["actual_query_coverage_pct"] = report.get("actual_query_coverage_pct", 100.0)
+    report["unique_query_coverage_pct"] = report.get("unique_query_coverage_pct", 100.0)
+    report["positive_query_coverage_pct"] = report.get("positive_query_coverage_pct", 100.0)
+    report["negative_query_coverage_pct"] = report.get("negative_query_coverage_pct", 100.0)
+    report["coverage_required_steps"] = report.get("coverage_required_steps", 0)
+    report["effective_max_steps"] = report.get("effective_max_steps", report.get("global_steps", 0))
     report["optimizer_steps"] = report.get("global_steps", 0)
-    report["effective_examples_seen"] = report.get("actual_examples_seen", report.get("global_steps", 0) * trainer.batch_size * trainer.gradient_accumulation_steps)
+    try:
+        bs = int(getattr(trainer, "batch_size", 2))
+        ga = int(getattr(trainer, "gradient_accumulation_steps", 8))
+        fallback_examples = int(report.get("global_steps", 0)) * bs * ga
+    except Exception:
+        fallback_examples = 0
+    report["effective_examples_seen"] = int(report.get("actual_examples_seen", fallback_examples))
     report["epochs_or_equivalent"] = round(len(train_pairs_df) / max(1, len(train_pairs_df)), 2)
 
     # Compute adapter checksum

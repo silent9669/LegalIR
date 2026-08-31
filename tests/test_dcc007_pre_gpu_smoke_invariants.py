@@ -249,8 +249,11 @@ def test_final_training_hard_fails_below_required_query_coverage(tmp_path: Path)
         "actual_unique_queries_seen": 500,
         "eligible_training_queries": 7000,
         "actual_query_coverage_pct": 7.14,
+        "unique_query_coverage_pct": 7.14,
+        "positive_query_coverage_pct": 7.14,
+        "negative_query_coverage_pct": 7.14,
     }), mock.patch("src.pipeline.kaggle_train.DenseMacroRetriever", return_value=mock_dense_inst), mock.patch("src.pipeline.kaggle_train.OOFRunner.run", return_value={}), mock.patch("src.pipeline.kaggle_train.build_training_pairs"), mock.patch("src.pipeline.kaggle_train.TrainQuestionMemory", return_value=mock_mem), mock.patch("torch.cuda.is_available", return_value=True), mock.patch("torch.cuda.device_count", return_value=2):
-        with pytest.raises(RuntimeError, match="FULL mode requires actual_query_coverage_pct >= 99.0%"):
+        with pytest.raises(RuntimeError, match="FULL mode requires .*query_coverage_pct >= 99.0%"):
             run_kaggle_pipeline(
                 data_dir=data_dir,
                 working_dir=tmp_path / "work",
@@ -309,8 +312,9 @@ def test_gpu_smoke_requires_8532_docs_7000_train_999_public(tmp_path: Path):
 def test_gpu_smoke_cli_rejects_tiny():
     """Verify smoke_kaggle_pipeline CLI rejects --tiny when run_mode is gpu_smoke or full."""
     import subprocess
+    import sys
     cmd = [
-        sys_executable := str(REPO_ROOT / ".venv/bin/python"),
+        sys.executable,
         str(REPO_ROOT / "scripts/smoke_kaggle_pipeline.py"),
         "--tiny",
         "--run-mode",

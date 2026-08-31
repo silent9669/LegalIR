@@ -61,10 +61,25 @@ def balance_pairs_by_query(records: list[dict[str, Any]], seed: int = 42) -> lis
     return balanced
 
 
-class QueryBalancedSampler(Sampler[int]):
-    """Deterministic query-aware sampler guaranteeing that every eligible query's primary pair
+def compute_coverage_required_steps(
+    eligible_query_count: int,
+    batch_size: int = 2,
+    gradient_accumulation_steps: int = 8,
+    target_coverage_pct: float = 0.99,
+    require_pos_and_neg: bool = True,
+) -> int:
+    """Compute minimum optimizer steps required to guarantee target query coverage."""
+    rows_per_step = max(1, batch_size * gradient_accumulation_steps)
+    multiplier = 2 if require_pos_and_neg else 1
+    target_queries = math.ceil(target_coverage_pct * eligible_query_count)
+    required_rows = multiplier * target_queries
+    return math.ceil(required_rows / rows_per_step)
 
-    (1 positive + 1 hard negative) is scheduled in the first cycle before any query is oversampled.
+
+class QueryBalancedSampler(Sampler[int]):
+    """Deterministic query-aware sampler guaranteeing that every eligible query's positive (Phase A)
+
+    and hard-negative (Phase B) pairs are scheduled before secondary repeats (Phase C).
     Survives DataLoader iteration without shuffle=True interference.
     """
 
@@ -125,14 +140,17 @@ class QueryBalancedSampler(Sampler[int]):
 
         ordered_indices: list[int] = []
 
-        # Pass 1: 1 positive + 1 negative for every query in scheduled order
+        # Phase A: 1 positive for every eligible query (and queries with positives)
         for q in qids:
             if pos_map[q]:
                 ordered_indices.append(pos_map[q].pop(0))
+
+        # Phase B: 1 negative for every eligible query (and queries with negatives)
+        for q in qids:
             if neg_map[q]:
                 ordered_indices.append(neg_map[q].pop(0))
 
-        # Pass 2: cycle through remaining items round-robin until all are scheduled
+        # Phase C: cycle through remaining items round-robin until all are scheduled
         has_more = True
         while has_more:
             has_more = False
@@ -667,14 +685,33 @@ class RerankerTrainer:
         if eligible_qids is None:
             eligible_qids = getattr(self.train_dataset, "unique_query_ids", set())
 
-        eligible_count = len(eligible_qids) if eligible_qids else len(seen_query_ids)
-        actual_seen_count = len(seen_query_ids)
-        coverage_pct = round((actual_seen_count / max(1, eligible_count)) * 100.0, 2)
+        eligible_set = set(str(q) for q in eligible_qids) if eligible_qids else set()
+        eligible_count = len(eligible_set) if eligible_set else max(1, len(seen_query_ids))
+
+        seen_eligible = seen_query_ids & eligible_set if eligible_set else seen_query_ids
+        positive_seen_eligible = positive_queries_seen & eligible_set if eligible_set else positive_queries_seen
+        negative_seen_eligible = queries_with_negative_seen & eligible_set if eligible_set else queries_with_negative_seen
+
+        unique_eligible_pct = min(100.0, round((len(seen_eligible) / max(1, eligible_count)) * 100.0, 2))
+        positive_eligible_pct = min(100.0, round((len(positive_seen_eligible) / max(1, eligible_count)) * 100.0, 2))
+        negative_eligible_pct = min(100.0, round((len(negative_seen_eligible) / max(1, eligible_count)) * 100.0, 2))
+        actual_query_coverage_pct = min(unique_eligible_pct, positive_eligible_pct, negative_eligible_pct)
+
+        coverage_req_steps = compute_coverage_required_steps(
+            eligible_query_count=eligible_count,
+            batch_size=self.batch_size,
+            gradient_accumulation_steps=self.gradient_accumulation_steps,
+            target_coverage_pct=0.99,
+            require_pos_and_neg=True,
+        )
 
         report = {
             "status": "completed",
             "global_steps": global_step,
             "total_training_steps": total_training_steps,
+            "configured_max_steps": self.max_steps,
+            "coverage_required_steps": coverage_req_steps,
+            "effective_max_steps": total_training_steps,
             "training_time_sec": round(elapsed_time, 2),
             "final_train_loss": round(final_train_loss, 6),
             "loss_history_sample": [round(x, 4) for x in loss_history[:5] + loss_history[-5:]] if len(loss_history) > 10 else [round(x, 4) for x in loss_history],
@@ -683,10 +720,13 @@ class RerankerTrainer:
             "trainable_percent": self.peft_meta.get("trainable_percent", 100.0),
             "param_diff": float(param_diff),
             "eligible_training_queries": int(eligible_count),
-            "actual_unique_queries_seen": int(actual_seen_count),
-            "actual_query_coverage_pct": float(coverage_pct),
-            "positive_queries_seen": int(len(positive_queries_seen)),
-            "queries_with_negative_seen": int(len(queries_with_negative_seen)),
+            "actual_unique_queries_seen": int(len(seen_eligible)),
+            "actual_query_coverage_pct": float(actual_query_coverage_pct),
+            "unique_query_coverage_pct": float(unique_eligible_pct),
+            "positive_query_coverage_pct": float(positive_eligible_pct),
+            "negative_query_coverage_pct": float(negative_eligible_pct),
+            "positive_queries_seen": int(len(positive_seen_eligible)),
+            "queries_with_negative_seen": int(len(negative_seen_eligible)),
             "actual_examples_seen": global_step * self.batch_size * self.gradient_accumulation_steps,
             "nonfinite_loss_count": nonfinite_loss_count,
             "weight_norm_before": float(weight_norm_before),

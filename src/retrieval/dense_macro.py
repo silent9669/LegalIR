@@ -1,11 +1,13 @@
 """Dense semantic retrieval over macro legal-document chunks."""
 
 from collections import defaultdict
+from dataclasses import dataclass
 import json
 from pathlib import Path
 import re
+import time
 import unicodedata
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
@@ -14,6 +16,17 @@ from src.models.device import resolve_device
 
 DEFAULT_MODEL_NAME = "CODE4LIFEOFFICIAL/huydang-dek21-embedding-v2"
 DEFAULT_DIMENSION = 768
+
+
+@dataclass
+class DenseEncodeTelemetry:
+    """Detailed telemetry for a single encode_texts/encode_queries execution."""
+    requested_batch_size: int
+    min_successful_batch_size: int | None
+    last_successful_batch_size: int | None
+    oom_events: int
+    item_count: int
+    elapsed_seconds: float
 
 
 class DenseMacroRetriever:
@@ -56,7 +69,9 @@ class DenseMacroRetriever:
         self._faiss_index = None
         self.dense_oom_events: int = 0
         self.dense_initial_batch_size: int = 32
-        self.dense_min_successful_batch_size: int = 32
+        self.dense_min_successful_batch_size: int | None = None
+        self.last_encode_telemetry: DenseEncodeTelemetry | None = None
+        self.stage_telemetry: dict[str, DenseEncodeTelemetry] = {}
 
     @classmethod
     def from_arrays(
@@ -184,11 +199,13 @@ class DenseMacroRetriever:
         texts: Iterable[Any],
         batch_size: int = 32,
         max_length: int = 512,
+        stage_name: str | None = None,
     ) -> np.ndarray:
         """Encode texts with mean pooling and normalized embeddings."""
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
 
+        t_call_0 = time.time()
         if isinstance(texts, str):
             texts = [texts]
         normalized_texts = [self.preprocess_text(text) for text in texts]
@@ -196,11 +213,34 @@ class DenseMacroRetriever:
             return np.empty((0, self.dimension), dtype=np.float32)
 
         if self.query_encoder is not None:
-            return self._coerce_embedding_matrix(self.query_encoder(normalized_texts))
+            res = self._coerce_embedding_matrix(self.query_encoder(normalized_texts))
+            telemetry = DenseEncodeTelemetry(
+                requested_batch_size=batch_size,
+                min_successful_batch_size=batch_size,
+                last_successful_batch_size=batch_size,
+                oom_events=0,
+                item_count=len(normalized_texts),
+                elapsed_seconds=time.time() - t_call_0,
+            )
+            self.last_encode_telemetry = telemetry
+            if stage_name:
+                self.stage_telemetry[stage_name] = telemetry
+            return res
 
         if self.model_name == "mock":
             np.random.seed(42)
             emb = np.random.randn(len(normalized_texts), self.dimension).astype(np.float32)
+            telemetry = DenseEncodeTelemetry(
+                requested_batch_size=batch_size,
+                min_successful_batch_size=batch_size,
+                last_successful_batch_size=batch_size,
+                oom_events=0,
+                item_count=len(normalized_texts),
+                elapsed_seconds=time.time() - t_call_0,
+            )
+            self.last_encode_telemetry = telemetry
+            if stage_name:
+                self.stage_telemetry[stage_name] = telemetry
             return self._coerce_embedding_matrix(emb)
 
         self._load_model()
@@ -212,6 +252,9 @@ class DenseMacroRetriever:
         all_vectors: list[np.ndarray] = []
         self.dense_initial_batch_size = batch_size
         curr_batch_size = batch_size
+        call_oom_events = 0
+        min_successful: int | None = None
+        last_successful: int | None = None
 
         idx = 0
         while idx < len(normalized_texts):
@@ -243,20 +286,35 @@ class DenseMacroRetriever:
                         vectors = normalized.cpu().to(torch.float32).numpy()
 
                 all_vectors.append(vectors)
+                min_successful = min(min_successful, len(curr_chunk)) if min_successful is not None else len(curr_chunk)
+                last_successful = len(curr_chunk)
                 idx += len(curr_chunk)
             except RuntimeError as exc:
                 msg = str(exc).lower()
                 if ("out of memory" in msg or "cuda error: out of memory" in msg or "mps" in msg):
                     self.dense_oom_events += 1
+                    call_oom_events += 1
                     if is_cuda and torch.cuda.is_available():
                         torch.cuda.empty_cache()
                     if curr_batch_size <= 1:
                         raise RuntimeError(f"Dense encoding failed with OOM even at batch_size=1: {exc}") from exc
                     curr_batch_size = max(1, curr_batch_size // 2)
-                    self.dense_min_successful_batch_size = min(self.dense_min_successful_batch_size, curr_batch_size)
                     print(f"[-] Dense CUDA OOM event #{self.dense_oom_events}: adapting batch size to {curr_batch_size}")
                 else:
                     raise
+
+        self.dense_min_successful_batch_size = min_successful
+        telemetry = DenseEncodeTelemetry(
+            requested_batch_size=batch_size,
+            min_successful_batch_size=min_successful,
+            last_successful_batch_size=last_successful,
+            oom_events=call_oom_events,
+            item_count=len(normalized_texts),
+            elapsed_seconds=time.time() - t_call_0,
+        )
+        self.last_encode_telemetry = telemetry
+        if stage_name:
+            self.stage_telemetry[stage_name] = telemetry
 
         return self._coerce_embedding_matrix(np.vstack(all_vectors))
 
@@ -323,11 +381,12 @@ class DenseMacroRetriever:
         corpus: Any,
         batch_size: int = 32,
         max_length: int = 512,
+        stage_name: str = "corpus",
     ) -> np.ndarray:
         """Encode macro records and retain chunk/document metadata for search."""
         records = self._records(corpus)
         texts = [self._record_text(record) for record in records]
-        embeddings = self.encode_texts(texts, batch_size=batch_size, max_length=max_length)
+        embeddings = self.encode_texts(texts, batch_size=batch_size, max_length=max_length, stage_name=stage_name)
 
         self.chunk_ids = [str(record.get("chunk_id", index)) for index, record in enumerate(records)]
         self.doc_ids = [
@@ -350,6 +409,7 @@ class DenseMacroRetriever:
         queries: Any,
         batch_size: int = 32,
         max_length: int = 512,
+        stage_name: str = "train_query",
     ) -> np.ndarray:
         """Encode query strings or query records from ``queries_train.parquet``."""
         if isinstance(queries, Path) or (
@@ -381,7 +441,7 @@ class DenseMacroRetriever:
                 query_ids.append(str(index))
 
         self.query_ids = query_ids
-        return self.encode_texts(texts, batch_size=batch_size, max_length=max_length)
+        return self.encode_texts(texts, batch_size=batch_size, max_length=max_length, stage_name=stage_name)
 
     def encode_and_cache_queries(
         self,
