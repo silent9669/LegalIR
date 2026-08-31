@@ -1219,5 +1219,9 @@ print("============================================================")""")
     out_file.write_text(json.dumps(notebook_structure, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     print(f"✓ Generated standalone Kaggle notebook at {out_file.resolve()}")
 
+    root_file = Path(__file__).parent.parent / "legalir_training.ipynb"
+    root_file.write_text(json.dumps(notebook_structure, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    print(f"✓ Generated root Kaggle notebook at {root_file.resolve()}")
+
 if __name__ == "__main__":
     generate_notebook()
