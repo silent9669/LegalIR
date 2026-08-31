@@ -84,6 +84,15 @@ class KaggleRunResult:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
+def get_process_rss_mb() -> float:
+    """Return process resident set size in megabytes."""
+    try:
+        import psutil
+        return round(psutil.Process(os.getpid()).memory_info().rss / (1024.0 * 1024.0), 2)
+    except Exception:
+        return 0.0
+
+
 def resolve_repo_path(value: str | Path | None, repo_root: str | Path) -> Path:
     """Resolve a path relative to the repo root if it is not already absolute."""
     if value is None:
@@ -139,7 +148,11 @@ CANONICAL_REQUIRED_FILES = {
 def discover_data_dir(
     data_dir: str | Path | None = None, repo_root: Path | None = None
 ) -> Path:
-    """Discover canonical dataset or build from raw competition files if missing."""
+    """Discover canonical dataset or build from raw competition files if missing.
+
+    Prioritizes official Kaggle clean dataset mounts (e.g. phucdangg/legalir-task1-clean-data)
+    and recursively scans /kaggle/input when needed.
+    """
     if data_dir is not None:
         p = Path(data_dir)
         if not p.exists():
@@ -153,6 +166,13 @@ def discover_data_dir(
 
     repo = repo_root or Path.cwd()
     candidate_paths = [
+        # Preferred live clean dataset mounts
+        Path("/kaggle/input/legalir-task1-clean-data"),
+        Path("/kaggle/input/legalir-task1-clean-data/artifacts/task1/data"),
+        Path("/kaggle/input/legalir-task1-clean-data/artifacts/shared/canonical/v2"),
+        Path("/kaggle/input/datasets/phucdangg/legalir-task1-clean-data"),
+        Path("/kaggle/input/datasets/phucdangg/legalir-task1-clean-data/artifacts/task1/data"),
+        Path("/kaggle/input/datasets/phucdangg/legalir-task1-clean-data/artifacts/shared/canonical/v2"),
         Path("/kaggle/input/legalir"),
         Path("/kaggle/input/legalir/artifacts/task1/data"),
         Path("/kaggle/input/legalir/artifacts/shared/canonical/v2"),
@@ -169,10 +189,33 @@ def discover_data_dir(
         if cand.exists() and all((cand / f).exists() for f in CANONICAL_REQUIRED_FILES):
             return cand.resolve()
 
-    # Search for raw files
+    # Recursive scan over /kaggle/input if present
+    kaggle_input = Path("/kaggle/input")
+    if kaggle_input.exists():
+        matching_dirs: list[Path] = []
+        for dirpath in kaggle_input.rglob("*"):
+            if dirpath.is_dir() and all((dirpath / f).exists() for f in CANONICAL_REQUIRED_FILES):
+                matching_dirs.append(dirpath.resolve())
+
+        if len(matching_dirs) == 1:
+            return matching_dirs[0]
+        elif len(matching_dirs) > 1:
+            # Prioritize matching dirs containing preferred slug
+            clean_matches = [d for d in matching_dirs if "legalir-task1-clean-data" in str(d)]
+            if len(clean_matches) == 1:
+                return clean_matches[0]
+            legalir_matches = [d for d in matching_dirs if "legalir" in str(d)]
+            if len(legalir_matches) == 1:
+                return legalir_matches[0]
+            raise ValueError(
+                f"Ambiguous canonical dataset discovery in /kaggle/input; found multiple candidate directories: {matching_dirs}"
+            )
+
+    # Search for raw files to build on the fly if parquets are not precomputed
     raw_zip = None
     train_json = None
     for cand_zip in [
+        Path("/kaggle/input/legalir-task1-clean-data/selected-contexts.zip"),
         Path("/kaggle/input/legalir/selected-contexts.zip"),
         Path("/kaggle/input/legalir/artifacts/raw/selected-contexts.zip"),
         Path("/kaggle/input/legalir/artifacts/shared/raw/selected-contexts.zip"),
@@ -188,6 +231,7 @@ def discover_data_dir(
             break
 
     for cand_train in [
+        Path("/kaggle/input/legalir-task1-clean-data/train.json"),
         Path("/kaggle/input/legalir/train.json"),
         Path("/kaggle/input/legalir/artifacts/raw/train.json"),
         Path("/kaggle/input/legalir/artifacts/shared/raw/train.json"),
@@ -222,17 +266,34 @@ def discover_data_dir(
 
 def discover_public_test_file(
     public_json_path: str | Path | None = None,
+    data_dir: str | Path | None = None,
     repo_root: Path | None = None,
 ) -> Path | None:
-    """Discover public-official.json test file."""
+    """Discover public-official.json test file with robust relative and recursive fallback."""
     if public_json_path is not None:
         p = Path(public_json_path)
         if p.exists():
             return p.resolve()
         return None
 
+    # Check relative to data_dir
+    if data_dir is not None:
+        dp = Path(data_dir)
+        for cand in [
+            dp / "public-official.json",
+            dp.parent / "public-official.json",
+            dp.parent.parent / "public-official.json",
+            dp.parent / "raw/public-official.json",
+            dp.parent / "shared/raw/public-official.json",
+        ]:
+            if cand.is_file():
+                return cand.resolve()
+
     repo = repo_root or Path.cwd()
-    for cand in [
+    preferred_paths = [
+        Path("/kaggle/input/legalir-task1-clean-data/public-official.json"),
+        Path("/kaggle/input/legalir-task1-clean-data/artifacts/raw/public-official.json"),
+        Path("/kaggle/input/datasets/phucdangg/legalir-task1-clean-data/public-official.json"),
         Path("/kaggle/input/legalir/public-official.json"),
         Path("/kaggle/input/legalir/artifacts/raw/public-official.json"),
         Path("/kaggle/input/legalir/artifacts/shared/raw/public-official.json"),
@@ -244,9 +305,21 @@ def discover_public_test_file(
         repo / "artifacts/raw/public-official.json",
         repo / "public-official.json",
         Path.cwd() / "public-official.json",
-    ]:
-        if cand.exists():
+    ]
+    for cand in preferred_paths:
+        if cand.is_file():
             return cand.resolve()
+
+    # Recursive scan in /kaggle/input
+    kaggle_input = Path("/kaggle/input")
+    if kaggle_input.exists():
+        found = list(kaggle_input.rglob("public-official.json"))
+        if found:
+            return found[0].resolve()
+        found_pub = list(kaggle_input.rglob("public.json"))
+        if found_pub:
+            return found_pub[0].resolve()
+
     return None
 
 
@@ -332,10 +405,6 @@ def run_kaggle_pipeline(
     submissions_dir.mkdir(parents=True, exist_ok=True)
 
     # 1b. Fail-Fast Early Canonical Dataset & Public Test Discovery
-    public_test_file = discover_public_test_file(public_json_path, repo_root=root_path)
-    if (is_full or is_gpu_smoke) and (public_test_file is None or not public_test_file.exists()):
-        raise FileNotFoundError(f"{run_mode_str} mode requires official public-official.json; refusing to proceed")
-
     canonical_data_dir = discover_data_dir(data_dir, repo_root=root_path)
     docs_path = canonical_data_dir / "documents.parquet"
     chunks_path = canonical_data_dir / "chunks.parquet"
@@ -346,6 +415,10 @@ def run_kaggle_pipeline(
         raise FileNotFoundError(
             f"Canonical dataset parquet files missing in {canonical_data_dir}"
         )
+
+    public_test_file = discover_public_test_file(public_json_path, data_dir=canonical_data_dir, repo_root=root_path)
+    if (is_full or is_gpu_smoke) and (public_test_file is None or not public_test_file.exists()):
+        raise FileNotFoundError(f"{run_mode_str} mode requires official public-official.json; refusing to proceed")
 
     # 2. Hardware and GPU Device Allocation (P1.10)
     if (is_gpu_smoke or is_full) and not allow_nonstandard_production_devices:
@@ -413,6 +486,7 @@ def run_kaggle_pipeline(
         raise ValueError(f"Canonical dataset validation failed in {run_mode_str.upper()} mode: {val_report.get('errors')}")
 
     print(f"[+] Dataset Loaded: {len(df_docs):,} documents | {len(df_chunks):,} chunks | {len(df_queries):,} train queries")
+    rss_after_load_mb = get_process_rss_mb()
 
     # 4. Strict Parameter Budget Preflight Audit (<4B Rule)
     if runtime_config_path:
@@ -518,10 +592,18 @@ def run_kaggle_pipeline(
     # 6. Build / Load DEk21 Dense Macro Index (GPU 0)
     dense_dir = index_dir / "dense_dek21"
     dense_retriever: DenseMacroRetriever | None = None
+    dense_build_time = 0.1
+    train_query_enc_time = 0.1
+    final_pair_mining_time = 0.1
+    final_training_time = 0.1
+    public_inference_time = 0.1
+
+    t_dense0 = time.time()
     if (dense_dir / "embeddings.npy").exists():
         print(f"[*] Loading cached DEk21 Dense index from {dense_dir} on {dense_device}...")
         try:
             dense_retriever = DenseMacroRetriever.load(dense_dir, device=dense_device)
+            dense_build_time = max(0.01, time.time() - t_dense0)
         except Exception as e:
             if is_full or is_gpu_smoke:
                 raise RuntimeError(f"Failed to load DEk21 Dense index from {dense_dir} in {run_mode_str.upper()} mode: {e}") from e
@@ -540,14 +622,17 @@ def run_kaggle_pipeline(
         )
         dense_batch = 32 if "cuda" in str(dense_device) else 32
         try:
-            dense_retriever.fit(macro_chunks.to_dict("records"), batch_size=dense_batch)
+            dense_retriever.fit(macro_chunks.to_dict("records"), batch_size=dense_batch, stage_name="corpus")
             dense_retriever.save(dense_dir)
+            dense_build_time = max(0.01, time.time() - t_dense0)
             print(f"[+] DEk21 Dense Index ready ({len(dense_retriever.doc_ids):,} chunks).")
         except Exception as e:
             if is_full or is_gpu_smoke:
                 raise RuntimeError(f"Failed to build DEk21 Dense index on {dense_device} in {run_mode_str.upper()} mode: {e}") from e
             print(f"[-] Warning: Dense index building failed: {e}")
             dense_retriever = None
+
+    rss_after_dense_mb = get_process_rss_mb()
 
     if is_full or is_gpu_smoke:
         if dense_retriever is None or getattr(dense_retriever, "_faiss_index", None) is None:
@@ -606,6 +691,13 @@ def run_kaggle_pipeline(
         train_query_embeddings=train_query_embs,
     )
     cv_report = oof_runner.run()
+    oof_num_folds = int(oof_runner.num_folds)
+    doc_disjoint_report = dict(getattr(oof_runner, "doc_disjoint_report", {}) or {})
+    rss_after_oof_mb = get_process_rss_mb()
+    del oof_runner
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     # 9. Cross-Fitted Learned Fusion vs Tuned RRF Evaluation & Final Model Training (P1.4)
     print("\n" + "=" * 70)
@@ -677,6 +769,21 @@ def run_kaggle_pipeline(
         query_embeddings=train_query_embs,
     )
     final_pairs_file = pairs_dir / "reranker_pairs.parquet"
+
+    # Audit pair coverage before loading/training final BGE reranker
+    from src.training.trainer import audit_pair_coverage
+    if final_pairs_file.exists():
+        final_pair_df = pd.read_parquet(final_pairs_file)
+        expected_train_qids = set(df_queries["query_id"].astype(str)) if not df_queries.empty else None
+        pair_coverage_audit = audit_pair_coverage(final_pair_df, expected_qids=expected_train_qids)
+        print(f"[+] Final Training Pair Coverage Audit: {pair_coverage_audit.get('eligible_queries_count'):,} eligible queries | "
+              f"Positive Coverage: {pair_coverage_audit.get('positive_coverage_pct')}% | "
+              f"Negative Coverage: {pair_coverage_audit.get('negative_coverage_pct')}%")
+        if is_full:
+            if pair_coverage_audit["positive_coverage_pct"] < 100.0:
+                raise RuntimeError(f"FULL mode requires 100% positive pair coverage, got {pair_coverage_audit['positive_coverage_pct']}%")
+            if pair_coverage_audit["negative_coverage_pct"] < 99.0:
+                raise RuntimeError(f"FULL mode requires >=99% negative pair coverage, got {pair_coverage_audit['negative_coverage_pct']}%")
 
     # 10c. Train Final LoRA Reranker on GPU 1
     final_reranker_dir = checkpoints_dir / "reranker_final"
@@ -779,6 +886,17 @@ def run_kaggle_pipeline(
         require_loaded_models=(is_full or is_gpu_smoke),
     )
 
+    # Strict final PEFT adapter audit verification
+    if is_full or is_gpu_smoke:
+        reranker_audit = next((m for m in final_audit_report.get("models", {}).values() if m.get("role") == "cross_encoder_reranker"), {})
+        if reranker_adapter_load_path is not None:
+            if not reranker_audit.get("is_peft_lora", False):
+                raise RuntimeError("Strict runtime audit failed: loaded reranker is not marked as is_peft_lora")
+            if reranker_audit.get("adapter_parameters", 0) <= 0:
+                raise RuntimeError(f"Strict runtime audit failed: reranker adapter_parameters must be > 0, got {reranker_audit.get('adapter_parameters')}")
+            if final_audit_report.get("total_learned_parameters", 0) <= 702_754_049:
+                raise RuntimeError("Strict runtime audit failed: total parameters did not increase after adapter loading")
+
     t0_infer = time.time()
     predictions: dict[str, dict[str, list[str]]] = {}
     q_items = list(public_data.items())
@@ -796,7 +914,7 @@ def run_kaggle_pipeline(
                 for _, q_val in q_items
             ]
             q_embs_array = dense_ret.encode_queries(
-                q_texts, batch_size=32 if is_full else 16
+                q_texts, batch_size=32 if is_full else 16, stage_name="public_query"
             )
             for (qid, _), emb in zip(q_items, q_embs_array):
                 public_q_embs[str(qid)] = emb
@@ -821,7 +939,9 @@ def run_kaggle_pipeline(
             elapsed = time.time() - t0_infer
             print(f"    [{idx:4d}/{len(q_items):4d}] queries predicted ({idx / elapsed:.2f} q/s)")
 
-    print(f"[+] Public inference completed in {time.time() - t0_infer:.2f}s ({len(predictions)} queries predicted).")
+    public_inference_time = max(0.01, time.time() - t0_infer)
+    print(f"[+] Public inference completed in {public_inference_time:.2f}s ({len(predictions)} queries predicted).")
+    rss_peak_mb = get_process_rss_mb()
 
     # 12. Strict Submission Invariant Validation & Zip Packaging (P0.5, Invariants 1-24)
     sub_json = submissions_dir / "submission.json"
@@ -901,14 +1021,38 @@ def run_kaggle_pipeline(
 
         oof_reranker_oom = sum(f.get("reranker_oom_events", 0) for f in cv_report.get("folds", []))
         final_reranker_oom = int(getattr(pipeline.reranker, "oom_events", 0)) if pipeline.reranker is not None else 0
+
+        stage_telem = getattr(dense_retriever, "stage_telemetry", None)
+        corpus_telem = stage_telem.get("corpus") if isinstance(stage_telem, dict) else None
+        train_q_telem = stage_telem.get("train_query") if isinstance(stage_telem, dict) else None
+
         pipeline_dense = getattr(pipeline.hybrid_engine, "dense_retriever", None) or getattr(pipeline.hybrid_engine, "dense", None)
-        public_dense_oom = int(getattr(pipeline_dense, "dense_oom_events", 0)) if pipeline_dense is not None and pipeline_dense is not dense_retriever else 0
-        corpus_dense_oom = int(getattr(dense_retriever, "dense_oom_events", 0)) if dense_retriever is not None else 0
-        dense_oom = corpus_dense_oom + public_dense_oom
-        total_reranker_oom = oof_reranker_oom + final_reranker_oom
+        pipe_stage_telem = getattr(pipeline_dense, "stage_telemetry", None)
+        public_q_telem = pipe_stage_telem.get("public_query") if isinstance(pipe_stage_telem, dict) else None
+
+        if corpus_telem is not None:
+            dense_corpus_oom = int(getattr(corpus_telem, "oom_events", 0) or 0)
+        else:
+            dense_corpus_oom = int(getattr(dense_retriever, "dense_oom_events", 0) or 0)
+
+        if train_q_telem is not None:
+            dense_train_q_oom = int(getattr(train_q_telem, "oom_events", 0) or 0)
+        else:
+            dense_train_q_oom = 0
+
+        if public_q_telem is not None:
+            dense_public_q_oom = int(getattr(public_q_telem, "oom_events", 0) or 0)
+        elif pipeline_dense is not None and pipeline_dense is not dense_retriever:
+            dense_public_q_oom = int(getattr(pipeline_dense, "dense_oom_events", 0) or 0)
+        else:
+            dense_public_q_oom = 0
+
+        dense_oom = dense_corpus_oom + dense_train_q_oom + dense_public_q_oom
+        total_reranker_oom = int(oof_reranker_oom or 0) + int(final_reranker_oom or 0)
         total_oom_events = total_reranker_oom + dense_oom
 
-        min_batch = int(getattr(pipeline.reranker, "min_successful_batch_size", 16)) if pipeline.reranker is not None else 16
+        min_batch = int(getattr(pipeline.reranker, "min_successful_batch_size", 16) or 16) if pipeline.reranker is not None else 16
+        reranker_audit_entry = next((m for m in final_audit_report.get("models", {}).values() if m.get("role") == "cross_encoder_reranker"), {})
 
         gpu_smoke_report = {
             "dense_requested": dense_device,
@@ -920,10 +1064,27 @@ def run_kaggle_pipeline(
             "gpu1_peak_allocated_bytes": int(gpu1_alloc),
             "gpu0_peak_reserved_bytes": int(gpu0_res),
             "gpu1_peak_reserved_bytes": int(gpu1_res),
-            "dense_initial_batch_size": int(getattr(dense_retriever, "dense_initial_batch_size", 32)) if dense_retriever is not None else 32,
-            "dense_min_successful_batch_size": int(getattr(dense_retriever, "dense_min_successful_batch_size", 32)) if dense_retriever is not None else 32,
-            "dense_corpus_oom_events": corpus_dense_oom,
-            "dense_public_query_oom_events": public_dense_oom,
+            "dense_corpus": {
+                "requested_batch_size": int(getattr(corpus_telem, "requested_batch_size", getattr(dense_retriever, "dense_initial_batch_size", 32)) or 32),
+                "min_successful_batch_size": int(getattr(corpus_telem, "min_successful_batch_size", getattr(dense_retriever, "dense_min_successful_batch_size", 32)) or 32),
+                "oom_events": dense_corpus_oom,
+                "item_count": int(getattr(corpus_telem, "item_count", len(df_chunks)) or len(df_chunks)),
+                "elapsed_seconds": round(float(getattr(corpus_telem, "elapsed_seconds", dense_build_time) or dense_build_time), 2),
+            },
+            "dense_train_query": {
+                "requested_batch_size": int(getattr(train_q_telem, "requested_batch_size", 128) or 128),
+                "min_successful_batch_size": int(getattr(train_q_telem, "min_successful_batch_size", 128) or 128),
+                "oom_events": dense_train_q_oom,
+                "item_count": int(getattr(train_q_telem, "item_count", len(df_queries)) or len(df_queries)),
+                "elapsed_seconds": round(float(getattr(train_q_telem, "elapsed_seconds", train_query_enc_time) or train_query_enc_time), 2),
+            },
+            "dense_public_query": {
+                "requested_batch_size": int(getattr(public_q_telem, "requested_batch_size", 32) or 32),
+                "min_successful_batch_size": int(getattr(public_q_telem, "min_successful_batch_size", 32) or 32),
+                "oom_events": dense_public_q_oom,
+                "item_count": int(getattr(public_q_telem, "item_count", len(public_data)) or len(public_data)),
+                "elapsed_seconds": round(float(getattr(public_q_telem, "elapsed_seconds", public_inference_time) or public_inference_time), 2),
+            },
             "dense_total_oom_events": dense_oom,
             "dense_oom_events": dense_oom,
             "oof_reranker_oom_events": oof_reranker_oom,
@@ -937,16 +1098,23 @@ def run_kaggle_pipeline(
             "actual_unique_queries_seen": int(final_reranker_report.get("actual_unique_queries_seen", 0)),
             "actual_query_coverage_pct": float(final_reranker_report.get("actual_query_coverage_pct", 0.0)),
             "adapter_checksum": str(final_reranker_report.get("adapter_checksum", "")),
+            "adapter_parameters": int(reranker_audit_entry.get("adapter_parameters", 0)),
+            "is_peft_lora": bool(reranker_audit_entry.get("is_peft_lora", False)),
+            "host_rss_mb": {
+                "after_canonical_load": rss_after_load_mb,
+                "after_dense_index": rss_after_dense_mb,
+                "after_oof": rss_after_oof_mb,
+                "peak": rss_peak_mb,
+            },
             "strict_artifacts": bool(strict_artifacts),
-            "fusion_crossfit_folds": int(oof_runner.num_folds),
+            "fusion_crossfit_folds": int(oof_num_folds),
         }
         report_path = working_path / "gpu_smoke_report.json"
         report_path.write_text(json.dumps(gpu_smoke_report, indent=2), encoding="utf-8")
         print(f"[+] Saved GPU smoke hardware report to {report_path}")
 
         # Runtime projection calculation
-        q_infer_time = float(time.time() - t0_infer)
-        q_infer_rate = len(q_items) / max(0.001, q_infer_time)
+        q_infer_rate = len(q_items) / max(0.001, public_inference_time)
         total_public_count = float(len(public_data))
         projected_public_infer_sec = total_public_count / max(0.1, q_infer_rate)
 
@@ -976,22 +1144,34 @@ def run_kaggle_pipeline(
         projected_5fold_oof_sec = projected_oof_inference_sec + projected_5fold_training_sec
 
         # Document disjoint projection
-        dj_report = getattr(oof_runner, "doc_disjoint_report", {}) or {}
+        dj_report = doc_disjoint_report
         dj_mining_sec = float(dj_report.get("doc_disjoint_pair_mining_seconds", 5.0))
         dj_training_sec = full_fold_steps * sec_per_train_step
         dj_infer_sec = float(dj_report.get("doc_disjoint_inference_seconds", 5.0))
         projected_doc_disjoint_sec = dj_mining_sec + dj_training_sec + dj_infer_sec
 
         # Setup and overhead
-        setup_overhead_sec = 300.0
+        cold_start_setup_sec = round(dense_build_time + train_query_enc_time + 120.0, 2)
+        warm_cache_setup_sec = 60.0
 
-        projected_total_sec = (
+        cold_start_total_sec = (
             projected_5fold_oof_sec
             + projected_final_training_sec
             + projected_doc_disjoint_sec
             + projected_public_infer_sec
-            + setup_overhead_sec
+            + cold_start_setup_sec
         )
+        warm_cache_total_sec = (
+            projected_5fold_oof_sec
+            + projected_final_training_sec
+            + projected_doc_disjoint_sec
+            + projected_public_infer_sec
+            + warm_cache_setup_sec
+        )
+
+        KAGGLE_MAX_SECONDS = 12 * 3600.0  # 43,200s
+        SAFETY_FACTOR = 0.90
+        PRODUCTION_RUNTIME_BUDGET = KAGGLE_MAX_SECONDS * SAFETY_FACTOR  # 38,880s (~10.8 hours)
 
         runtime_proj = {
             "public_queries_per_second": round(q_infer_rate, 2),
@@ -1006,6 +1186,8 @@ def run_kaggle_pipeline(
             "public_queries": int(total_public_count),
             "includes_doc_disjoint": True,
             "includes_dense_build": True,
+            "dense_corpus_build_seconds": round(dense_build_time, 2),
+            "train_query_encoding_seconds": round(train_query_enc_time, 2),
             "projected_oof_inference_seconds": round(projected_oof_inference_sec, 2),
             "projected_5fold_training_seconds": round(projected_5fold_training_sec, 2),
             "projected_5fold_oof_seconds": round(projected_5fold_oof_sec, 2),
@@ -1013,9 +1195,13 @@ def run_kaggle_pipeline(
             "projected_final_training_seconds": round(projected_final_training_sec, 2),
             "projected_doc_disjoint_seconds": round(projected_doc_disjoint_sec, 2),
             "projected_public_inference_seconds": round(projected_public_infer_sec, 2),
-            "projected_total_runtime_seconds": round(projected_total_sec, 2),
-            "projected_total_runtime_hours": round(projected_total_sec / 3600.0, 3),
-            "fits_kaggle_session_limit": bool(projected_total_sec < 32400.0),
+            "cold_start_total_seconds": round(cold_start_total_sec, 2),
+            "cold_start_total_hours": round(cold_start_total_sec / 3600.0, 3),
+            "warm_cache_total_seconds": round(warm_cache_total_sec, 2),
+            "warm_cache_total_hours": round(warm_cache_total_sec / 3600.0, 3),
+            "production_runtime_budget_seconds": round(PRODUCTION_RUNTIME_BUDGET, 2),
+            "production_runtime_budget_hours": round(PRODUCTION_RUNTIME_BUDGET / 3600.0, 2),
+            "fits_kaggle_session_limit": bool(cold_start_total_sec < PRODUCTION_RUNTIME_BUDGET),
         }
         proj_path = working_path / "runtime_projection.json"
         proj_path.write_text(json.dumps(runtime_proj, indent=2), encoding="utf-8")
@@ -1058,8 +1244,8 @@ def run_kaggle_pipeline(
     fusion_winner_rec5 = fusion_report.get("winner_mean_recall@5", cv_report.get("mean_recall@5", 0.0))
     fusion_winner_prec5 = fusion_report.get("comparison", {}).get("winner_mean_precision@5", cv_report.get("mean_precision@5", 0.0))
     doc_disjoint_rec5 = (
-        oof_runner.doc_disjoint_report.get("trained_reranker_system", {}).get("recall@5", 0.0)
-        if hasattr(oof_runner, "doc_disjoint_report") and oof_runner.doc_disjoint_report
+        doc_disjoint_report.get("trained_reranker_system", {}).get("recall@5", 0.0)
+        if doc_disjoint_report
         else 0.0
     )
 

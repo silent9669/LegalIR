@@ -122,28 +122,27 @@ The system is optimized for Kaggle **Dual GPU T4 (T4 x2)** execution with automa
 
 ### 4.1 Kaggle Kernel Setup
 1. **Notebook**: Open `legalir_training.ipynb` (or upload from `kaggle_kernel_task1/legalir_training.ipynb`).
-2. **Dataset**: Attach the official **`LegalIR`** dataset (mounted at `/kaggle/input/legalir` or discoverable via auto-path resolution).
-3. **Accelerator**: Select **GPU T4 x2** (or GPU T4).
-4. **Internet**: Toggle **On** (for Hugging Face model weights and dependencies).
+2. **Dataset**: Attach the official **`phucdangg/legalir-task1-clean-data`** dataset (discoverable via robust automatic resolution across `/kaggle/input`).
+3. **Accelerator**: Select **GPU T4 x2** (Dual NVIDIA Tesla T4).
+4. **Internet**: Toggle **On** (for Hugging Face model weights and minimal dependencies).
 5. **Kaggle Secret (`HF_TOKEN`)**: Add `HF_TOKEN` under **Add-ons -> Secrets** for authenticated high-bandwidth model downloads (token is securely retrieved via `kaggle_secrets.UserSecretsClient` and never printed/logged).
 
 ### 4.2 Notebook Execution Flow
 Click **Run All** or **Save Version -> Save & Run All (Commit)**:
 
-1. **Cell 0-3**: Environment & Dual-GPU discovery, HF authentication, dependency installation (`bm25s`, `pyvi`).
-2. **Cell 4-6**: Canonical data validation, parameter preflight audit (<4B check), BM25 & DEk21 dense indexing.
-3. **Cell 7-9**: Fold-safe hard-negative pair generation, supervised LoRA fine-tuning of BGE reranker, full 5-fold OOF evaluation.
-4. **Cell 10-12**: Model selection, final full-corpus retraining on all 7,000 training queries, public test question memory compilation.
-5. **Cell 13-16**: Public test inference, strict invariant validation, packaging of `submission.zip`, and output artifact manifest export.
+1. **Cell 0-1**: Environment & Dual-GPU discovery (`cuda:0` Dense, `cuda:1` Reranker), HF authentication, global seed 42.
+2. **Cell 2**: Repository bootstrap and minimal dependency verification (`lightgbm`, `sentencepiece`, `bm25s`, `pyvi`, `peft`, `accelerate`, `faiss`).
+3. **Cell 3**: Canonical data discovery (`phucdangg/legalir-task1-clean-data`) and public test query discovery.
+4. **Cell 4**: End-to-end production orchestrator execution (`run_kaggle_pipeline`), 5-fold OOF validation, 7,000-query query-balanced final LoRA training, and submission packaging.
 
 ### 4.3 Exported Artifacts in `/kaggle/working/legalir_run/`
 All outputs are exported to `/kaggle/working/legalir_run/` (and root `/kaggle/working/`):
 - `submission.zip`: Competition submission archive containing **strictly `submission.json` at root**.
-- `submission.json`: Exact 1,000 public test query predictions with 5 unique valid document IDs per query.
+- `submission.json`: Exact 999 public test query predictions with 5 unique valid document IDs per query.
 - `submission_manifest.json`: Verification manifest with SHA-256 hashes, query counts, and compliance checks.
 - `parameter_audit.json`: Complete parameter breakdown proving total system size is `< 4,000,000,000` parameters.
-- `benchmark_report.json` & `ablation_report.csv`: 5-fold CV metrics (Recall@1, 3, 5, Precision@5, Candidate Recalls).
-- `models/final_reranker/`: Saved LoRA adapter weights, tokenizer, and training configuration.
+- `gpu_smoke_report.json` & `runtime_projection.json`: Real hardware, VRAM, and cold-start/warm-cache execution projections.
+- `cv/cv_report.json` & `ablation_report.csv`: 5-fold CV metrics (Recall@1, 3, 5, Precision@5, Candidate Recalls).
 
 ---
 

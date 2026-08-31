@@ -65,15 +65,64 @@ def compute_coverage_required_steps(
     eligible_query_count: int,
     batch_size: int = 2,
     gradient_accumulation_steps: int = 8,
-    target_coverage_pct: float = 0.99,
     require_pos_and_neg: bool = True,
+    target_coverage_pct: float = 1.0,
 ) -> int:
-    """Compute minimum optimizer steps required to guarantee target query coverage."""
+    """Compute minimum optimizer steps required to guarantee full Phase A/B query coverage."""
     rows_per_step = max(1, batch_size * gradient_accumulation_steps)
-    multiplier = 2 if require_pos_and_neg else 1
-    target_queries = math.ceil(target_coverage_pct * eligible_query_count)
-    required_rows = multiplier * target_queries
+    if require_pos_and_neg:
+        # Phase A (all eligible positives) + Phase B (target_coverage_pct of negatives)
+        required_rows = eligible_query_count + math.ceil(target_coverage_pct * eligible_query_count)
+    else:
+        required_rows = math.ceil(target_coverage_pct * eligible_query_count)
     return math.ceil(required_rows / rows_per_step)
+
+
+def audit_pair_coverage(
+    pairs_data: pd.DataFrame | list[dict[str, Any]],
+    expected_qids: Sequence[str] | set[str] | None = None,
+) -> dict[str, Any]:
+    """Audit query coverage of mined training pairs before model loading."""
+    records = pairs_data.to_dict(orient="records") if isinstance(pairs_data, pd.DataFrame) else list(pairs_data)
+    pos_qids: set[str] = set()
+    neg_qids: set[str] = set()
+    all_pair_qids: set[str] = set()
+
+    for r in records:
+        qid = str(r.get("query_id", "")).strip()
+        if not qid:
+            continue
+        all_pair_qids.add(qid)
+        lbl = float(r.get("label", 0.0))
+        if lbl > 0.5:
+            pos_qids.add(qid)
+        else:
+            neg_qids.add(qid)
+
+    eligible_qids = pos_qids & neg_qids
+    exp_set = set(str(q) for q in expected_qids) if expected_qids is not None else all_pair_qids
+
+    missing_qids = exp_set - all_pair_qids
+    pos_missing = exp_set - pos_qids
+    neg_missing = exp_set - neg_qids
+
+    total_expected = len(exp_set) if exp_set else len(all_pair_qids)
+
+    return {
+        "expected_queries_count": total_expected,
+        "queries_in_pairs_count": len(all_pair_qids),
+        "queries_with_positive_count": len(pos_qids),
+        "queries_with_negative_count": len(neg_qids),
+        "eligible_queries_count": len(eligible_qids),
+        "missing_queries_count": len(missing_qids),
+        "positive_missing_count": len(pos_missing),
+        "negative_missing_count": len(neg_missing),
+        "positive_coverage_pct": round((len(pos_qids & exp_set) / max(1, total_expected)) * 100.0, 2),
+        "negative_coverage_pct": round((len(neg_qids & exp_set) / max(1, total_expected)) * 100.0, 2),
+        "eligible_coverage_pct": round((len(eligible_qids & exp_set) / max(1, total_expected)) * 100.0, 2),
+        "missing_query_ids": sorted(list(missing_qids))[:20],
+        "is_valid": len(missing_qids) == 0 and len(pos_missing) == 0,
+    }
 
 
 class QueryBalancedSampler(Sampler[int]):
@@ -111,7 +160,7 @@ class QueryBalancedSampler(Sampler[int]):
             else:
                 self.neg_indices[qid].append(idx)
 
-        # Eligible queries have at least 1 positive and 1 negative (or at least 1 pair)
+        # Eligible queries have at least 1 positive and 1 negative
         self.eligible_query_ids: set[str] = set(
             qid for qid in self.all_query_ids
             if len(self.pos_indices[qid]) > 0 and len(self.neg_indices[qid]) > 0
@@ -127,7 +176,6 @@ class QueryBalancedSampler(Sampler[int]):
 
     def __iter__(self):
         rng = random.Random(self.seed + self.epoch)
-        # Separate eligible queries and others
         eligible_sorted = sorted(list(self.eligible_query_ids))
         rng.shuffle(eligible_sorted)
         other_sorted = sorted(list(self.all_query_ids - self.eligible_query_ids))
@@ -140,13 +188,20 @@ class QueryBalancedSampler(Sampler[int]):
 
         ordered_indices: list[int] = []
 
-        # Phase A: 1 positive for every eligible query (and queries with positives)
-        for q in qids:
+        # Phase A: 1 positive for every eligible query
+        for q in eligible_sorted:
             if pos_map[q]:
                 ordered_indices.append(pos_map[q].pop(0))
 
-        # Phase B: 1 negative for every eligible query (and queries with negatives)
-        for q in qids:
+        # Phase B: 1 negative for every eligible query
+        for q in eligible_sorted:
+            if neg_map[q]:
+                ordered_indices.append(neg_map[q].pop(0))
+
+        # Non-eligible query rows (e.g. positive-only or negative-only queries)
+        for q in other_sorted:
+            if pos_map[q]:
+                ordered_indices.append(pos_map[q].pop(0))
             if neg_map[q]:
                 ordered_indices.append(neg_map[q].pop(0))
 

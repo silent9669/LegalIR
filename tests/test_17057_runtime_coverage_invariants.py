@@ -114,17 +114,8 @@ def make_mock_canonical_dataset(data_dir: Path, num_docs: int = 8532, num_querie
 # 1. P0-1: Training Coverage & Step Calculations
 # ==============================================================================
 
-def test_required_steps_for_7000_bce_queries_is_867_for_99pct():
-    """Verify compute_coverage_required_steps calculates 867 steps for 99% of 7000 queries at batch=2, grad_accum=8."""
-    steps_99 = compute_coverage_required_steps(
-        eligible_query_count=7000,
-        batch_size=2,
-        gradient_accumulation_steps=8,
-        target_coverage_pct=0.99,
-        require_pos_and_neg=True,
-    )
-    assert steps_99 == 867
-
+def test_7000_bce_queries_require_875_steps_for_complete_posneg_cycle():
+    """Verify compute_coverage_required_steps calculates 875 steps for complete Phase A+B of 7000 queries at batch=2, grad_accum=8."""
     steps_100 = compute_coverage_required_steps(
         eligible_query_count=7000,
         batch_size=2,
@@ -135,7 +126,16 @@ def test_required_steps_for_7000_bce_queries_is_867_for_99pct():
     assert steps_100 == 875
 
 
-def test_sampler_first_phase_contains_one_unique_query_each():
+def test_867_steps_do_not_reach_99pct_negative_coverage():
+    """Verify that 867 optimizer steps (13872 rows) falls short of 99% negative coverage (13930 rows needed)."""
+    rows_at_867 = 867 * 16
+    rows_needed_for_99pct_neg = 7000 + math.ceil(0.99 * 7000)  # 7000 + 6930 = 13930
+    assert rows_at_867 == 13872
+    assert rows_needed_for_99pct_neg == 13930
+    assert rows_at_867 < rows_needed_for_99pct_neg
+
+
+def test_sampler_finishes_eligible_positive_phase_before_negative_phase():
     """Verify Phase A of QueryBalancedSampler schedules exactly 1 positive for each eligible query before Phase B."""
     pairs = [
         {"query_id": "q1", "evidence_text": "pos 1", "label": 1.0},
@@ -164,6 +164,27 @@ def test_sampler_first_phase_contains_one_unique_query_each():
     assert all(lbl <= 0.5 for lbl in phase_b_labels)
 
 
+def test_sampler_finishes_eligible_negative_phase_before_ineligible_rows():
+    """Verify eligible query negative phase finishes before ineligible single-label rows."""
+    pairs = [
+        {"query_id": "q1", "evidence_text": "pos 1", "label": 1.0},
+        {"query_id": "q1", "evidence_text": "neg 1", "label": 0.0},
+        {"query_id": "q2", "evidence_text": "pos 2", "label": 1.0},
+        {"query_id": "q2", "evidence_text": "neg 2", "label": 0.0},
+        {"query_id": "q_ineligible_pos", "evidence_text": "pos only", "label": 1.0},
+    ]
+    dataset = RerankerPairDataset(pairs, balanced=False)
+    sampler = QueryBalancedSampler(dataset, seed=42)
+    indices = list(iter(sampler))
+
+    # Phase A: 2 eligible positives (q1, q2)
+    assert set(pairs[i]["query_id"] for i in indices[:2]) == {"q1", "q2"}
+    # Phase B: 2 eligible negatives (q1, q2)
+    assert set(pairs[i]["query_id"] for i in indices[2:4]) == {"q1", "q2"}
+    # Ineligible row comes after Phase B
+    assert pairs[indices[4]]["query_id"] == "q_ineligible_pos"
+
+
 def test_eligible_coverage_never_exceeds_100pct():
     """Verify query coverage percentage is capped at 100% and correctly intersected."""
     pairs = [
@@ -189,6 +210,8 @@ def test_gpu_smoke_projection_scales_3_steps_to_full_final_steps(tmp_path: Path)
     mock_dense.dense_search_backend = "faiss_index_flat_ip"
     mock_dense._faiss_index = mock.MagicMock()
     mock_dense.device = "cuda:0"
+    mock_dense.dense_oom_events = 0
+    mock_dense.stage_telemetry = {}
     mock_param_0 = mock.MagicMock()
     mock_param_0.device = "cuda:0"
     mock_dense.model.parameters.return_value = iter([mock_param_0])
@@ -201,6 +224,7 @@ def test_gpu_smoke_projection_scales_3_steps_to_full_final_steps(tmp_path: Path)
     mock_pipeline.hybrid_engine.dense_retriever = mock_dense
     mock_pipeline.reranker = mock.MagicMock()
     mock_pipeline.reranker.device = "cuda:1"
+    mock_pipeline.reranker.oom_events = 0
     mock_param_1 = mock.MagicMock()
     mock_param_1.device = "cuda:1"
     mock_pipeline.reranker.model.parameters.return_value = iter([mock_param_1])
@@ -396,14 +420,65 @@ def test_fusion_manifest_json_contains_actual_winning_model_type(tmp_path: Path)
     assert manifest["winning_model_type"] in ("lightgbm", "linear_fallback", "rrf_weighted")
 
 
-def test_500_steps_cannot_claim_99pct_posneg_coverage_for_7000_queries():
-    """Verify that 500 optimizer steps with batch=2, grad_accum=8 only processes 8000 rows (under 13860 required)."""
-    rows_at_500 = 500 * 2 * 8
-    assert rows_at_500 == 8000
+def test_discover_actual_flat_kaggle_dataset_slug(tmp_path: Path):
+    """Verify discover_data_dir resolves /kaggle/input/legalir-task1-clean-data."""
+    from src.pipeline.kaggle_train import discover_data_dir
 
-    required_rows_99 = 2 * math.ceil(0.99 * 7000)
-    assert required_rows_99 == 13860
-    assert rows_at_500 < required_rows_99
+    fake_input = tmp_path / "kaggle/input/legalir-task1-clean-data"
+    make_mock_canonical_dataset(fake_input, 10, 10, 5)
+
+    discovered = discover_data_dir(data_dir=fake_input)
+    assert discovered == fake_input.resolve()
+
+
+def test_discover_actual_namespaced_kaggle_dataset_slug(tmp_path: Path):
+    """Verify discover_data_dir resolves nested namespaced /kaggle/input/datasets/phucdangg/legalir-task1-clean-data."""
+    from src.pipeline.kaggle_train import discover_data_dir
+
+    fake_input = tmp_path / "kaggle/input/datasets/phucdangg/legalir-task1-clean-data/artifacts/task1/data"
+    make_mock_canonical_dataset(fake_input, 10, 10, 5)
+
+    discovered = discover_data_dir(data_dir=fake_input)
+    assert discovered == fake_input.resolve()
+
+
+def test_kernel_metadata_uses_actual_clean_dataset_source():
+    """Verify kernel-metadata.json lists phucdangg/legalir-task1-clean-data as dataset_source."""
+    meta_path = REPO_ROOT / "kaggle_kernel_task1/kernel-metadata.json"
+    assert meta_path.is_file()
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    assert "phucdangg/legalir-task1-clean-data" in meta.get("dataset_sources", [])
+
+
+def test_fold_step_budget_uses_actual_fold_eligible_qids():
+    """Verify train_reranker derives required steps dynamically from actual fold training pairs."""
+    from src.training.train_reranker import train_reranker
+
+    pairs = [
+        {"query_id": f"q_{i}", "evidence_text": f"pos_{i}", "label": 1.0} for i in range(8)
+    ] + [
+        {"query_id": f"q_{i}", "evidence_text": f"neg_{i}", "label": 0.0} for i in range(8)
+    ]
+    pairs_file = REPO_ROOT / "artifacts/test_fold_pairs.parquet"
+    pairs_file.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(pairs).to_parquet(pairs_file, index=False)
+
+    with mock.patch("src.training.train_reranker.RerankerTrainer") as mock_trainer_cls:
+        mock_trainer_inst = mock.MagicMock()
+        mock_trainer_inst.train.return_value = {"status": "completed", "global_steps": 2}
+        mock_trainer_cls.return_value = mock_trainer_inst
+
+        report = train_reranker(
+            pairs_file=pairs_file,
+            output_dir=REPO_ROOT / "artifacts/test_out_fold",
+            fold=1,
+            base_model_name="mock",
+        )
+        assert "coverage_required_steps" in report
+        assert report["coverage_required_steps"] >= 1
+
+    if pairs_file.exists():
+        pairs_file.unlink()
 
 
 def test_full_rejects_cuda0_cuda0_mapping(tmp_path: Path):

@@ -9,7 +9,7 @@
   "enable_tpu": false,
   "enable_internet": true,
   "dataset_sources": [
-    "phucdangg/legalir"
+    "phucdangg/legalir-task1-clean-data"
   ],
   "competition_sources": [],
   "kernel_sources": []

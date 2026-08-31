@@ -9,7 +9,11 @@ from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 from src.core.paths import ProjectPaths
 from src.models.device import resolve_device
-from src.training.trainer import RerankerTrainer
+from src.training.trainer import (
+    RerankerTrainer,
+    audit_pair_coverage,
+    compute_coverage_required_steps,
+)
 
 
 def load_training_config(config_path: str | Path | dict[str, Any]) -> dict[str, Any]:
@@ -90,6 +94,27 @@ def train_reranker(
     train_pairs_df = pairs_df
     val_pairs_df = None
 
+    # Audit pair coverage and compute required steps from actual eligible queries in training pairs
+    coverage_audit = audit_pair_coverage(train_pairs_df)
+    n_eligible = coverage_audit["eligible_queries_count"]
+    batch_sz = int(cfg.get("batch_size", 2))
+    grad_acc = int(cfg.get("gradient_accumulation_steps", 8))
+    req_steps = compute_coverage_required_steps(
+        eligible_query_count=n_eligible,
+        batch_size=batch_sz,
+        gradient_accumulation_steps=grad_acc,
+        target_coverage_pct=1.0,
+        require_pos_and_neg=True,
+    )
+
+    if max_steps is None:
+        cfg_steps = int(cfg.get("max_steps", 500))
+        effective_steps = max(cfg_steps, req_steps)
+        cfg["max_steps"] = effective_steps
+    else:
+        effective_steps = max_steps
+        cfg["max_steps"] = max_steps
+
     # Load tokenizer and model
     if model_name_or_path == "mock":
         import tempfile
@@ -139,15 +164,16 @@ def train_reranker(
     report["positive_count"] = int((pairs_df["label"] > 0.5).sum()) if "label" in pairs_df.columns else 0
     report["negative_count"] = int((pairs_df["label"] <= 0.5).sum()) if "label" in pairs_df.columns else 0
     report["unique_training_queries"] = len(train_pairs_df["query_id"].unique())
-    report["eligible_training_queries"] = report.get("eligible_training_queries", len(train_pairs_df["query_id"].unique()))
-    report["actual_unique_queries_seen"] = report.get("actual_unique_queries_seen", len(train_pairs_df["query_id"].unique()))
-    report["actual_query_coverage_pct"] = report.get("actual_query_coverage_pct", 100.0)
-    report["unique_query_coverage_pct"] = report.get("unique_query_coverage_pct", 100.0)
-    report["positive_query_coverage_pct"] = report.get("positive_query_coverage_pct", 100.0)
-    report["negative_query_coverage_pct"] = report.get("negative_query_coverage_pct", 100.0)
-    report["coverage_required_steps"] = report.get("coverage_required_steps", 0)
-    report["effective_max_steps"] = report.get("effective_max_steps", report.get("global_steps", 0))
-    report["optimizer_steps"] = report.get("global_steps", 0)
+    report["eligible_training_queries"] = int(n_eligible)
+    report["actual_unique_queries_seen"] = int(report.get("actual_unique_queries_seen", len(train_pairs_df["query_id"].unique())))
+    report["actual_query_coverage_pct"] = float(report.get("actual_query_coverage_pct", 100.0))
+    report["unique_query_coverage_pct"] = float(report.get("unique_query_coverage_pct", 100.0))
+    report["positive_query_coverage_pct"] = float(report.get("positive_query_coverage_pct", 100.0))
+    report["negative_query_coverage_pct"] = float(report.get("negative_query_coverage_pct", 100.0))
+    report["coverage_required_steps"] = int(req_steps)
+    report["effective_max_steps"] = int(effective_steps)
+    report["pair_coverage_audit"] = coverage_audit
+    report["optimizer_steps"] = int(report.get("global_steps", 0))
     try:
         bs = int(getattr(trainer, "batch_size", 2))
         ga = int(getattr(trainer, "gradient_accumulation_steps", 8))
