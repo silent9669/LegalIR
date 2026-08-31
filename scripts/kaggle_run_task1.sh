@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
 KERNEL_DIR="kaggle_kernel_task1"
-KERNEL_ID="phucdangg/legalir-task1-training-gpu"
+KERNEL_ID="phucdangg/legalir-training"
 OUTPUT_DIR="artifacts/task1/submissions/kaggle"
 
 # Locate Kaggle CLI

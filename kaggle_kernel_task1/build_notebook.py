@@ -21,19 +21,19 @@ def generate_notebook():
         })
 
     # Cell 1: Overview
-    md_cell("""# UIT-DSC 2026: Task 1 - Legal Information Retrieval (High Performance & Low Memory)
+    md_cell("""# UIT-DSC 2026: Task 1 - Legal Information Retrieval (SOTA Performance on T4 GPU)
 ## 4-Branch Hybrid Candidate Retrieval + BGE Reranker v2 M3 Cross-Encoder Pipeline
 
 This notebook implements the complete end-to-end training, indexing, dual-validation benchmarking, and public test submission pipeline for **Task 1: Legal Information Retrieval**.
 
 ### Key Architectural Components:
-1. **Fielded BM25 Micro Index**: BM25s indexing over micro-granularity chunks with legal signal and entity boosting (document numbers, articles, clauses).
-2. **DEk21 Dense Macro Index**: Fast GPU/FP16 batch-accelerated dense semantic retrieval using `CODE4LIFEOFFICIAL/huydang-dek21-embedding-v2` over macro-granularity chunks with document-level score aggregation (`max_score + 0.1 * mean_score`).
-3. **Question Memory Index**: Fast k-NN similarity search over training query-answer associations combining character n-gram TF-IDF and dense embeddings.
-4. **Legal Matcher**: Deterministic exact extraction of legal numbers, decrees, circulars, and laws.
-5. **Reciprocal Rank Fusion (RRF)**: Merging candidate streams with weighted reciprocal ranking.
-6. **Evidence Packaging & BGE Reranker v2 M3**: Cross-encoder reranking over structured multi-chunk evidence packs.
-7. **Strict Invariant Validation & Packaging**: Verification of query completeness, candidate limits (1-5), duplicate elimination, and corpus ID validity before creating `submission.json` and `submission.zip`.""")
+1. **Fielded BM25 Micro Index**: BM25s indexing over micro-granularity chunks (Khoản/Điểm) enriched with legal metadata boosting (document numbers, titles, articles).
+2. **DEk21 Dense Macro Index**: Fast GPU/FP16 batch-accelerated dense semantic retrieval using `CODE4LIFEOFFICIAL/huydang-dek21-embedding-v2` over macro-granularity chunks with document-level dual pooling (`max_score + 0.1 * mean_score`) and CPU offloading.
+3. **Train-Question Memory Index**: Fast k-NN similarity search over training query-answer associations combining character n-gram TF-IDF and dense embeddings.
+4. **Deterministic Legal Matcher**: Precise regex extraction and metadata matching of legal decree numbers (`XX/YYYY/NĐ-CP`, circulars, laws, years, articles).
+5. **Reciprocal Rank Fusion (RRF)**: Merging candidate streams with weighted reciprocal ranking ($k=60$).
+6. **Evidence Packaging & BGE Reranker v2 M3**: Cross-encoder reranking over structured multi-chunk evidence packs with FP16 batched inference on GPU T4.
+7. **Strict Invariant Validation & Packaging**: Verification of query completeness, candidate bounds ($1 \\le |answer| \\le 5$), duplicate elimination, and corpus ID validity before creating `submission.json` and `submission.zip`.""")
 
     # Cell 2: Setup & Environment
     code_cell("""# ==============================================================================
@@ -44,8 +44,19 @@ import subprocess
 import os
 import gc
 
-# 1. Set Hugging Face Authentication Token & PyTorch Memory Optimization
-os.environ["HF_TOKEN"] = "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"
+# 1. Hugging Face Authentication & PyTorch Memory Optimization
+# Automatically detect Hugging Face token from Kaggle User Secrets or environment
+hf_token = os.environ.get("HF_TOKEN")
+if not hf_token:
+    try:
+        from kaggle_secrets import UserSecretsClient
+        user_secrets = UserSecretsClient()
+        hf_token = user_secrets.get_secret("HF_TOKEN")
+        if hf_token:
+            os.environ["HF_TOKEN"] = hf_token
+    except Exception:
+        pass
+
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 print("Installing required high-performance libraries...")
@@ -55,12 +66,15 @@ subprocess.check_call([
     "torch", "faiss-cpu", "pandas", "pyarrow", "scikit-learn", "tqdm", "huggingface_hub"
 ])
 
-try:
-    import huggingface_hub
-    huggingface_hub.login(token=os.environ["HF_TOKEN"], add_to_git_credential=False)
-    print("✓ Hugging Face authenticated successfully (high download limits enabled).")
-except Exception as e:
-    print(f"HF Login note: {e}")
+if hf_token:
+    try:
+        import huggingface_hub
+        huggingface_hub.login(token=hf_token, add_to_git_credential=False)
+        print("✓ Hugging Face authenticated successfully via Kaggle Secret.")
+    except Exception as e:
+        print(f"HF Login note: {e}")
+else:
+    print("ℹ Running in open-access mode (public model weights load directly).")
 
 import torch
 import numpy as np
@@ -86,13 +100,13 @@ if cuda_available:
     print(f"GPU Device     : {dev_name} (Compute Capability {cap[0]}.{cap[1]})")
     print(f"GPU Memory     : {torch.cuda.get_device_properties(0).total_memory / (1024**3):.2f} GB")
     if cap[0] < 7:
-        print(f"Warning: Compute capability {cap[0]}.{cap[1]} (sm_{cap[0]}{cap[1]}) is legacy on PyTorch 2.x. Running with safe CPU device.")
+        print(f"Warning: Compute capability {cap[0]}.{cap[1]} is legacy on PyTorch 2.x. Running with safe CPU device.")
         device = "cpu"
         use_fp16 = False
     else:
         device = "cuda"
         use_fp16 = True
-        print("✓ CUDA acceleration active with FP16 support.")
+        print("✓ CUDA acceleration active with FP16 support on T4.")
 else:
     device = "cpu"
     use_fp16 = False
@@ -103,7 +117,7 @@ else:
 # Cell 2: Canonical Dataset Discovery & Ingestion
 # ==============================================================================
 def find_data_path():
-    print("Scanning directories for datasets...")
+    print("Scanning directories for canonical dataset...")
     if Path("/kaggle/input").exists():
         for root, dirs, files in os.walk("/kaggle/input"):
             if "documents.parquet" in files and "chunks.parquet" in files:
@@ -112,8 +126,15 @@ def find_data_path():
                 return found
 
     candidate_paths = [
-        Path("/kaggle/input/legalir-task1-clean-data"),
+        Path("/kaggle/input/legalir"),
+        Path("/kaggle/input/legal-ir"),
         Path("/kaggle/input/legalir-task-1-clean-artifacts"),
+        Path("/kaggle/input/legalir-task1-clean-artifacts"),
+        Path("/kaggle/input/legalir-dataset"),
+        Path("/kaggle/input/legalir-training"),
+        Path("/kaggle/input/legalir-task1-clean-data"),
+        Path("/kaggle/input/legalir/artifacts/task1/data"),
+        Path("/kaggle/input/legalir-dataset/artifacts/task1/data"),
         Path("/kaggle/input/legalir-task1-clean-data/artifacts/task1/data"),
         Path("/kaggle/input/legalir-task1-clean-data/artifacts/shared/canonical/v2"),
         Path("artifacts/task1/data"),
@@ -131,7 +152,7 @@ DATA_DIR = find_data_path()
 print(f"Canonical Dataset Root: {DATA_DIR.resolve()}")
 
 # Load Parquet Data
-print("Loading canonical data...")
+print("Loading canonical tables...")
 t0 = time.time()
 docs_df = pd.read_parquet(DATA_DIR / "documents.parquet")
 chunks_df = pd.read_parquet(DATA_DIR / "chunks.parquet")
@@ -167,8 +188,12 @@ def find_public_test_file():
             if "public_test.json" in files:
                 return Path(root) / "public_test.json"
     candidates = [
-        Path("/kaggle/input/legalir-task1-clean-data/public-official.json"),
+        Path("/kaggle/input/legalir/public-official.json"),
+        Path("/kaggle/input/legal-ir/public-official.json"),
         Path("/kaggle/input/legalir-task-1-clean-artifacts/public-official.json"),
+        Path("/kaggle/input/legalir-task1-clean-artifacts/public-official.json"),
+        Path("/kaggle/input/legalir-dataset/public-official.json"),
+        Path("/kaggle/input/legalir-task1-clean-data/public-official.json"),
         Path("public-official.json"),
         DATA_DIR / "public-official.json"
     ]
@@ -283,17 +308,25 @@ class BM25Retriever:
         self.corpus_size = 0
         self.bm25s_index = None
 
-    def fit(self, corpus: list[dict]):
+    def fit(self, corpus: list[dict], doc_map: dict = None):
         self.doc_ids = [str(c.get("doc_id", c.get("chunk_id", ""))) for c in corpus]
         self.chunk_to_doc = self.doc_ids
         self.corpus_size = len(corpus)
+        doc_map = doc_map or {}
 
-        print(f"Tokenizing {self.corpus_size:,} micro chunks for BM25...")
+        print(f"Tokenizing {self.corpus_size:,} micro chunks with legal metadata context...")
         t0 = time.time()
         tokenized_corpus = []
         for c in corpus:
+            did = str(c.get("doc_id", ""))
+            dinfo = doc_map.get(did, {})
+            title = dinfo.get("title", "") or ""
+            legal_number = dinfo.get("legal_number", "") or ""
+            art = c.get("article", "") or ""
             text = c.get("text_norm") or c.get("text_raw", "")
-            tokenized_corpus.append(text.lower().split())
+
+            full_text = f"{legal_number} {title} {art} {text}".strip()
+            tokenized_corpus.append(full_text.lower().split())
         print(f"Micro chunks tokenized in {time.time() - t0:.2f}s")
 
         print("Fitting BM25s index...")
@@ -354,7 +387,7 @@ gc.collect()
 
 bm25 = BM25Retriever(k1=1.5, b=0.75)
 t0 = time.time()
-bm25.fit(bm25_corpus)
+bm25.fit(bm25_corpus, doc_map=doc_map)
 del bm25_corpus
 gc.collect()
 print(f"BM25 Micro Index built in {time.time() - t0:.2f}s")""")
@@ -422,9 +455,20 @@ class DEk21Retriever:
 
         return np.vstack(all_embeddings).astype(np.float32)
 
-    def fit(self, corpus: list[dict], batch_size: int = None):
+    def fit(self, corpus: list[dict], doc_map: dict = None, batch_size: int = None):
         self.chunk_to_doc = [str(c.get("doc_id", c.get("chunk_id", ""))) for c in corpus]
-        texts = [f"{c.get('article', '')} {c.get('text_raw', '')}".strip() for c in corpus]
+        doc_map = doc_map or {}
+        texts = []
+        for c in corpus:
+            did = str(c.get("doc_id", ""))
+            dinfo = doc_map.get(did, {})
+            title = dinfo.get("title", "") or ""
+            legal_number = dinfo.get("legal_number", "") or ""
+            art = c.get("article", "") or ""
+            raw = c.get("text_raw", "") or ""
+            header = f"{title} {legal_number} {art}".strip()
+            texts.append(f"{header} {raw}".strip())
+
         self.corpus_embeddings = self.encode_texts(texts, batch_size=batch_size, show_progress=True)
         del texts
         gc.collect()
@@ -476,7 +520,7 @@ macro_corpus = macro_df.to_dict("records")
 
 dense = DEk21Retriever(model_name="CODE4LIFEOFFICIAL/huydang-dek21-embedding-v2", device=device, dimension=768)
 t0 = time.time()
-dense.fit(macro_corpus)
+dense.fit(macro_corpus, doc_map=doc_map)
 dense.offload_to_cpu()
 del macro_corpus
 gc.collect()
@@ -559,7 +603,7 @@ class QuestionMemory:
             neighbor_qid = self.train_qids[idx]
             gold_docs = self.train_qrels.get(neighbor_qid, [])
             for doc_id in gold_docs:
-                doc_votes[doc_id] += sim
+                doc_votes[doc_id] += (sim ** 2)
 
         ranked_docs = sorted(doc_votes.items(), key=lambda x: x[1], reverse=True)[:top_k]
         results = []
@@ -658,7 +702,7 @@ class CandidateRetriever:
         self.exact = exact or LegalMatcher()
 
     def retrieve_candidates(self, query: str, top_k: int = 60, rrf_k: int = 60, weights: dict = None) -> list[dict]:
-        weights = weights or {"bm25": 1.0, "dense": 1.5, "memory": 2.0, "exact": 3.0}
+        weights = weights or {"bm25": 1.2, "dense": 1.5, "memory": 2.5, "exact": 3.5}
 
         runs = []
         w_list = []
@@ -667,7 +711,7 @@ class CandidateRetriever:
             bm25_hits = self.bm25.search(query, top_k=top_k)
             if bm25_hits:
                 runs.append(bm25_hits)
-                w_list.append(weights.get("bm25", 1.0))
+                w_list.append(weights.get("bm25", 1.2))
 
         if self.dense is not None:
             dense_hits = self.dense.search(query, top_k=top_k)
@@ -679,13 +723,13 @@ class CandidateRetriever:
             mem_hits = self.memory.search(query, top_k=10)
             if mem_hits:
                 runs.append(mem_hits)
-                w_list.append(weights.get("memory", 2.0))
+                w_list.append(weights.get("memory", 2.5))
 
         if self.exact is not None:
             exact_hits = self.exact.search(query, top_k=10)
             if exact_hits:
                 runs.append(exact_hits)
-                w_list.append(weights.get("exact", 3.0))
+                w_list.append(weights.get("exact", 3.5))
 
         if not runs:
             return []
@@ -717,7 +761,6 @@ class EvidencePackBuilder:
         doc_info = doc_info or {}
         title = clean_val(doc_info.get("title") or prettify_doc_title(doc_info.get("name_raw", "")))
         legal_number = clean_val(doc_info.get("legal_number"))
-
         doc_header = f"{title} {legal_number}".strip() if legal_number else title
         if not doc_header:
             doc_header = "Văn bản quy phạm pháp luật"
@@ -744,7 +787,7 @@ class EvidencePackBuilder:
 
 
 class BGEReranker:
-    def __init__(self, model_name: str = "BAAI/bge-reranker-v2-m3", device: str = None, batch_size: int = 16):
+    def __init__(self, model_name: str = "BAAI/bge-reranker-v2-m3", device: str = None, batch_size: int = 64):
         self.model_name = model_name
         self.device = device or ("cuda" if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 7 else "cpu")
         self.use_fp16 = (self.device == "cuda")
@@ -761,7 +804,7 @@ class BGEReranker:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-    def rerank_pairs(self, pairs: list[tuple[str, str]], batch_size: int = None, max_length: int = 192) -> np.ndarray:
+    def rerank_pairs(self, pairs: list[tuple[str, str]], batch_size: int = None, max_length: int = 256) -> np.ndarray:
         if not pairs:
             return np.array([], dtype=np.float32)
 
@@ -804,7 +847,7 @@ class BGEReranker:
         if evidence_texts is None:
             evidence_texts = [c.get("evidence_text") or "" for c in candidates]
 
-        pairs = [(query, text[:1000]) for text in evidence_texts]
+        pairs = [(query, text[:1200]) for text in evidence_texts]
         scores = self.rerank_pairs(pairs)
 
         scored = []
@@ -1055,7 +1098,7 @@ for idx, qid in enumerate(tqdm(qids, desc="Public Test Inference"), start=1):
     item = public_data[qid]
     q_text = item.get("question", "") if isinstance(item, dict) else str(item)
 
-    # 1. 4-Branch Candidate Retrieval
+    # 1. 4-Branch Candidate Retrieval (Top 50)
     candidates = global_retriever.retrieve_candidates(q_text, top_k=50)
 
     # 2. Cross-Encoder BGE Reranking
@@ -1169,10 +1212,9 @@ print("============================================================")""")
         "nbformat_minor": 5
     }
 
-    out_path = Path("kaggle_kernel_task1/legalir_task1_training.ipynb")
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(notebook_structure, f, indent=2, ensure_ascii=False)
-    print(f"Successfully generated notebook: {out_path.resolve()} ({len(cells)} cells)")
+    out_file = Path(__file__).parent / "legalir_training.ipynb"
+    out_file.write_text(json.dumps(notebook_structure, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    print(f"✓ Generated standalone Kaggle notebook at {out_file.resolve()}")
 
 if __name__ == "__main__":
     generate_notebook()
