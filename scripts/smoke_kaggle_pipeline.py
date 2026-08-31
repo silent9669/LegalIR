@@ -314,8 +314,8 @@ def main():
         "--run-mode",
         type=str,
         default="smoke",
-        choices=["smoke", "full"],
-        help="Execution mode (smoke or full). Default: smoke.",
+        choices=["smoke", "gpu_smoke", "full"],
+        help="Execution mode (smoke, gpu_smoke, or full). Default: smoke.",
     )
     parser.add_argument(
         "--config",

@@ -196,6 +196,7 @@ def discover_public_test_file(
         p = Path(public_json_path)
         if p.exists():
             return p.resolve()
+        return None
 
     repo = repo_root or Path.cwd()
     for cand in [
@@ -215,12 +216,17 @@ def run_kaggle_pipeline(
     *,
     data_dir: str | Path | None = None,
     working_dir: str | Path = "/kaggle/working/legalir_run",
-    run_mode: Literal["smoke", "full"] | str = "full",
+    run_mode: Literal["smoke", "gpu_smoke", "full"] | str = "full",
     hf_token: str | None = None,
     devices: list[str] | None = None,
+    runtime_config_path: str | Path | None = "configs/kaggle.yaml",
+    reranker_config_path: str | Path | None = "configs/experiments/reranker_lora.yaml",
     config_path: str | Path | None = None,
     public_json_path: str | Path | None = None,
     repo_root: str | Path | None = None,
+    dense_device: str | None = None,
+    reranker_device: str | None = None,
+    strict_artifacts: bool | None = None,
 ) -> KaggleRunResult:
     """
     Execute the complete 24-step high-score LegalIR production pipeline on Kaggle.
@@ -235,7 +241,7 @@ def run_kaggle_pipeline(
     7. Mining fold-isolated hard-negative training pairs.
     8. 5-Fold OOF cross-validation with fold-specific LoRA rerankers.
     9. Full cross-fitted Learned Fusion (LightGBM) vs Tuned RRF evaluation.
-    10. Document-disjoint robustness split validation.
+    10. Document-disjoint robustness split validation with dedicated trained reranker.
     11. Full 7,000-query question memory indexing with precomputed embeddings.
     12. Final LoRA reranker fine-tuning on all 7,000 training queries on GPU 1.
     13. Final fusion model fitting on all OOF candidate features (if learned fusion won).
@@ -243,11 +249,16 @@ def run_kaggle_pipeline(
     15. Strict submission invariant validation (bounds, types, no duplicates, valid corpus IDs).
     16. Zip packaging containing strictly submission.json at root.
     17. Full artifact manifest creation with SHA-256 hashes and parameter audits.
-    18. Support for run_mode="smoke" and run_mode="full".
+    18. Support for run_mode="smoke", "gpu_smoke", and "full".
     """
     t_start = time.time()
     run_mode_str = str(run_mode).lower().strip()
     is_smoke = run_mode_str == "smoke"
+    is_gpu_smoke = run_mode_str == "gpu_smoke"
+    is_full = run_mode_str == "full"
+
+    if strict_artifacts is None:
+        strict_artifacts = is_full
 
     print("=" * 80)
     print("LEGALIR TASK 1: KAGGLE T4 x2 PRODUCTION ORCHESTRATOR")
@@ -269,8 +280,28 @@ def run_kaggle_pipeline(
     submissions_dir = working_path / "submissions"
     submissions_dir.mkdir(parents=True, exist_ok=True)
 
+    # 1b. Fail-Fast Early Public Test Check in FULL mode
+    public_test_file = discover_public_test_file(public_json_path, repo_root=root_path)
+    if is_full and (public_test_file is None or not public_test_file.exists()):
+        raise FileNotFoundError("Full mode requires official public-official.json; refusing to generate submission")
+
     # 2. Hardware and GPU Device Allocation (P1.10)
-    dense_device, reranker_device = resolve_kaggle_devices(devices)
+    from src.models.device import resolve_device
+
+    if dense_device is None or reranker_device is None:
+        d_dev, r_dev = resolve_kaggle_devices(devices)
+        if dense_device is None:
+            dense_device = d_dev
+        if reranker_device is None:
+            reranker_device = r_dev
+
+    if not is_smoke:
+        dense_device = resolve_device(dense_device)
+        reranker_device = resolve_device(reranker_device)
+    else:
+        dense_device = "cpu"
+        reranker_device = "cpu"
+
     print(f"[+] Device Allocation (P1.10 Multi-GPU Utilization):")
     print(f"    - Dense Embedding & Question Encoding : {dense_device}")
     print(f"    - Reranker Training & Neural Inference: {reranker_device}")
@@ -295,8 +326,8 @@ def run_kaggle_pipeline(
 
     val_report = validate_canonical_dataset(canonical_data_dir)
     print(f"[+] Canonical Dataset Validation: is_valid = {val_report.get('is_valid')}")
-    if not val_report.get("is_valid") and not is_smoke:
-        print(f"[-] Validation warnings/errors: {val_report.get('errors')}")
+    if not val_report.get("is_valid") and is_full:
+        raise ValueError(f"Canonical dataset validation failed in FULL mode: {val_report.get('errors')}")
 
     df_docs = pd.read_parquet(docs_path)
     df_chunks = pd.read_parquet(chunks_path)
@@ -305,13 +336,19 @@ def run_kaggle_pipeline(
     print(f"[+] Dataset Loaded: {len(df_docs):,} documents | {len(df_chunks):,} chunks | {len(df_queries):,} train queries")
 
     # 4. Strict Parameter Budget Preflight Audit (<4B Rule)
-    resolved_config = Path(config_path) if config_path else (root_path / "configs/kaggle.yaml")
-    if not resolved_config.exists():
-        resolved_config = root_path / "configs/pipeline.yaml"
+    resolved_runtime_config = Path(runtime_config_path) if runtime_config_path else (root_path / "configs/kaggle.yaml")
+    if config_path and not runtime_config_path:
+        resolved_runtime_config = Path(config_path)
+    if not resolved_runtime_config.exists():
+        resolved_runtime_config = root_path / "configs/pipeline.yaml"
+
+    resolved_reranker_config = Path(reranker_config_path) if reranker_config_path else (root_path / "configs/experiments/reranker_lora.yaml")
+    if not resolved_reranker_config.exists():
+        resolved_reranker_config = root_path / "configs/pipeline.yaml"
 
     audit_json_path = working_path / "parameter_audit.json"
     audit_report = audit_system_parameters(
-        config_path=resolved_config if resolved_config.exists() else None,
+        config_path=resolved_runtime_config if resolved_runtime_config.exists() else None,
         output_json=audit_json_path,
         raise_on_violation=True,
         offline_fallback=True,
@@ -321,6 +358,17 @@ def run_kaggle_pipeline(
         f"({audit_report['total_parameters_billions']:.4f}B / 4.0B limit, "
         f"{audit_report['budget_utilization_pct']:.2f}% utilization). PASS"
     )
+
+    # Validate explicit reranker training config
+    reranker_cfg = yaml.safe_load(resolved_reranker_config.read_text(encoding="utf-8")) if resolved_reranker_config.exists() else {}
+    if is_full:
+        effective_max_steps = reranker_cfg.get("max_steps", 500)
+        if effective_max_steps is None:
+            raise ValueError("Full reranker training requires explicit max_steps")
+    elif is_gpu_smoke:
+        effective_max_steps = 3
+    else:
+        effective_max_steps = 5
 
     # 5. Build / Load Dual BM25 Indexes with Metadata Enrichment (P1.5)
     micro_chunks = (
@@ -411,16 +459,17 @@ def run_kaggle_pipeline(
         output_dir=cv_dir,
         splits_path=canonical_data_dir / "splits/random_5fold.json" if (canonical_data_dir / "splits/random_5fold.json").exists() else None,
         doc_disjoint_splits_path=canonical_data_dir / "splits/doc_disjoint_split.json" if (canonical_data_dir / "splits/doc_disjoint_split.json").exists() else None,
-        config_path=resolved_config,
-        num_folds=5 if not is_smoke else 2,
-        candidate_k=150 if not is_smoke else 20,
-        rerank_k=50 if not is_smoke else 10,
+        config_path=resolved_reranker_config,
+        num_folds=1 if is_gpu_smoke else (2 if is_smoke else 5),
+        candidate_k=20 if (is_smoke or is_gpu_smoke) else 150,
+        rerank_k=10 if (is_smoke or is_gpu_smoke) else 50,
         use_reranker=True,
-        reranker_model="BAAI/bge-reranker-v2-m3" if not is_smoke else "mock",
+        reranker_model="mock" if is_smoke else "BAAI/bge-reranker-v2-m3",
         train_reranker_per_fold=(not is_smoke),
-        device=reranker_device,
-        smoke=is_smoke,
-        smoke_sample_size=20 if is_smoke else 50,
+        dense_device=dense_device,
+        reranker_device=reranker_device,
+        smoke=(is_smoke or is_gpu_smoke),
+        smoke_sample_size=20 if (is_smoke or is_gpu_smoke) else 50,
         doc_disjoint=True,
     )
     cv_report = oof_runner.run()
@@ -444,7 +493,7 @@ def run_kaggle_pipeline(
                 oof_df=oof_df,
                 qrels_dict=qrels_dict,
                 output_dir=fusion_final_dir,
-                num_boost_round=100 if not is_smoke else 10,
+                num_boost_round=100 if not (is_smoke or is_gpu_smoke) else 10,
             )
 
     winning_fusion_method = fusion_report.get("winning_method", "reciprocal_rank_fusion")
@@ -473,14 +522,16 @@ def run_kaggle_pipeline(
             else (qid, queries_dict[qid], None)
             for qid in queries_dict.keys()
         ]
-        full_memory = TrainQuestionMemory(min_similarity=0.82, dense_encoder=dense_retriever)
+        full_memory = TrainQuestionMemory(min_similarity=0.82, dense_encoder=dense_retriever, dense_device=dense_device)
         full_memory.fit(queries_for_memory, qrels_dict_full)
+        if len(full_memory.qids) == 0:
+            raise ValueError("Final Question Memory has 0 indexed queries")
         full_mem_dir = index_dir / "question_memory"
         full_memory.save(full_mem_dir)
         print(f"[+] Full Question Memory Index saved to {full_mem_dir} ({len(full_memory.qids):,} queries).")
 
     # 10b. Mine hard-negative training pairs from ALL training queries
-    limit_pairs = 100 if is_smoke else None
+    limit_pairs = 100 if (is_smoke or is_gpu_smoke) else None
     print(f"[*] Mining hard-negative training pairs on all training queries (limit={limit_pairs})...")
     build_training_pairs(
         data_dir=canonical_data_dir,
@@ -490,20 +541,22 @@ def run_kaggle_pipeline(
         use_all_queries=True,
         limit=limit_pairs,
         negatives_per_positive=8,
+        query_embeddings=train_query_embs,
     )
     final_pairs_file = pairs_dir / "reranker_pairs.parquet"
 
     # 10c. Train Final LoRA Reranker on GPU 1
     final_reranker_dir = checkpoints_dir / "reranker_final"
-    max_final_steps = 10 if is_smoke else None
+    max_final_steps = effective_max_steps
     print(f"[*] Training Final Supervised LoRA Reranker on {reranker_device} (max_steps={max_final_steps})...")
     final_reranker_report = train_reranker(
         pairs_file=final_pairs_file,
-        config_path=resolved_config,
+        config_path=resolved_reranker_config,
         output_dir=final_reranker_dir,
         fold=None,
         max_steps=max_final_steps,
         base_model_name="mock" if is_smoke else "BAAI/bge-reranker-v2-m3",
+        device=reranker_device,
     )
     print(f"[+] Final Reranker Training Status: {final_reranker_report.get('status')} | Checkpoint: {final_reranker_dir}")
 
@@ -513,13 +566,18 @@ def run_kaggle_pipeline(
     print("=" * 70)
 
     public_test_file = discover_public_test_file(public_json_path, repo_root=root_path)
-    if public_test_file and public_test_file.exists():
+    if is_full:
+        if public_test_file is None or not public_test_file.exists():
+            raise FileNotFoundError("Full mode requires official public-official.json; refusing to generate submission")
+        with open(public_test_file, "r", encoding="utf-8") as f:
+            public_data = json.load(f)
+    elif public_test_file and public_test_file.exists():
         print(f"[+] Found Public Test Queries: {public_test_file}")
         with open(public_test_file, "r", encoding="utf-8") as f:
             public_data = json.load(f)
     else:
         print("[!] public-official.json not found. Using train queries sample for inference verification.")
-        sample_records = df_queries.head(20 if is_smoke else 100).to_dict("records")
+        sample_records = df_queries.head(20 if (is_smoke or is_gpu_smoke) else 100).to_dict("records")
         public_data = {
             str(r["query_id"]): {
                 "question": str(
@@ -529,6 +587,7 @@ def run_kaggle_pipeline(
             for r in sample_records
         }
 
+    official_public_qids = set(public_data.keys())
     print(f"[+] Total Public Test Queries: {len(public_data)}")
 
     # Load fully integrated pipeline
@@ -542,7 +601,9 @@ def run_kaggle_pipeline(
         fusion_model_path=fusion_model_load_path,
         use_reranker=True,
         use_learned_fusion=use_learned_fusion,
-        device=reranker_device,
+        dense_device=dense_device,
+        reranker_device=reranker_device,
+        strict_artifacts=strict_artifacts,
         audit_preflight=True,
         audit_output_json=working_path / "parameter_audit.json",
         reranker_model_name="mock" if is_smoke else "BAAI/bge-reranker-v2-m3",
@@ -551,7 +612,7 @@ def run_kaggle_pipeline(
     t0_infer = time.time()
     predictions: dict[str, dict[str, list[str]]] = {}
     q_items = list(public_data.items())
-    if is_smoke and len(q_items) > 20:
+    if (is_smoke or is_gpu_smoke) and len(q_items) > 20:
         q_items = q_items[:20]
 
     for idx, (qid, q_val) in enumerate(q_items, start=1):
@@ -559,8 +620,8 @@ def run_kaggle_pipeline(
         pred_docs = pipeline.predict_single(
             query=q_text,
             query_id=str(qid),
-            top_k_candidates=150 if not is_smoke else 20,
-            top_k_rerank=50 if not is_smoke else 10,
+            top_k_candidates=150 if is_full else 20,
+            top_k_rerank=50 if is_full else 10,
         )
         predictions[str(qid)] = {"answer": pred_docs}
         if idx % 100 == 0 or idx == len(q_items):
@@ -574,12 +635,27 @@ def run_kaggle_pipeline(
     sub_zip = submissions_dir / "submission.zip"
     package_submission(predictions, sub_json, sub_zip)
 
-    expected_qids = set(predictions.keys())
+    expected_qids = official_public_qids if is_full else set(predictions.keys())
+    if is_full:
+        assert set(predictions.keys()) == expected_qids, f"Prediction keys mismatch with official public keys: missing {len(expected_qids - set(predictions.keys()))}, extra {len(set(predictions.keys()) - expected_qids)}"
+
     val_res = validate_submission(sub_json, expected_qids=expected_qids)
     zip_val_res = validate_submission_zip(sub_zip)
 
     is_submission_valid = bool(val_res.get("is_valid") and zip_val_res.get("is_valid"))
     print(f"[+] Submission Validation: JSON = {val_res.get('is_valid')} | ZIP = {zip_val_res.get('is_valid')} | Overall = {is_submission_valid}")
+
+    # Copy files to /kaggle/working root if running in Kaggle environment and in full mode
+    if is_full and Path("/kaggle/working").exists() and is_submission_valid:
+        try:
+            import shutil
+            shutil.copy2(sub_json, Path("/kaggle/working/submission.json"))
+            shutil.copy2(sub_zip, Path("/kaggle/working/submission.zip"))
+            if (submissions_dir / "submission_manifest.json").exists():
+                shutil.copy2(submissions_dir / "submission_manifest.json", Path("/kaggle/working/submission_manifest.json"))
+            print("[+] Copied submission.json, submission.zip, and manifest to /kaggle/working/ root.")
+        except Exception as e:
+            print(f"[-] Warning: Failed to copy submission to /kaggle/working: {e}")
 
     # 13. Manifest, Hashes, Reports & Parameter Audits
     git_sha = get_git_commit(root_path)
@@ -596,6 +672,7 @@ def run_kaggle_pipeline(
         ],
         metadata={
             "run_mode": run_mode_str,
+            "submission_status": "SUBMITTABLE_OFFICIAL" if is_full else f"NON_SUBMITTABLE_{run_mode_str.upper()}",
             "cv_mean_recall@5": cv_report.get("mean_recall@5", 0.0),
             "cv_mean_precision@5": cv_report.get("mean_precision@5", 0.0),
             "candidate_recall@150": cv_report.get("mean_candidate@150", 0.0),

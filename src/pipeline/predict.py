@@ -236,10 +236,13 @@ class LegalIRPipeline:
         fusion_model_path: str | Path | None = None,
         use_reranker: bool = True,
         use_learned_fusion: bool | None = None,
+        dense_device: str | None = None,
+        reranker_device: str | None = None,
         device: str | None = None,
         audit_preflight: bool = False,
         audit_output_json: str | Path | None = None,
         reranker_model_name: str = "BAAI/bge-reranker-v2-m3",
+        strict_artifacts: bool = False,
     ) -> "LegalIRPipeline":
         """Load fully instantiated pipeline from index and data artifacts."""
         import json
@@ -256,13 +259,22 @@ class LegalIRPipeline:
         data_dir = Path(data_dir)
         index_dir = Path(index_dir)
 
+        resolved_dense_device = dense_device if dense_device is not None else device
+        resolved_reranker_device = reranker_device if reranker_device is not None else device
+
         docs_path = data_dir / "documents.parquet"
         chunks_path = data_dir / "chunks.parquet"
 
         doc_map = {}
         valid_doc_ids = set()
         if docs_path.exists():
-            docs_df = pd.read_parquet(docs_path, columns=["doc_id", "title", "name_raw", "legal_number"])
+            target_cols = ["doc_id", "title", "name_raw", "legal_number", "year", "doc_type", "link"]
+            try:
+                sample_df = pd.read_parquet(docs_path)
+                load_cols = [c for c in target_cols if c in sample_df.columns]
+                docs_df = sample_df[load_cols]
+            except Exception:
+                docs_df = pd.read_parquet(docs_path)
             for r in docs_df.to_dict("records"):
                 did = str(r["doc_id"])
                 doc_map[did] = r
@@ -288,7 +300,7 @@ class LegalIRPipeline:
             dense_path = index_dir / "dense"
         if dense_path.exists():
             try:
-                dense = DenseMacroRetriever.load(dense_path, device=device)
+                dense = DenseMacroRetriever.load(dense_path, device=resolved_dense_device)
             except Exception:
                 dense = None
         else:
@@ -301,7 +313,42 @@ class LegalIRPipeline:
         if mem_path.exists():
             memory = TrainQuestionMemory.load(mem_path, dense_retriever=dense)
         else:
-            memory = TrainQuestionMemory()
+            memory = TrainQuestionMemory(dense_device=resolved_dense_device)
+
+        # Strict artifact validation in production mode
+        if strict_artifacts:
+            if not bm25_path.exists() or len(getattr(bm25, "corpus", [])) == 0:
+                raise FileNotFoundError(f"Strict artifact check failed: Legal BM25 index at {bm25_path} is missing or empty")
+            if bm25_pyvi is None or not bm25_pyvi_path.exists() or len(getattr(bm25_pyvi, "corpus", [])) == 0:
+                raise FileNotFoundError(f"Strict artifact check failed: PyVi BM25 index at {bm25_pyvi_path} is missing or empty")
+            if dense is None or not (dense_path / "embeddings.npy").exists():
+                raise FileNotFoundError(f"Strict artifact check failed: Dense index at {dense_path} is missing or empty")
+            if len(memory.qids) == 0:
+                raise FileNotFoundError(f"Strict artifact check failed: Question Memory at {mem_path} has 0 indexed queries")
+            if use_reranker and reranker_model_name != "mock":
+                if reranker_adapter_path is None:
+                    raise FileNotFoundError("Strict artifact check failed: reranker_adapter_path is None")
+                ad_path = Path(reranker_adapter_path)
+                if not (ad_path / "adapter_config.json").exists():
+                    raise FileNotFoundError(f"Strict artifact check failed: adapter_config.json missing in {ad_path}")
+                has_weights = (ad_path / "adapter_model.safetensors").exists() or (ad_path / "adapter_model.bin").exists()
+                if not has_weights:
+                    raise FileNotFoundError(f"Strict artifact check failed: adapter weights (safetensors/bin) missing in {ad_path}")
+                ad_manifest = ad_path / "training_manifest.json"
+                if ad_manifest.exists():
+                    m_data = json.loads(ad_manifest.read_text(encoding="utf-8"))
+                    if m_data.get("status") != "completed":
+                        raise ValueError(f"Strict artifact check failed: adapter training status is {m_data.get('status')}")
+                    if m_data.get("param_diff", 1) is not None and m_data.get("param_diff", 1) <= 0:
+                        raise ValueError("Strict artifact check failed: adapter param_diff <= 0")
+                    if not m_data.get("adapter_checksum"):
+                        raise ValueError("Strict artifact check failed: adapter checksum is missing")
+            if use_learned_fusion:
+                if fusion_model_path is None:
+                    raise FileNotFoundError("Strict artifact check failed: learned fusion requested but fusion_model_path is None")
+                f_p = Path(fusion_model_path)
+                if not f_p.exists():
+                    raise FileNotFoundError(f"Strict artifact check failed: fusion model path {f_p} does not exist")
 
         # 4. Exact Matcher
         exact = ExactMatcher(documents=list(doc_map.values()))
@@ -330,7 +377,7 @@ class LegalIRPipeline:
             reranker = CrossEncoderReranker(
                 model_name=reranker_model_name,
                 adapter_path=reranker_adapter_path,
-                device=device,
+                device=resolved_reranker_device,
             )
         else:
             reranker = None

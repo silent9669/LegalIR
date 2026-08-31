@@ -37,6 +37,7 @@ def train_reranker(
     loss_type: str | None = None,
     batch_size: int | None = None,
     learning_rate: float | None = None,
+    device: str | None = None,
 ) -> dict[str, Any]:
     """
     Supervised Cross-Encoder fine-tuning with PEFT LoRA, verified weight updates,
@@ -65,7 +66,7 @@ def train_reranker(
     if learning_rate is not None:
         cfg["learning_rate"] = learning_rate
 
-    device = resolve_device(cfg.get("device", "auto"))
+    resolved_device = resolve_device(device if device is not None else cfg.get("device", "auto"))
 
     out_path = Path(output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
@@ -131,7 +132,7 @@ def train_reranker(
         train_data=train_pairs_df,
         val_data=val_pairs_df,
         config=cfg,
-        device=device,
+        device=resolved_device,
     )
 
     report = trainer.train(output_dir=out_path)
@@ -177,6 +178,7 @@ def main():
     parser.add_argument("--loss-type", type=str, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--device", type=str, default=None)
     args = parser.parse_args()
 
     train_reranker(
@@ -189,6 +191,7 @@ def main():
         loss_type=args.loss_type,
         batch_size=args.batch_size,
         learning_rate=args.lr,
+        device=args.device,
     )
 
 

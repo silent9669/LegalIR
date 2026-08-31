@@ -35,7 +35,7 @@ from src.evaluation.splits import (
     verify_fold_isolation,
 )
 from src.ranking.evidence_pack import EvidencePackBuilder
-from src.ranking.oof_features import extract_candidate_features
+from src.ranking.oof_features import compute_training_doc_frequencies, extract_candidate_features
 from src.ranking.reranker import CrossEncoderReranker
 from src.ranking.selector import TopKSelector
 from src.retrieval.bm25_micro import BM25MicroRetriever
@@ -63,6 +63,8 @@ class OOFRunner:
         use_reranker: bool = False,
         reranker_model: str = "mock",
         train_reranker_per_fold: bool = False,
+        dense_device: str | None = None,
+        reranker_device: str | None = None,
         device: str | None = None,
         smoke: bool = False,
         smoke_sample_size: int = 20,
@@ -88,7 +90,9 @@ class OOFRunner:
         self.use_reranker = bool(use_reranker)
         self.reranker_model = str(reranker_model)
         self.train_reranker_per_fold = bool(train_reranker_per_fold)
-        self.device = device
+        self.dense_device = dense_device if dense_device is not None else device
+        self.reranker_device = reranker_device if reranker_device is not None else device
+        self.device = self.reranker_device
         self.smoke = bool(smoke)
         self.smoke_sample_size = int(smoke_sample_size)
         self.doc_disjoint = bool(doc_disjoint)
@@ -203,7 +207,7 @@ class OOFRunner:
             dense_path = dense_dek21 if dense_dek21.exists() else dense_std
             if dense_path.exists() and (dense_path / "embeddings.npy").exists():
                 try:
-                    self.dense = DenseMacroRetriever.load(dense_path, device=self.device)
+                    self.dense = DenseMacroRetriever.load(dense_path, device=self.dense_device)
                 except Exception as e:
                     print(f"Warning: Dense retriever could not be loaded from {dense_path}: {e}")
                     self.dense = None
@@ -290,6 +294,9 @@ class OOFRunner:
             exact_matcher=self.exact,
         )
 
+        # Compute fold-specific training doc frequencies (zero validation label leakage)
+        fold_train_doc_freq = compute_training_doc_frequencies(fold_train_qrels)
+
         fold_preds: dict[str, list[str]] = {}
         fold_candidates: dict[str, list[str]] = {}
         fold_feature_dfs: list[pd.DataFrame] = []
@@ -310,15 +317,7 @@ class OOFRunner:
             cand_ids = [str(c["doc_id"]) for c in candidates]
             fold_candidates[qid] = cand_ids
 
-            # Extract features for candidate union
-            feat_df = extract_candidate_features(query_id=qid, candidate_records=candidates)
-            if not feat_df.empty:
-                gold_set = set(self.qrels_map.get(qid, []))
-                feat_df["label"] = feat_df["doc_id"].apply(lambda did: 1 if did in gold_set else 0)
-                feat_df["fold"] = fold_idx
-                fold_feature_dfs.append(feat_df)
-
-            # Rerank if configured
+            # Rerank first if configured (P1: Extract features AFTER reranking)
             if reranker is not None and self.evidence_builder is not None:
                 candidates = reranker.rerank(
                     query=q_text,
@@ -326,6 +325,18 @@ class OOFRunner:
                     evidence_builder=self.evidence_builder,
                     top_k=self.rerank_k,
                 )
+
+            # Extract features for candidate union AFTER reranking
+            feat_df = extract_candidate_features(
+                query_id=qid,
+                candidate_records=candidates,
+                query_text=q_text,
+                doc_freq_map=fold_train_doc_freq,
+                qrels=self.qrels_map,
+            )
+            if not feat_df.empty:
+                feat_df["fold"] = fold_idx
+                fold_feature_dfs.append(feat_df)
 
             top5 = self.selector.select(candidates)
             fold_preds[qid] = top5
@@ -416,6 +427,7 @@ class OOFRunner:
                     fold=f_idx,
                     use_all_queries=False,
                     limit=self.smoke_sample_size if self.smoke else None,
+                    query_embeddings=self.train_query_embeddings,
                 )
 
                 adapter_dir = fold_dir / "reranker_adapter"
@@ -428,12 +440,13 @@ class OOFRunner:
                     fold=f_idx,
                     base_model_name=base_m_name,
                     max_steps=5 if self.smoke else None,
+                    device=self.reranker_device,
                 )
 
                 fold_reranker = CrossEncoderReranker(
                     model_name=self.reranker_model,
                     adapter_path=adapter_dir,
-                    device=self.device,
+                    device=self.reranker_device,
                 )
             elif self.use_reranker:
                 fold_reranker = global_reranker
@@ -637,24 +650,96 @@ class OOFRunner:
             exact_matcher=self.exact,
         )
 
-        preds = {}
-        candidates_map = {}
-        runtimes = {}
+        # 1. Retrieval-only pass
+        preds_retrieval: dict[str, list[str]] = {}
+        candidates_map: dict[str, list[str]] = {}
+        runtimes_retrieval: dict[str, float] = {}
 
         t0 = time.time()
-        for qid in tqdm(val_ids, desc="Document-Disjoint Eval", leave=False):
+        for qid in tqdm(val_ids, desc="Doc-Disjoint Retrieval Eval", leave=False):
             q_text = self.queries_map.get(qid, "")
             t_q0 = time.time()
+            q_emb = self.train_query_embeddings.get(qid)
 
             cands = hybrid_engine.search_candidates(
                 query=q_text,
                 top_k=self.candidate_k,
                 exclude_qid=str(qid),
+                q_emb=q_emb,
             )
             candidates_map[qid] = [str(c["doc_id"]) for c in cands]
+            preds_retrieval[qid] = self.selector.select(cands)
+            runtimes_retrieval[qid] = time.time() - t_q0
 
-            if reranker is not None and self.evidence_builder is not None:
-                cands = reranker.rerank(
+        gold = {qid: self.qrels_map[qid] for qid in val_ids}
+        retrieval_metrics = evaluate_predictions(
+            y_pred=preds_retrieval,
+            y_true=gold,
+            candidate_pools=candidates_map,
+            runtimes=runtimes_retrieval,
+            cutoffs=DEFAULT_CANDIDATE_CUTOFFS,
+        )
+        retrieval_metrics["elapsed_seconds"] = time.time() - t0
+        retrieval_metrics["val_queries"] = len(val_ids)
+
+        active_reranker = reranker
+        doc_disjoint_adapter_dir: Path | None = None
+        if active_reranker is None and self.train_reranker_per_fold:
+            print("--- Training dedicated fold-safe LoRA reranker for Document-Disjoint split ---")
+            doc_disjoint_dir = self.output_dir / "doc_disjoint"
+            doc_disjoint_dir.mkdir(parents=True, exist_ok=True)
+            pairs_dir = doc_disjoint_dir / "pairs"
+
+            from src.training.build_pairs import build_training_pairs
+            from src.training.train_reranker import train_reranker
+
+            _, pairs_df = build_training_pairs(
+                data_dir=self.data_dir,
+                index_dir=self.index_dir,
+                output_dir=pairs_dir,
+                train_query_ids=list(train_ids),
+                use_all_queries=False,
+                limit=self.smoke_sample_size if self.smoke else None,
+                query_embeddings=self.train_query_embeddings,
+            )
+
+            doc_disjoint_adapter_dir = doc_disjoint_dir / "reranker_adapter"
+            reranker_cfg = self.config_path or "configs/experiments/reranker_lora.yaml"
+            base_m_name = self.reranker_model if self.reranker_model != "mock" else None
+            train_reranker(
+                pairs_file=pairs_dir / "reranker_pairs.parquet",
+                config_path=reranker_cfg,
+                output_dir=doc_disjoint_adapter_dir,
+                base_model_name=base_m_name,
+                max_steps=5 if self.smoke else None,
+                device=self.reranker_device,
+            )
+
+            active_reranker = CrossEncoderReranker(
+                model_name=self.reranker_model,
+                adapter_path=doc_disjoint_adapter_dir,
+                device=self.reranker_device,
+            )
+
+        # 2. Reranked pass
+        preds_system: dict[str, list[str]] = {}
+        runtimes_system: dict[str, float] = {}
+
+        t1 = time.time()
+        for qid in tqdm(val_ids, desc="Doc-Disjoint System Eval", leave=False):
+            q_text = self.queries_map.get(qid, "")
+            t_q0 = time.time()
+            q_emb = self.train_query_embeddings.get(qid)
+
+            cands = hybrid_engine.search_candidates(
+                query=q_text,
+                top_k=self.candidate_k,
+                exclude_qid=str(qid),
+                q_emb=q_emb,
+            )
+
+            if active_reranker is not None and self.evidence_builder is not None:
+                cands = active_reranker.rerank(
                     query=q_text,
                     candidates=cands,
                     evidence_builder=self.evidence_builder,
@@ -662,28 +747,42 @@ class OOFRunner:
                 )
 
             top5 = self.selector.select(cands)
-            preds[qid] = top5
-            runtimes[qid] = time.time() - t_q0
+            preds_system[qid] = top5
+            runtimes_system[qid] = time.time() - t_q0
 
-        gold = {qid: self.qrels_map[qid] for qid in val_ids}
-        metrics = evaluate_predictions(
-            y_pred=preds,
+        trained_system_metrics = evaluate_predictions(
+            y_pred=preds_system,
             y_true=gold,
             candidate_pools=candidates_map,
-            runtimes=runtimes,
+            runtimes=runtimes_system,
             cutoffs=DEFAULT_CANDIDATE_CUTOFFS,
         )
-        metrics["elapsed_seconds"] = time.time() - t0
-        metrics["val_queries"] = len(val_ids)
+        trained_system_metrics["elapsed_seconds"] = time.time() - t1
+        trained_system_metrics["val_queries"] = len(val_ids)
 
-        assert_official_equivalence(preds, gold)
+        assert_official_equivalence(preds_system, gold)
+
+        final_report = {
+            "retrieval_only": retrieval_metrics,
+            "trained_reranker_system": trained_system_metrics,
+            "recall@5": trained_system_metrics["recall@5"],
+            "precision@5": trained_system_metrics["precision@5"],
+            "mrr": trained_system_metrics.get("mrr", 0.0),
+            "map": trained_system_metrics.get("map", 0.0),
+            "ndcg@5": trained_system_metrics.get("ndcg@5", 0.0),
+            "adapter_path": str(doc_disjoint_adapter_dir) if doc_disjoint_adapter_dir else None,
+        }
 
         report_path = self.output_dir / "doc_disjoint_report.json"
         with open(report_path, "w", encoding="utf-8") as f:
-            json.dump(metrics, f, indent=2)
+            json.dump(final_report, f, indent=2)
 
-        print(f"Document-Disjoint Split Recall@5: {metrics['recall@5'] * 100:.2f}% | Precision@5: {metrics['precision@5'] * 100:.2f}%")
-        return metrics
+        print(
+            f"Document-Disjoint Split: Retrieval Recall@5 = {retrieval_metrics['recall@5'] * 100:.2f}% | "
+            f"Trained System Recall@5 = {trained_system_metrics['recall@5'] * 100:.2f}% | "
+            f"Precision@5 = {trained_system_metrics['precision@5'] * 100:.2f}%"
+        )
+        return final_report
 
     def run_fusion_evaluation(self, output_dir: str | Path | None = None) -> dict[str, Any]:
         """Run cross-fitted fusion evaluation on generated oof_features.parquet."""

@@ -136,6 +136,17 @@ class TrainQuestionMemory:
                 qid = record.get("query_id", record.get("qid", index))
                 text = cls._query_text(record)
                 embedding = cls._query_embedding(record)
+            elif isinstance(record, (tuple, list)):
+                if len(record) == 3:
+                    qid, text, embedding = record
+                elif len(record) == 2:
+                    qid, text = record
+                    embedding = None
+                else:
+                    raise ValueError(
+                        "question tuple/list must be (qid, text) or (qid, text, embedding)"
+                    )
+                text = normalize_text(text)
             else:
                 qid, text, embedding = index, normalize_text(record), None
             parsed.append((str(qid), text, embedding))
@@ -237,6 +248,9 @@ class TrainQuestionMemory:
         qids: list[str],
         record_embeddings: list[Any | None],
     ) -> np.ndarray | None:
+        if not self.use_dense:
+            return None
+
         values = self.dense_embeddings_input
         if values is not None:
             if isinstance(values, Mapping):
@@ -255,9 +269,17 @@ class TrainQuestionMemory:
             return self._normalize_embeddings(record_embeddings)
         return None
 
-    def fit(self, train_queries: Any, qrels: Any = None) -> "TrainQuestionMemory":
+    def fit(
+        self,
+        train_queries: Any,
+        qrels: Any = None,
+        dense_embeddings: Any = None,
+        encode_dense: bool = True,
+    ) -> "TrainQuestionMemory":
         """Index only the supplied training questions and their gold qrels."""
         self._clear_index()
+        if dense_embeddings is not None:
+            self.dense_embeddings_input = dense_embeddings
         qrels_by_qid = self._qrel_records(qrels) if qrels is not None else {}
         query_records = self._query_records(train_queries)
 
@@ -279,7 +301,7 @@ class TrainQuestionMemory:
                 if qid in self.training_query_ids
             ]
             self.dense_embeddings = self._provided_embeddings(self.qids, record_embeddings)
-            if self.dense_embeddings is None and self.use_dense:
+            if self.dense_embeddings is None and self.use_dense and encode_dense:
                 self._ensure_dense_encoder()
                 if self.dense_encoder is not None:
                     self.dense_embeddings = self._encode(self.texts)
@@ -412,7 +434,7 @@ class TrainQuestionMemory:
         dense_retriever: Any | None = None,
         min_similarity: float = 0.82,
     ) -> "TrainQuestionMemory":
-        """Load question memory index from disk."""
+        """Load question memory index from disk without re-encoding if embeddings exist."""
         index_dir = Path(index_dir)
         qa_path = index_dir / "train_qa.json"
         emb_path = index_dir / "train_embeddings.npy"
@@ -422,9 +444,11 @@ class TrainQuestionMemory:
                 data = json.load(f)
             queries = {qid: q for qid, q in zip(data["qids"], data["queries"])}
             qrels = data["qrels"]
-            mem.fit(queries, qrels)
-            if emb_path.exists():
-                mem.dense_embeddings = np.load(str(emb_path))
+            saved_emb = np.load(str(emb_path)) if emb_path.exists() else None
+            if saved_emb is not None:
+                mem.fit(queries, qrels, dense_embeddings=saved_emb, encode_dense=False)
+            else:
+                mem.fit(queries, qrels)
         return mem
 
 

@@ -23,12 +23,14 @@ def build_training_pairs(
     index_dir: str | Path,
     output_dir: str | Path,
     fold: int | None = 0,
+    train_query_ids: list[str] | None = None,
     use_all_queries: bool = False,
     limit: int | None = None,
     negatives_per_positive: int = 10,
     max_evidence_chunks: int = 3,
     include_dense_negatives: bool = True,
     include_pyvi_negatives: bool = True,
+    query_embeddings: Mapping[str, Any] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Build fold-safe positive and multi-band hard negative pairs for cross-encoder training.
@@ -48,7 +50,9 @@ def build_training_pairs(
     queries_dict = dict(zip(queries_df["query_id"].astype(str), queries_df.get("question_norm", queries_df.get("question_raw", ""))))
     qrels_dict = qrels_df.groupby("query_id")["doc_id"].apply(lambda s: [str(x) for x in s]).to_dict()
 
-    if use_all_queries or fold is None:
+    if train_query_ids is not None:
+        train_qids = [str(x) for x in train_query_ids if str(x) in queries_dict]
+    elif use_all_queries or fold is None:
         train_qids = [str(x) for x in queries_df["query_id"].unique() if str(x) in qrels_dict and len(qrels_dict[str(x)]) > 0]
         if not train_qids:
             train_qids = [str(x) for x in queries_df["query_id"].unique()]
@@ -169,6 +173,8 @@ def build_training_pairs(
         if not gold_ids or not q_text:
             continue
 
+        q_emb = query_embeddings.get(qid) if query_embeddings is not None else None
+
         # Multi-band candidate generation
         # 1. Exact matches
         exact_cands = exact.search(q_text, top_k=10) if exact else []
@@ -177,11 +183,11 @@ def build_training_pairs(
         # 2b. BM25 PyVi top candidates
         pyvi_cands = bm25_pyvi.search(q_text, top_k=50) if bm25_pyvi else []
         # 3. Dense top candidates
-        dense_cands = dense.retrieve(q_text, top_k=50) if dense else []
+        dense_cands = dense.retrieve(q_text, top_k=50, q_emb=q_emb) if dense else []
         # 4. Question memory candidates (fold-safe, excludes current qid)
-        mem_cands = memory.query(q_text, exclude_qid=qid, top_k=10) if memory else []
+        mem_cands = memory.query(q_text, exclude_qid=qid, top_k=10, q_emb=q_emb) if memory else []
         # 5. Hybrid pool
-        hybrid_cands = hybrid_engine.search_candidates(q_text, exclude_qid=qid, top_k=80)
+        hybrid_cands = hybrid_engine.search_candidates(q_text, exclude_qid=qid, top_k=80, q_emb=q_emb)
 
         # Medium negatives from lower-ranked hybrid candidates (ranks 20-80)
         medium_cands = hybrid_cands[20:] if len(hybrid_cands) > 20 else []

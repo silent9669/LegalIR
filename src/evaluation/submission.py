@@ -235,6 +235,7 @@ def create_submission_manifest(
     }
 
     if metadata:
+        manifest["metadata"] = dict(metadata)
         manifest.update(metadata)
     if extra_metadata:
         manifest.update(extra_metadata)
