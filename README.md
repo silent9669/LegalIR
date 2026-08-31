@@ -65,13 +65,13 @@ pytest tests/ -v
 
 ## 4. Kaggle GPU T4 Execution Guide
 
-The standalone notebook for Task 1 is formatted to match Task 2 (`LegalQA training`):
+The standalone notebook and dataset for Task 1 are named with the identical format as Task 2 (`LegalQA training` / `LegalQA`):
 - **Notebook Name**: **`LegalIR training`** (file: `kaggle_kernel_task1/legalir_training.ipynb`)
-- **Dataset Name**: **`LegalIR`** (or `LegalIR Task 1 Clean Artifacts` / `LegalIR dataset`)
+- **Dataset Name**: **`LegalIR`** (mounted at `/kaggle/input/legalir`)
 
 ### Step 1: Kaggle Environment Setup
 1. Open or create the Kaggle Notebook: **`LegalIR training`**.
-2. Under **Input / Data**, attach your dataset: **`LegalIR`** (or `LegalIR Task 1 Clean Artifacts`).
+2. Under **Input / Data**, attach your dataset: **`LegalIR`**.
 3. Under **Notebook settings** (right sidebar):
    - **Accelerator**: Select **GPU T4** or **GPU T4 x2**.
    - **Internet**: Toggle **On** (required to install `bm25s`, `pyvi` and download model backbones).

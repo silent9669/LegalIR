@@ -21,10 +21,13 @@ def generate_notebook():
         })
 
     # Cell 1: Overview
-    md_cell("""# UIT-DSC 2026: Task 1 - Legal Information Retrieval (SOTA Performance on T4 GPU)
-## 4-Branch Hybrid Candidate Retrieval + BGE Reranker v2 M3 Cross-Encoder Pipeline
+    md_cell("""# LegalIR training
+## High-Recall Vietnamese Legal Information Retrieval Pipeline (Task 1)
+### 4-Branch Hybrid Candidate Retrieval + BGE Reranker v2 M3 Cross-Encoder Pipeline
 
 This notebook implements the complete end-to-end training, indexing, dual-validation benchmarking, and public test submission pipeline for **Task 1: Legal Information Retrieval**.
+* Dataset: **`LegalIR`** (mounted at `/kaggle/input/legalir`)
+* Target Hardware: **Kaggle GPU T4** (FP16 Accelerated with CPU memory offloading)
 
 ### Key Architectural Components:
 1. **Fielded BM25 Micro Index**: BM25s indexing over micro-granularity chunks (Khoản/Điểm) enriched with legal metadata boosting (document numbers, titles, articles).
