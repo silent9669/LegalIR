@@ -74,18 +74,29 @@ class LegalIRPipeline:
         """Return a deterministic, duplicate-free answer for empty retrieval."""
         return self.fallback_doc_ids[: self.selector.max_k]
 
-    def _sanitize_answer(self, candidates: Iterable[Any]) -> list[str]:
+    def _sanitize_answer(self, candidates: Iterable[Any], fill_to_k: int | None = 5) -> list[str]:
         answer = self._unique_ids(candidates)
         if self.valid_doc_ids is not None:
             answer = [doc_id for doc_id in answer if doc_id in self.valid_doc_ids]
         answer = answer[: self.selector.max_k]
 
-        if len(answer) < self.selector.min_k:
+        target_len = self.selector.min_k
+        if fill_to_k is not None:
+            max_avail = len(self.valid_doc_ids) if self.valid_doc_ids is not None else self.selector.max_k
+            target_len = min(fill_to_k, max_avail, self.selector.max_k)
+
+        if len(answer) < target_len:
             for doc_id in self._fallback_answer():
                 if doc_id not in answer:
                     answer.append(doc_id)
-                if len(answer) == self.selector.max_k:
+                if len(answer) == target_len:
                     break
+            if len(answer) < target_len and self.valid_doc_ids is not None:
+                for doc_id in sorted(self.valid_doc_ids):
+                    if doc_id not in answer:
+                        answer.append(doc_id)
+                    if len(answer) == target_len:
+                        break
         return answer
 
     def predict_one(
@@ -172,8 +183,11 @@ class LegalIRPipeline:
         else:
             ranked = candidates
 
-        selected = self.selector.select(ranked, valid_doc_ids=self.valid_doc_ids)
-        return self._sanitize_answer(selected)
+        try:
+            selected = self.selector.select(ranked, valid_doc_ids=self.valid_doc_ids, fill_to_k=5)
+        except TypeError:
+            selected = self.selector.select(ranked, valid_doc_ids=self.valid_doc_ids)
+        return self._sanitize_answer(selected, fill_to_k=5)
 
     def audit_parameters(
         self,
@@ -403,6 +417,13 @@ class LegalIRPipeline:
                     raise ValueError("Strict artifact check failed: adapter param_diff <= 0 or missing")
                 if not m_data.get("adapter_checksum"):
                     raise ValueError("Strict artifact check failed: adapter checksum is missing")
+                # Verify actual weights file SHA-256 against manifest
+                weights_path = (ad_path / "adapter_model.safetensors") if (ad_path / "adapter_model.safetensors").exists() else (ad_path / "adapter_model.bin")
+                import hashlib
+                actual_adapter_sha = hashlib.sha256(weights_path.read_bytes()).hexdigest()
+                expected_sha = m_data.get("adapter_checksum", "")
+                if not expected_sha or actual_adapter_sha != expected_sha:
+                    raise ValueError(f"Strict artifact check failed: adapter checksum mismatch (expected {expected_sha}, got {actual_adapter_sha})")
                 if m_data.get("unique_training_queries", 0) <= 0:
                     raise ValueError("Strict artifact check failed: unique_training_queries <= 0")
                 if m_data.get("optimizer_steps", 0) <= 0:
@@ -417,12 +438,15 @@ class LegalIRPipeline:
                 f_manifest = f_dir / "manifest.json"
                 if not f_manifest.exists() and (f_dir.parent / "manifest.json").exists():
                     f_manifest = f_dir.parent / "manifest.json"
-                if f_manifest.exists():
-                    f_mdata = json.loads(f_manifest.read_text(encoding="utf-8"))
-                    if f_mdata.get("winning_method") and f_mdata.get("winning_method") != "learned_ranker":
-                        raise ValueError(f"Strict artifact check failed: winning_method in manifest is {f_mdata.get('winning_method')}, expected learned_ranker")
-                    if f_mdata.get("feature_training_stage") and f_mdata.get("feature_training_stage") != "post_rerank":
-                        raise ValueError(f"Strict artifact check failed: feature_training_stage is {f_mdata.get('feature_training_stage')}, expected post_rerank")
+                if not f_manifest.exists():
+                    raise FileNotFoundError(f"Strict artifact check failed: fusion manifest.json missing in {f_dir}")
+                f_mdata = json.loads(f_manifest.read_text(encoding="utf-8"))
+                if f_mdata.get("winning_method") != "learned_ranker":
+                    raise ValueError(f"Strict artifact check failed: winning_method in manifest is {f_mdata.get('winning_method')}, expected learned_ranker")
+                if f_mdata.get("feature_training_stage") != "post_rerank":
+                    raise ValueError(f"Strict artifact check failed: feature_training_stage is {f_mdata.get('feature_training_stage')}, expected post_rerank")
+                if not f_mdata.get("feature_columns"):
+                    raise ValueError("Strict artifact check failed: feature_columns in fusion manifest is empty")
 
         # 4. Exact Matcher
         exact = ExactMatcher(documents=list(doc_map.values()))
@@ -475,9 +499,11 @@ class LegalIRPipeline:
                 actual_file = next((p for p in candidates if p.is_file()), f_path)
             else:
                 actual_file = f_path
-            ranker = LightGBMRanker(model_file=actual_file)
+            ranker = LightGBMRanker(model_file=actual_file, strict=strict_artifacts)
+            if use_learned_fusion and ranker.model is None and ranker.fallback_model is None:
+                raise RuntimeError(f"Strict artifact check failed: learned fusion ranker failed to load model from {actual_file}")
         elif use_learned_fusion:
-            ranker = LightGBMRanker()
+            ranker = LightGBMRanker(strict=strict_artifacts)
         else:
             ranker = ReciprocalRankFusion()
 

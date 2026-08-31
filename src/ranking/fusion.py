@@ -234,6 +234,7 @@ class LightGBMRanker:
         num_leaves: int = 31,
         min_child_samples: int = 1,
         lambdarank_truncation_level: int = 5,
+        strict: bool = False,
     ):
         self.model = None
         self.fallback_model: LinearRanker | None = None
@@ -243,9 +244,10 @@ class LightGBMRanker:
         self.min_child_samples = int(min_child_samples)
         self.lambdarank_truncation_level = int(lambdarank_truncation_level)
         self.model_type = "lightgbm"
+        self.strict = bool(strict)
 
         if model_file is not None:
-            self.load(model_file)
+            self.load(model_file, strict=self.strict)
 
     def fit(
         self,
@@ -337,6 +339,8 @@ class LightGBMRanker:
             return []
 
         if self.model is None and self.fallback_model is None:
+            if getattr(self, "strict", False):
+                raise RuntimeError("LightGBMRanker has no active loaded model or fallback model.")
             rrf = ReciprocalRankFusion()
             return rrf.rank_candidates(candidate_records)
 
@@ -402,56 +406,64 @@ class LightGBMRanker:
             with open(meta_path, "w", encoding="utf-8") as f:
                 json.dump(meta, f, indent=2)
 
-    def load(self, file_path: str | Path):
+    def load(self, file_path: str | Path, strict: bool = False):
         """Load ranker model and metadata from disk."""
         file_path = Path(file_path)
         if not file_path.exists():
+            if strict:
+                raise FileNotFoundError(f"Ranker model file not found: {file_path}")
             return
 
         if file_path.is_dir():
             candidates = [
-                file_path / "model.json",
-                file_path / "model_full.json",
-                file_path / "fusion_model.json",
                 file_path / "model.txt",
                 file_path / "model_full.txt",
                 file_path / "fusion_model.txt",
+                file_path / "model.json",
+                file_path / "model_full.json",
+                file_path / "fusion_model.json",
             ]
             file_path = next((p for p in candidates if p.is_file()), file_path)
             if file_path.is_dir():
-                json_candidates = list(file_path.glob("*.json"))
                 txt_candidates = list(file_path.glob("*.txt"))
-                if json_candidates:
-                    file_path = json_candidates[0]
-                elif txt_candidates:
+                json_candidates = list(file_path.glob("*.json"))
+                if txt_candidates:
                     file_path = txt_candidates[0]
+                elif json_candidates:
+                    file_path = json_candidates[0]
 
-        meta_path = file_path.with_suffix(".json")
-        txt_path = file_path.with_suffix(".txt")
+        # 1. Inspect if content is JSON (e.g. linear_ridge metadata or lightgbm config)
+        if file_path.is_file():
+            try:
+                content = file_path.read_text(encoding="utf-8").strip()
+                if content.startswith("{") and content.endswith("}"):
+                    meta = json.loads(content)
+                    if meta.get("model_type") == "linear_ridge":
+                        self.fallback_model = LinearRanker()
+                        self.fallback_model.load(file_path)
+                        self.model = None
+                        self.model_type = "linear_ridge"
+                        self.feature_cols = list(self.fallback_model.feature_cols)
+                        return
+                    elif meta.get("model_type") == "lightgbm" and "model_file" in meta:
+                        m_target = file_path.parent / meta["model_file"]
+                        if m_target.is_file():
+                            file_path = m_target
+            except Exception:
+                pass
 
-        if file_path.suffix == ".json" and file_path.exists():
-            with open(file_path, "r", encoding="utf-8") as f:
-                meta = json.load(f)
-            if meta.get("model_type") == "linear_ridge":
-                self.fallback_model = LinearRanker()
-                self.fallback_model.load(file_path)
-                self.model = None
-                self.model_type = "linear_ridge"
-                self.feature_cols = self.fallback_model.feature_cols
-                return
-            elif meta.get("model_type") == "lightgbm":
-                model_file = file_path.parent / meta.get("model_file", txt_path.name)
-                if model_file.exists():
-                    file_path = model_file
-
-        if str(file_path).endswith(".txt") or file_path.exists():
+        # 2. Attempt LightGBM Booster loading
+        if file_path.is_file():
             try:
                 import lightgbm as lgb
                 self.model = lgb.Booster(model_file=str(file_path))
-                self.feature_cols = self.model.feature_name()
+                self.feature_cols = list(self.model.feature_name())
                 self.model_type = "lightgbm"
                 self.fallback_model = None
+                return
             except Exception as e:
+                if strict:
+                    raise RuntimeError(f"Could not load LightGBM Booster from {file_path}: {e}") from e
                 print(f"Warning: Could not load LightGBM Booster from {file_path}: {e}")
 
 

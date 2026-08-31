@@ -49,6 +49,7 @@ class TopKSelector:
         ranked_candidates: list[Any],
         top_k: int | None = None,
         valid_doc_ids: set[str] | None = None,
+        fill_to_k: int | None = None,
     ) -> list[str]:
         """Return unique string IDs, capped by the requested value and five."""
         if top_k is None:
@@ -70,8 +71,14 @@ class TopKSelector:
             if len(selected) == limit:
                 break
 
-        # If empty or fewer than min_k, backfill from fallbacks or valid IDs if available
-        if len(selected) < self.min_k:
+        # Determine target answer length (default min_k, or fill_to_k if requested)
+        target_len = self.min_k
+        if fill_to_k is not None:
+            max_avail = len(valid_doc_ids) if valid_doc_ids is not None else limit
+            target_len = min(fill_to_k, max_avail, limit)
+
+        # If empty or fewer than target_len, backfill from fallbacks or valid IDs if available
+        if len(selected) < target_len:
             pool = self.fallback_doc_ids
             if valid_doc_ids is not None:
                 pool = [d for d in pool if d in valid_doc_ids]
@@ -82,10 +89,18 @@ class TopKSelector:
                 if fb not in seen:
                     seen.add(fb)
                     selected.append(fb)
-                if len(selected) == limit:
+                if len(selected) == target_len:
                     break
 
-        if selected and not self.min_k <= len(selected) <= self.max_k:
+            if len(selected) < target_len and valid_doc_ids is not None:
+                for fb in sorted(valid_doc_ids):
+                    if fb not in seen:
+                        seen.add(fb)
+                        selected.append(fb)
+                    if len(selected) == target_len:
+                        break
+
+        if selected and not 1 <= len(selected) <= self.max_k:
             raise ValueError("selected answer must contain between 1 and 5 IDs")
         return selected
 

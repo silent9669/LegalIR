@@ -129,6 +129,7 @@ class OOFRunner:
         self.dense: DenseMacroRetriever | None = None
         self.exact: ExactMatcher | None = None
         self.selector = TopKSelector(max_k=5)
+        self.doc_disjoint_report: dict[str, Any] = {}
 
     def load_data(self) -> None:
         """Load canonical dataset tables and build lookups."""
@@ -784,6 +785,7 @@ class OOFRunner:
         with open(report_path, "w", encoding="utf-8") as f:
             json.dump(final_report, f, indent=2)
 
+        self.doc_disjoint_report = final_report
         print(
             f"Document-Disjoint Split: Retrieval Recall@5 = {retrieval_metrics['recall@5'] * 100:.2f}% | "
             f"Trained System Recall@5 = {trained_system_metrics['recall@5'] * 100:.2f}% | "

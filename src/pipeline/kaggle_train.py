@@ -128,19 +128,30 @@ def get_git_commit(repo_root: Path | None = None) -> str:
         return "unknown"
 
 
+CANONICAL_REQUIRED_FILES = {
+    "documents.parquet",
+    "chunks.parquet",
+    "queries_train.parquet",
+    "qrels_train.parquet",
+}
+
+
 def discover_data_dir(
     data_dir: str | Path | None = None, repo_root: Path | None = None
 ) -> Path:
     """Discover canonical dataset or build from raw competition files if missing."""
     if data_dir is not None:
         p = Path(data_dir)
-        if p.exists() and (p / "documents.parquet").exists():
+        if p.exists() and all((p / f).exists() for f in CANONICAL_REQUIRED_FILES):
             return p.resolve()
         elif p.exists():
             return p.resolve()
 
     repo = repo_root or Path.cwd()
     candidate_paths = [
+        Path("/kaggle/input/legalir"),
+        Path("/kaggle/input/legalir/artifacts/task1/data"),
+        Path("/kaggle/input/legalir/artifacts/shared/canonical/v2"),
         Path("/kaggle/input/legalir-task1/artifacts/task1/data"),
         Path("/kaggle/input/legalir-task-1/artifacts/task1/data"),
         Path("/kaggle/input/uit-dsc-2026-task1/artifacts/task1/data"),
@@ -151,17 +162,21 @@ def discover_data_dir(
         Path.cwd() / "artifacts/task1/data",
     ]
     for cand in candidate_paths:
-        if cand.exists() and (cand / "documents.parquet").exists():
+        if cand.exists() and all((cand / f).exists() for f in CANONICAL_REQUIRED_FILES):
             return cand.resolve()
 
     # Search for raw files
     raw_zip = None
     train_json = None
     for cand_zip in [
+        Path("/kaggle/input/legalir/selected-contexts.zip"),
+        Path("/kaggle/input/legalir/artifacts/raw/selected-contexts.zip"),
+        Path("/kaggle/input/legalir/artifacts/shared/raw/selected-contexts.zip"),
         Path("/kaggle/input/legalir-task1/selected-contexts.zip"),
         Path("/kaggle/input/legalir-task-1/selected-contexts.zip"),
         Path("/kaggle/input/uit-dsc-2026-task1/selected-contexts.zip"),
         repo / "artifacts/shared/raw/selected-contexts.zip",
+        repo / "artifacts/raw/selected-contexts.zip",
         repo / "selected-contexts.zip",
     ]:
         if cand_zip.exists():
@@ -169,10 +184,14 @@ def discover_data_dir(
             break
 
     for cand_train in [
+        Path("/kaggle/input/legalir/train.json"),
+        Path("/kaggle/input/legalir/artifacts/raw/train.json"),
+        Path("/kaggle/input/legalir/artifacts/shared/raw/train.json"),
         Path("/kaggle/input/legalir-task1/train.json"),
         Path("/kaggle/input/legalir-task-1/train.json"),
         Path("/kaggle/input/uit-dsc-2026-task1/train.json"),
         repo / "artifacts/shared/raw/train.json",
+        repo / "artifacts/raw/train.json",
         repo / "train.json",
     ]:
         if cand_train.exists():
@@ -210,12 +229,17 @@ def discover_public_test_file(
 
     repo = repo_root or Path.cwd()
     for cand in [
+        Path("/kaggle/input/legalir/public-official.json"),
+        Path("/kaggle/input/legalir/artifacts/raw/public-official.json"),
+        Path("/kaggle/input/legalir/artifacts/shared/raw/public-official.json"),
         Path("/kaggle/input/legalir-task1/public-official.json"),
         Path("/kaggle/input/legalir-task-1/public-official.json"),
         Path("/kaggle/input/uit-dsc-2026-task1/public-official.json"),
+        Path("/kaggle/input/legalir-dataset/public-official.json"),
         repo / "artifacts/shared/raw/public-official.json",
-        repo / "public-official.json",
         repo / "artifacts/raw/public-official.json",
+        repo / "public-official.json",
+        Path.cwd() / "public-official.json",
     ]:
         if cand.exists():
             return cand.resolve()
@@ -268,7 +292,14 @@ def run_kaggle_pipeline(
     is_full = run_mode_str == "full"
 
     if strict_artifacts is None:
-        strict_artifacts = is_full
+        strict_artifacts = is_full or is_gpu_smoke
+
+    if torch.cuda.is_available():
+        for i in range(torch.cuda.device_count()):
+            try:
+                torch.cuda.reset_peak_memory_stats(i)
+            except Exception:
+                pass
 
     print("=" * 80)
     print("LEGALIR TASK 1: KAGGLE T4 x2 PRODUCTION ORCHESTRATOR")
@@ -438,6 +469,8 @@ def run_kaggle_pipeline(
         try:
             dense_retriever = DenseMacroRetriever.load(dense_dir, device=dense_device)
         except Exception as e:
+            if is_full or is_gpu_smoke:
+                raise RuntimeError(f"Failed to load DEk21 Dense index from {dense_dir} in {run_mode_str.upper()} mode: {e}") from e
             print(f"[-] Warning: Failed to load dense index: {e}")
     elif not is_smoke:
         print(f"[*] Building DEk21 Dense index on {dense_device}...")
@@ -451,10 +484,16 @@ def run_kaggle_pipeline(
             device=dense_device,
             dimension=768,
         )
-        dense_batch = 128 if "cuda" in dense_device else 32
-        dense_retriever.fit(macro_chunks.to_dict("records"), batch_size=dense_batch)
-        dense_retriever.save(dense_dir)
-        print(f"[+] DEk21 Dense Index ready ({len(dense_retriever.doc_ids):,} chunks).")
+        dense_batch = 128 if "cuda" in str(dense_device) else 32
+        try:
+            dense_retriever.fit(macro_chunks.to_dict("records"), batch_size=dense_batch)
+            dense_retriever.save(dense_dir)
+            print(f"[+] DEk21 Dense Index ready ({len(dense_retriever.doc_ids):,} chunks).")
+        except Exception as e:
+            if is_full or is_gpu_smoke:
+                raise RuntimeError(f"Failed to build DEk21 Dense index on {dense_device} in {run_mode_str.upper()} mode: {e}") from e
+            print(f"[-] Warning: Dense index building failed: {e}")
+            dense_retriever = None
 
     # 7. Precompute Train Query Dense Embeddings on GPU 0 (P1.10)
     train_query_embs: dict[str, np.ndarray] = {}
@@ -468,13 +507,15 @@ def run_kaggle_pipeline(
         try:
             print(f"[*] Precomputing train query embeddings for {len(qids):,} queries on {dense_device}...")
             embs = dense_retriever.encode_queries(
-                qtexts, batch_size=128 if "cuda" in dense_device else 32
+                qtexts, batch_size=128 if "cuda" in str(dense_device) else 32
             )
             for qid, emb in zip(qids, embs):
                 train_query_embs[qid] = emb
             np.save(str(index_dir / "train_query_embeddings.npy"), embs)
             print(f"[+] Precomputed and cached {len(train_query_embs):,} train query dense embeddings.")
         except Exception as e:
+            if is_full or is_gpu_smoke:
+                raise RuntimeError(f"Failed to precompute train query embeddings on {dense_device} in {run_mode_str.upper()} mode: {e}") from e
             print(f"[-] Warning: query embedding precomputation skipped: {e}")
 
     # 8. Out-of-Fold (OOF) 5-Fold Cross-Validation with Fold-Trained LoRA Rerankers (P1.1, P1.2, P1.7, P1.10)
@@ -663,6 +704,8 @@ def run_kaggle_pipeline(
                 public_q_embs[str(qid)] = emb
             print(f"[+] Precomputed {len(public_q_embs):,} public query embeddings for reuse.")
         except Exception as e:
+            if is_full or is_gpu_smoke:
+                raise RuntimeError(f"Failed to precompute public query embeddings on {dense_device} in {run_mode_str.upper()} mode: {e}") from e
             print(f"[-] Warning: public query embedding precomputation skipped: {e}")
 
     for idx, (qid, q_val) in enumerate(q_items, start=1):
@@ -691,7 +734,8 @@ def run_kaggle_pipeline(
     if is_full:
         assert set(predictions.keys()) == expected_qids, f"Prediction keys mismatch with official public keys: missing {len(expected_qids - set(predictions.keys()))}, extra {len(set(predictions.keys()) - expected_qids)}"
 
-    val_res = validate_submission(sub_json, expected_qids=expected_qids)
+    official_doc_ids = set(df_docs["doc_id"].astype(str)) if "doc_id" in df_docs.columns else None
+    val_res = validate_submission(sub_json, expected_qids=expected_qids, corpus_doc_ids=official_doc_ids)
     zip_val_res = validate_submission_zip(sub_zip)
 
     is_submission_valid = bool(val_res.get("is_valid") and zip_val_res.get("is_valid"))
@@ -721,6 +765,57 @@ def run_kaggle_pipeline(
             "submission_valid": is_submission_valid,
         },
     )
+
+    # 13b. Hardware Placement & Peak VRAM Verification (Section 3)
+    dense_actual_dev = "cpu"
+    if hasattr(pipeline.hybrid_engine, "dense") and pipeline.hybrid_engine.dense is not None:
+        dense_m = getattr(pipeline.hybrid_engine.dense, "model", None)
+        if dense_m is not None:
+            try:
+                dense_actual_dev = str(next(dense_m.parameters()).device)
+            except Exception:
+                dense_actual_dev = str(getattr(pipeline.hybrid_engine.dense, "device", "cpu"))
+
+    reranker_actual_dev = "cpu"
+    if pipeline.reranker is not None:
+        reranker_m = getattr(pipeline.reranker, "model", None)
+        if reranker_m is not None:
+            try:
+                reranker_actual_dev = str(next(reranker_m.parameters()).device)
+            except Exception:
+                reranker_actual_dev = str(getattr(pipeline.reranker, "device", "cpu"))
+
+    if is_gpu_smoke and torch.cuda.is_available() and torch.cuda.device_count() >= 2:
+        if dense_device == "cuda:0" and not dense_actual_dev.startswith("cuda:0"):
+            raise RuntimeError(f"Dense model device mismatch: requested {dense_device}, actual {dense_actual_dev}")
+        if reranker_device == "cuda:1" and not reranker_actual_dev.startswith("cuda:1"):
+            raise RuntimeError(f"Reranker model device mismatch: requested {reranker_device}, actual {reranker_actual_dev}")
+
+    if is_gpu_smoke or is_full:
+        gpu0_alloc = torch.cuda.max_memory_allocated(0) if torch.cuda.is_available() and torch.cuda.device_count() > 0 else 0
+        gpu1_alloc = torch.cuda.max_memory_allocated(1) if torch.cuda.is_available() and torch.cuda.device_count() > 1 else 0
+        gpu0_res = torch.cuda.max_memory_reserved(0) if torch.cuda.is_available() and torch.cuda.device_count() > 0 else 0
+        gpu1_res = torch.cuda.max_memory_reserved(1) if torch.cuda.is_available() and torch.cuda.device_count() > 1 else 0
+
+        gpu_smoke_report = {
+            "dense_requested": dense_device,
+            "dense_actual": dense_actual_dev,
+            "reranker_requested": reranker_device,
+            "reranker_actual": reranker_actual_dev,
+            "gpu0_peak_allocated_bytes": int(gpu0_alloc),
+            "gpu1_peak_allocated_bytes": int(gpu1_alloc),
+            "gpu0_peak_reserved_bytes": int(gpu0_res),
+            "gpu1_peak_reserved_bytes": int(gpu1_res),
+            "optimizer_steps": int(final_reranker_report.get("optimizer_steps", 0)),
+            "param_diff": float(final_reranker_report.get("param_diff", 0.0) or 0.0),
+            "adapter_checksum": str(final_reranker_report.get("adapter_checksum", "")),
+            "strict_artifacts": bool(strict_artifacts),
+            "fusion_crossfit_folds": int(oof_runner.num_folds),
+            "oom": False,
+        }
+        report_path = working_path / "gpu_smoke_report.json"
+        report_path.write_text(json.dumps(gpu_smoke_report, indent=2), encoding="utf-8")
+        print(f"[+] Saved GPU smoke hardware report to {report_path}")
 
     # Copy files to /kaggle/working root if running in Kaggle environment and in full mode AFTER manifest creation
     if is_full and Path("/kaggle/working").exists() and is_submission_valid:
@@ -779,16 +874,7 @@ def run_kaggle_pipeline(
     if doc_disjoint_rec5 > 0:
         print(f"  - Doc-Disjoint Trained Reranker Recall@5 : {doc_disjoint_rec5 * 100:.4f}%")
     print(f"  - Parameter Utilization                  : {audit_report.get('total_learned_parameters', 0):,} / 4,000,000,000 ({audit_report.get('budget_utilization_pct', 0.0):.2f}%)")
-    print("=" * 80)
-    print("\n" + "=" * 80)
-    print(f"LEGALIR TASK 1 PIPELINE RUN COMPLETE in {total_runtime:.2f}s")
-    print(f"  - Validation Status     : {'PASS' if is_submission_valid else 'FAIL'}")
-    print(f"  - Submission JSON       : {sub_json}")
-    print(f"  - Submission ZIP        : {sub_zip} ({sub_zip.stat().st_size:,} bytes)")
-    print(f"  - Manifest JSON         : {manifest_path}")
-    print(f"  - Full OOF Recall@5     : {cv_report.get('mean_recall@5', 0.0) * 100:.4f}%")
-    print(f"  - Full OOF Precision@5  : {cv_report.get('mean_precision@5', 0.0) * 100:.4f}%")
-    print(f"  - Parameter Utilization : {audit_report.get('total_learned_parameters', 0):,} / 4,000,000,000 ({audit_report.get('budget_utilization_pct', 0.0):.2f}%)")
+    print(f"  - Submission Status                      : {'SUBMITTABLE_OFFICIAL' if is_full else f'NON_SUBMITTABLE_{run_mode_str.upper()}'}")
     print("=" * 80)
 
     return KaggleRunResult(
