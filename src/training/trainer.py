@@ -358,6 +358,11 @@ class RerankerTrainer:
         loss_history: list[float] = []
         accumulated_loss = 0.0
         optimizer.zero_grad()
+        seen_query_ids = set()
+        nonfinite_loss_count = 0
+
+        # AMP GradScaler for stable mixed precision training on CUDA
+        scaler = torch.amp.GradScaler("cuda", enabled=self.fp16)
 
         print(f"Starting training: {total_training_steps} steps, device={self.device}, fp16={self.fp16}")
 
@@ -365,6 +370,10 @@ class RerankerTrainer:
             for batch_idx, batch in enumerate(self.train_loader):
                 if global_step >= total_training_steps:
                     break
+
+                for qid in batch.get("query_ids", []):
+                    if qid:
+                        seen_query_ids.add(str(qid))
 
                 inputs = {
                     k: v.to(self.device)
@@ -398,15 +407,23 @@ class RerankerTrainer:
                         labels = batch["labels"].to(self.device)
                         loss = self.loss_fn(logits, labels)
 
+                    if not torch.isfinite(loss):
+                        nonfinite_loss_count += 1
+                        raise RuntimeError(f"Non-finite training loss encountered: {loss.item()} at step {global_step}")
+
                     # Scale for gradient accumulation
                     loss_to_backprop = loss / self.gradient_accumulation_steps
 
-                loss_to_backprop.backward()
+                scaler.scale(loss_to_backprop).backward()
                 accumulated_loss += loss.item()
 
                 if (batch_idx + 1) % self.gradient_accumulation_steps == 0 or (batch_idx + 1) == len(self.train_loader):
-                    torch.nn.utils.clip_grad_norm_(trainable_params, self.max_grad_norm)
-                    optimizer.step()
+                    scaler.unscale_(optimizer)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, self.max_grad_norm)
+                    if not torch.isfinite(grad_norm):
+                        raise RuntimeError(f"Non-finite gradient norm encountered: {grad_norm} at step {global_step}")
+                    scaler.step(optimizer)
+                    scaler.update()
                     scheduler.step()
                     optimizer.zero_grad()
 
@@ -436,6 +453,10 @@ class RerankerTrainer:
         elapsed_time = time.time() - start_time
         final_train_loss = loss_history[-1] if loss_history else 0.0
 
+        total_input_queries = len(set(r.get("query_id") for r in getattr(self.train_dataset, "records", []))) if hasattr(self.train_dataset, "records") else len(seen_query_ids)
+        actual_seen_count = len(seen_query_ids)
+        coverage_pct = round((actual_seen_count / max(1, total_input_queries)) * 100.0, 2)
+
         report = {
             "status": "completed",
             "global_steps": global_step,
@@ -447,6 +468,10 @@ class RerankerTrainer:
             "total_params": self.peft_meta.get("total_params", sum(p.numel() for p in self.model.parameters())),
             "trainable_percent": self.peft_meta.get("trainable_percent", 100.0),
             "param_diff": float(param_diff),
+            "actual_unique_queries_seen": actual_seen_count,
+            "actual_query_coverage_pct": coverage_pct,
+            "actual_examples_seen": global_step * self.batch_size * self.gradient_accumulation_steps,
+            "nonfinite_loss_count": nonfinite_loss_count,
             "weight_norm_before": float(weight_norm_before),
             "weight_norm_after": float(weight_norm_after),
             "weight_norm_change": float(weight_norm_change),

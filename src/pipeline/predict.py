@@ -502,6 +502,17 @@ class LegalIRPipeline:
             ranker = LightGBMRanker(model_file=actual_file, strict=strict_artifacts)
             if use_learned_fusion and ranker.model is None and ranker.fallback_model is None:
                 raise RuntimeError(f"Strict artifact check failed: learned fusion ranker failed to load model from {actual_file}")
+            if strict_artifacts:
+                f_dir = f_path if f_path.is_dir() else f_path.parent
+                f_manifest = f_dir / "manifest.json"
+                if not f_manifest.exists() and (f_dir.parent / "manifest.json").exists():
+                    f_manifest = f_dir.parent / "manifest.json"
+                if f_manifest.exists():
+                    f_mdata = json.loads(f_manifest.read_text(encoding="utf-8"))
+                    m_cols = list(f_mdata.get("feature_columns", []))
+                    r_cols = list(getattr(ranker, "feature_cols", []))
+                    if m_cols and r_cols and m_cols != r_cols:
+                        raise ValueError(f"Strict artifact check failed: manifest feature columns {m_cols} do not match loaded model feature columns {r_cols}")
         elif use_learned_fusion:
             ranker = LightGBMRanker(strict=strict_artifacts)
         else:

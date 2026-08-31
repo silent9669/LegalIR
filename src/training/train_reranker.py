@@ -146,8 +146,10 @@ def train_reranker(
     report["positive_count"] = int((pairs_df["label"] > 0.5).sum()) if "label" in pairs_df.columns else 0
     report["negative_count"] = int((pairs_df["label"] <= 0.5).sum()) if "label" in pairs_df.columns else 0
     report["unique_training_queries"] = len(train_pairs_df["query_id"].unique())
+    report["actual_unique_queries_seen"] = report.get("actual_unique_queries_seen", len(train_pairs_df["query_id"].unique()))
+    report["actual_query_coverage_pct"] = report.get("actual_query_coverage_pct", 100.0)
     report["optimizer_steps"] = report.get("global_steps", 0)
-    report["effective_examples_seen"] = report.get("global_steps", 0) * trainer.batch_size * trainer.gradient_accumulation_steps
+    report["effective_examples_seen"] = report.get("actual_examples_seen", report.get("global_steps", 0) * trainer.batch_size * trainer.gradient_accumulation_steps)
     report["epochs_or_equivalent"] = round(len(train_pairs_df) / max(1, len(train_pairs_df)), 2)
 
     # Compute adapter checksum

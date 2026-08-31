@@ -359,7 +359,7 @@ def main():
             run_mode=args.run_mode,
             repo_root=REPO_ROOT,
             config_path=args.config,
-            devices=["cpu", "cpu"] if args.tiny else None,
+            devices=["cpu", "cpu"] if (args.tiny and args.run_mode == "smoke") else None,
         )
     except Exception as e:
         print(f"\n[!] FATAL PIPELINE ERROR: {e}")

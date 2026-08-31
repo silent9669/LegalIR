@@ -42,6 +42,9 @@ class CrossEncoderReranker:
         self.tokenizer = None
         self.model = None
         self.score_fn = score_fn
+        self.oom_events: int = 0
+        self.initial_batch_size: int = 16
+        self.min_successful_batch_size: int = 16
 
     def _resolve_model_path(
         self,
@@ -245,12 +248,19 @@ class CrossEncoderReranker:
                 all_scores.extend(float(score) for score in batch_scores)
             except RuntimeError as exc:
                 message = str(exc).lower()
-                if ("out of memory" not in message and "mps" not in message) or batch_size == 1:
+                if ("out of memory" in message or "cuda error: out of memory" in message or "mps" in message):
+                    self.oom_events += 1
+                    if batch_size == 1:
+                        raise
+                    half_batch_size = max(1, batch_size // 2)
+                    self.min_successful_batch_size = min(self.min_successful_batch_size, half_batch_size)
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    all_scores.extend(
+                        self.score_pairs(batch, batch_size=half_batch_size, max_length=max_length)
+                    )
+                else:
                     raise
-                half_batch_size = max(1, batch_size // 2)
-                all_scores.extend(
-                    self.score_pairs(batch, batch_size=half_batch_size, max_length=max_length)
-                )
         return all_scores
 
     def aggregate_document(

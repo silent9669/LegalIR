@@ -142,10 +142,14 @@ def discover_data_dir(
     """Discover canonical dataset or build from raw competition files if missing."""
     if data_dir is not None:
         p = Path(data_dir)
-        if p.exists() and all((p / f).exists() for f in CANONICAL_REQUIRED_FILES):
-            return p.resolve()
-        elif p.exists():
-            return p.resolve()
+        if not p.exists():
+            raise FileNotFoundError(f"Explicitly provided data_dir does not exist: {data_dir}")
+        missing_files = [f for f in CANONICAL_REQUIRED_FILES if not (p / f).exists()]
+        if missing_files:
+            raise FileNotFoundError(
+                f"Explicitly provided data_dir at {p} is missing required canonical files: {missing_files}"
+            )
+        return p.resolve()
 
     repo = repo_root or Path.cwd()
     candidate_paths = [
@@ -286,10 +290,23 @@ def run_kaggle_pipeline(
     18. Support for run_mode="smoke", "gpu_smoke", and "full".
     """
     t_start = time.time()
+    VALID_RUN_MODES = {"smoke", "gpu_smoke", "full"}
     run_mode_str = str(run_mode).lower().strip()
+    if run_mode_str not in VALID_RUN_MODES:
+        raise ValueError(
+            f"Invalid run_mode: '{run_mode}'. Must be one of {sorted(VALID_RUN_MODES)}"
+        )
     is_smoke = run_mode_str == "smoke"
     is_gpu_smoke = run_mode_str == "gpu_smoke"
     is_full = run_mode_str == "full"
+
+    if is_gpu_smoke:
+        if not torch.cuda.is_available():
+            raise RuntimeError("gpu_smoke mode requires CUDA but torch.cuda.is_available() is False")
+        if torch.cuda.device_count() < 2:
+            raise RuntimeError(
+                f"gpu_smoke mode requires Kaggle T4 x2 / >=2 CUDA devices (found {torch.cuda.device_count()} device(s))"
+            )
 
     if strict_artifacts is None:
         strict_artifacts = is_full or is_gpu_smoke
@@ -367,8 +384,8 @@ def run_kaggle_pipeline(
 
     val_report = validate_canonical_dataset(canonical_data_dir)
     print(f"[+] Canonical Dataset Validation: is_valid = {val_report.get('is_valid')}")
-    if not val_report.get("is_valid") and is_full:
-        raise ValueError(f"Canonical dataset validation failed in FULL mode: {val_report.get('errors')}")
+    if not val_report.get("is_valid") and (is_full or is_gpu_smoke):
+        raise ValueError(f"Canonical dataset validation failed in {run_mode_str.upper()} mode: {val_report.get('errors')}")
 
     df_docs = pd.read_parquet(docs_path)
     df_chunks = pd.read_parquet(chunks_path)
@@ -402,17 +419,17 @@ def run_kaggle_pipeline(
     if not resolved_reranker_config.exists():
         resolved_reranker_config = resolve_repo_path("configs/pipeline.yaml", root_path)
 
-    audit_json_path = working_path / "parameter_audit.json"
-    audit_report = audit_system_parameters(
+    preflight_json_path = working_path / "preflight_parameter_audit.json"
+    preflight_audit_report = audit_system_parameters(
         config_path=resolved_runtime_config if resolved_runtime_config.exists() else None,
-        output_json=audit_json_path,
+        output_json=preflight_json_path,
         raise_on_violation=True,
         offline_fallback=True,
     )
     print(
-        f"[+] Parameter Budget Preflight: {audit_report['total_learned_parameters']:,} params "
-        f"({audit_report['total_parameters_billions']:.4f}B / 4.0B limit, "
-        f"{audit_report['budget_utilization_pct']:.2f}% utilization). PASS"
+        f"[+] Parameter Budget Preflight: {preflight_audit_report['total_learned_parameters']:,} params "
+        f"({preflight_audit_report['total_parameters_billions']:.4f}B / 4.0B limit, "
+        f"{preflight_audit_report['budget_utilization_pct']:.2f}% utilization). PASS"
     )
 
     # Validate explicit reranker training config
@@ -666,6 +683,7 @@ def run_kaggle_pipeline(
     fusion_model_load_path = (checkpoints_dir / "fusion_final") if use_learned_fusion else None
     reranker_adapter_load_path = final_reranker_dir if final_reranker_dir.exists() else None
 
+    final_audit_json = working_path / "parameter_audit.json"
     pipeline = LegalIRPipeline.load_pipeline(
         data_dir=canonical_data_dir,
         index_dir=index_dir,
@@ -677,8 +695,12 @@ def run_kaggle_pipeline(
         reranker_device=reranker_device,
         strict_artifacts=strict_artifacts,
         audit_preflight=True,
-        audit_output_json=working_path / "parameter_audit.json",
+        audit_output_json=final_audit_json,
         reranker_model_name="mock" if is_smoke else "BAAI/bge-reranker-v2-m3",
+    )
+    final_audit_report = pipeline.audit_parameters(
+        output_json=final_audit_json,
+        raise_on_violation=True,
     )
 
     t0_infer = time.time()
@@ -740,6 +762,10 @@ def run_kaggle_pipeline(
 
     is_submission_valid = bool(val_res.get("is_valid") and zip_val_res.get("is_valid"))
     print(f"[+] Submission Validation: JSON = {val_res.get('is_valid')} | ZIP = {zip_val_res.get('is_valid')} | Overall = {is_submission_valid}")
+    if is_full and not is_submission_valid:
+        raise RuntimeError(
+            f"Final official submission failed validation: JSON errors={val_res.get('errors')} | ZIP errors={zip_val_res.get('errors')}"
+        )
 
     # 13. Manifest, Hashes, Reports & Parameter Audits
     git_sha = get_git_commit(root_path)
@@ -749,7 +775,7 @@ def run_kaggle_pipeline(
         submission_zip_path=sub_zip,
         output_path=manifest_path,
         git_commit=git_sha,
-        parameter_total=audit_report.get("total_learned_parameters", 0),
+        parameter_total=final_audit_report.get("total_learned_parameters", 0),
         model_names_and_revisions=[
             {"name": "CODE4LIFEOFFICIAL/huydang-dek21-embedding-v2", "role": "dense_embedding"},
             {"name": "BAAI/bge-reranker-v2-m3", "role": "cross_encoder_reranker"},
@@ -797,6 +823,9 @@ def run_kaggle_pipeline(
         gpu0_res = torch.cuda.max_memory_reserved(0) if torch.cuda.is_available() and torch.cuda.device_count() > 0 else 0
         gpu1_res = torch.cuda.max_memory_reserved(1) if torch.cuda.is_available() and torch.cuda.device_count() > 1 else 0
 
+        oom_ev = int(getattr(pipeline.reranker, "oom_events", 0)) if pipeline.reranker is not None else 0
+        min_batch = int(getattr(pipeline.reranker, "min_successful_batch_size", 16)) if pipeline.reranker is not None else 16
+
         gpu_smoke_report = {
             "dense_requested": dense_device,
             "dense_actual": dense_actual_dev,
@@ -806,12 +835,16 @@ def run_kaggle_pipeline(
             "gpu1_peak_allocated_bytes": int(gpu1_alloc),
             "gpu0_peak_reserved_bytes": int(gpu0_res),
             "gpu1_peak_reserved_bytes": int(gpu1_res),
+            "oom_events": oom_ev,
+            "oom": bool(oom_ev > 0),
+            "stable_reranker_batch_size": min_batch,
             "optimizer_steps": int(final_reranker_report.get("optimizer_steps", 0)),
             "param_diff": float(final_reranker_report.get("param_diff", 0.0) or 0.0),
+            "actual_unique_queries_seen": int(final_reranker_report.get("actual_unique_queries_seen", 0)),
+            "actual_query_coverage_pct": float(final_reranker_report.get("actual_query_coverage_pct", 0.0)),
             "adapter_checksum": str(final_reranker_report.get("adapter_checksum", "")),
             "strict_artifacts": bool(strict_artifacts),
             "fusion_crossfit_folds": int(oof_runner.num_folds),
-            "oom": False,
         }
         report_path = working_path / "gpu_smoke_report.json"
         report_path.write_text(json.dumps(gpu_smoke_report, indent=2), encoding="utf-8")
@@ -843,7 +876,7 @@ def run_kaggle_pipeline(
             "candidate_recall@200": cv_report.get("mean_candidate@200", 0.0),
             "runtime_per_query_ms": cv_report.get("runtime_per_query_ms", 0.0),
             "fusion_winner": winning_fusion_method,
-            "total_learned_parameters": audit_report.get("total_learned_parameters", 0),
+            "total_learned_parameters": final_audit_report.get("total_learned_parameters", 0),
             "public_predictions_count": len(predictions),
             "git_commit": git_sha,
         }
@@ -873,7 +906,7 @@ def run_kaggle_pipeline(
     print(f"  - Candidate Recall@150                   : {cv_report.get('mean_candidate@150', 0.0) * 100:.4f}%")
     if doc_disjoint_rec5 > 0:
         print(f"  - Doc-Disjoint Trained Reranker Recall@5 : {doc_disjoint_rec5 * 100:.4f}%")
-    print(f"  - Parameter Utilization                  : {audit_report.get('total_learned_parameters', 0):,} / 4,000,000,000 ({audit_report.get('budget_utilization_pct', 0.0):.2f}%)")
+    print(f"  - Parameter Utilization                  : {final_audit_report.get('total_learned_parameters', 0):,} / 4,000,000,000 ({final_audit_report.get('budget_utilization_pct', 0.0):.2f}%)")
     print(f"  - Submission Status                      : {'SUBMITTABLE_OFFICIAL' if is_full else f'NON_SUBMITTABLE_{run_mode_str.upper()}'}")
     print("=" * 80)
 
@@ -882,7 +915,7 @@ def run_kaggle_pipeline(
         submission_path=sub_json,
         submission_zip_path=sub_zip,
         manifest_path=manifest_path,
-        audit_report=audit_report,
+        audit_report=final_audit_report,
         cv_report=cv_report,
         fusion_report=fusion_report,
         public_predictions_count=len(predictions),
