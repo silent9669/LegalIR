@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 
-def build_legalir_notebook() -> dict:
+def build_legalir_notebook(expected_commit: str = "76bb4c3a483ee7946bc5a8b19c42a0b6e5e0f2a4") -> dict:
     """Build the clean, thin 5-cell Kaggle orchestrator notebook."""
     cells = []
 
@@ -117,7 +117,7 @@ def build_legalir_notebook() -> dict:
             "    Path(\"/kaggle/working\"),\n",
             "]\n",
             "\n",
-            "EXPECTED_COMMIT = os.environ.get(\"LEGALIR_COMMIT_SHA\", \"2c1b6e8bcfb3738ccd369d181a92ac68f3f98f12\")\n",
+            f'EXPECTED_COMMIT = os.environ.get("LEGALIR_COMMIT_SHA", "{expected_commit}")\n',
             "REPO_ROOT = None\n",
             "for p in possible_repo_paths:\n",
             "    if (p / \"src\" / \"pipeline\").exists():\n",

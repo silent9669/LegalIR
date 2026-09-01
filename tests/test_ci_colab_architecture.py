@@ -485,17 +485,17 @@ def test_colab_smoke_report_schema_and_execution(tmp_path, monkeypatch):
         "dataset_identity",
         "subset_manifest_hash",
         "split_provenance_sha",
-        "duplicate_blacklist_count",
+        "duplicate_blacklist",
         "dense_device",
         "dense_backend",
         "dense_embeddings_finite",
+        "dense_telemetry",
         "reranker_device",
         "optimizer_steps",
         "loss_finite",
         "param_diff",
-        "adapter_sha256",
-        "adapter_params",
-        "total_learned_params",
+        "adapter_verification",
+        "parameter_audit",
         "prediction_validation",
         "stage_timings",
         "result",
@@ -505,7 +505,7 @@ def test_colab_smoke_report_schema_and_execution(tmp_path, monkeypatch):
 
     assert report["loss_finite"] is True
     assert report["param_diff"] >= 0.0
-    assert report["total_learned_params"] < 4_000_000_000
+    assert report["parameter_audit"]["system_learned_parameters"] < 4_000_000_000
     assert report["prediction_validation"]["valid"] is True
     assert (work_dir / "colab_smoke_report.json").exists()
 
