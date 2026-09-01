@@ -540,7 +540,7 @@ def run_colab_t4_smoke_pipeline(
         torch.cuda.empty_cache()
 
     timings["dense_macro_sec"] = round(time.time() - t0, 2)
-    print(f"[+] Dense macro completed: backend={dense_backend}, finite={embeddings_finite}, peak_vram={dense_peak_vram}MB")
+    print(f"[+] Dense macro completed: backend={dense_backend}, finite={embeddings_finite}, peak_vram={dense_peak_vram}MB", flush=True)
 
     # --------------------------------------------------------------------------
     # Stage 3: Pair Mining on Official Subset (Train-Only Isolation)

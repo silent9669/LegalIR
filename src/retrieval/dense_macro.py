@@ -131,6 +131,10 @@ class DenseMacroRetriever:
         if not normalized or not self.use_pyvi:
             return normalized
 
+        # If text is already PyVi word-segmented (e.g. from canonical text_norm), skip redundant re-tokenization
+        if "_" in normalized:
+            return normalized
+
         try:
             from pyvi import ViTokenizer
         except ImportError as exc:
@@ -364,6 +368,8 @@ class DenseMacroRetriever:
         elif isinstance(corpus, str):
             corpus = [{"text": corpus}]
         if isinstance(corpus, pd.DataFrame):
+            if "granularity" in corpus.columns:
+                corpus = corpus[corpus["granularity"] == "macro"]
             records = corpus.to_dict(orient="records")
         elif isinstance(corpus, Mapping):
             records = [dict(corpus)]
