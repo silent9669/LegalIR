@@ -858,7 +858,7 @@ def run_kaggle_pipeline(
     submissions_dir = working_path / "submissions"
     submissions_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1b. Fail-Fast Early Canonical Dataset & Public Test Discovery
+    # 1. Canonical Dataset Parquet Existence Check
     canonical_data_dir = discover_data_dir(data_dir, repo_root=root_path)
     docs_path = canonical_data_dir / "documents.parquet"
     chunks_path = canonical_data_dir / "chunks.parquet"
@@ -870,24 +870,14 @@ def run_kaggle_pipeline(
             f"Canonical dataset parquet files missing in {canonical_data_dir}"
         )
 
+    # 2. Public Test Discovery (Fail-Fast)
     public_test_file = discover_public_test_file(public_json_path, data_dir=canonical_data_dir, repo_root=root_path)
-    if (is_full or is_gpu_smoke) and (public_test_file is None or not public_test_file.exists()):
+    if is_full and (public_test_file is None or not public_test_file.exists()):
+        raise FileNotFoundError(f"{run_mode_str} mode requires official public-official.json; refusing to proceed")
+    if is_gpu_smoke and public_json_path is not None and (public_test_file is None or not public_test_file.exists()):
         raise FileNotFoundError(f"{run_mode_str} mode requires official public-official.json; refusing to proceed")
 
-    # Resolve split artifacts with strict provenance tracking
-    split_res = resolve_split_artifacts(
-        canonical_data_dir=canonical_data_dir,
-        working_dir=working_path,
-        repo_root=root_path,
-    )
-    split_provenance_report = {
-        "random_5fold": {"source": split_res.random_source, "sha256": split_res.random_sha256, "path": str(split_res.random_5fold_path)},
-        "doc_disjoint": {"source": split_res.doc_disjoint_source, "sha256": split_res.doc_disjoint_sha256, "path": str(split_res.doc_disjoint_path)},
-    }
-    print(f"[+] Split Provenance: random_5fold from '{split_res.random_source}' (SHA: {split_res.random_sha256[:12]}...), "
-          f"doc_disjoint from '{split_res.doc_disjoint_source}' (SHA: {split_res.doc_disjoint_sha256[:12]}...)")
-
-    # 2. Hardware and GPU Device Allocation (P1.10)
+    # 3. Hardware and GPU Device Allocation (P1.10)
     if (is_gpu_smoke or is_full) and not allow_nonstandard_production_devices:
         if not torch.cuda.is_available():
             raise RuntimeError(f"{run_mode_str} mode requires CUDA but torch.cuda.is_available() is False")
@@ -917,6 +907,24 @@ def run_kaggle_pipeline(
             raise RuntimeError(f"{run_mode_str} mode requires dense_device == 'cuda:0', got '{dense_device}'")
         if reranker_device != "cuda:1":
             raise RuntimeError(f"{run_mode_str} mode requires reranker_device == 'cuda:1', got '{reranker_device}'")
+
+    print(f"[+] Device Allocation (P1.10 Multi-GPU Utilization):")
+    print(f"    - Dense Embedding & Question Encoding : {dense_device}")
+    print(f"    - Reranker Training & Neural Inference: {reranker_device}")
+
+    # Resolve split artifacts with strict provenance tracking
+    split_res = resolve_split_artifacts(
+        canonical_data_dir=canonical_data_dir,
+        working_dir=working_path,
+        repo_root=root_path,
+    )
+    split_provenance_report = {
+        "random_5fold": {"source": split_res.random_source, "sha256": split_res.random_sha256, "path": str(split_res.random_5fold_path)},
+        "doc_disjoint": {"source": split_res.doc_disjoint_source, "sha256": split_res.doc_disjoint_sha256, "path": str(split_res.doc_disjoint_path)},
+    }
+    print(f"[+] Split Provenance: random_5fold from '{split_res.random_source}' (SHA: {split_res.random_sha256[:12]}...), "
+          f"doc_disjoint from '{split_res.doc_disjoint_source}' (SHA: {split_res.doc_disjoint_sha256[:12]}...)")
+
 
     print(f"[+] Device Allocation (P1.10 Multi-GPU Utilization):")
     print(f"    - Dense Embedding & Question Encoding : {dense_device}")
