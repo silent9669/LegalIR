@@ -416,4 +416,99 @@ def test_build_colab_smoke_subset(tmp_path):
     assert set(manifest_1.selected_train_qids).isdisjoint(set(manifest_1.selected_val_qids))
 
 
+# ==============================================================================
+# Task 5: Colab Single-T4 Smoke Runner & Hardware Contract
+# ==============================================================================
+
+def test_hardware_contract_validation():
+    from src.pipeline.colab_smoke import check_gpu_readiness
+
+    # 1. No CUDA available -> raises RuntimeError
+    with pytest.raises(RuntimeError, match="CUDA not available"):
+        check_gpu_readiness(cuda_available=False, gpu_name="Tesla T4")
+
+    # 2. Tesla T4 -> Validated for readiness
+    is_t4, verdict, msg = check_gpu_readiness(cuda_available=True, gpu_name="Tesla T4", allow_non_t4=False)
+    assert is_t4 is True
+    assert verdict == "READY_FOR_T4_SMOKE"
+
+    # 3. L4 or A100 without override -> Raises RuntimeError / Fails readiness
+    with pytest.raises(RuntimeError, match="not a Tesla T4"):
+        check_gpu_readiness(cuda_available=True, gpu_name="NVIDIA A100-SXM4-40GB", allow_non_t4=False)
+
+    # 4. Non-T4 with explicit override -> returns NOT_A_T4_READINESS_GATE verdict
+    is_t4, verdict, msg = check_gpu_readiness(cuda_available=True, gpu_name="NVIDIA A100-SXM4-40GB", allow_non_t4=True)
+    assert is_t4 is False
+    assert verdict == "NOT_A_T4_READINESS_GATE"
+
+
+def test_colab_smoke_report_schema_and_execution(tmp_path, monkeypatch):
+    from scripts.smoke_kaggle_pipeline import create_toy_canonical_dataset
+    from src.pipeline.colab_smoke import ColabSmokeConfig, run_colab_t4_smoke_pipeline
+
+    toy_data = tmp_path / "toy_data"
+    create_toy_canonical_dataset(toy_data)
+
+    work_dir = tmp_path / "colab_work"
+    cfg = ColabSmokeConfig(
+        seed=42,
+        train_queries=4,
+        validation_queries=2,
+        public_queries=2,
+        max_documents=5,
+        folds=2,
+        reranker_optimizer_steps=3,
+        device="cpu",  # CPU for local pytest execution
+    )
+
+    # Mock CI check to return True
+    import scripts.verify_github_ci as vci
+    monkeypatch.setattr(vci, "check_ci_status", lambda *args, **kwargs: (True, "GREEN"))
+
+    report = run_colab_t4_smoke_pipeline(
+        data_dir=toy_data,
+        work_dir=work_dir,
+        target_sha="a" * 40,
+        config=cfg,
+        skip_ci_check=False,
+        allow_non_t4=True,
+        use_mock_models=True,
+    )
+
+    # Assert required report fields
+    required_fields = [
+        "git_sha",
+        "ci_green",
+        "gpu_name",
+        "cuda_version",
+        "torch_version",
+        "dataset_identity",
+        "subset_manifest_hash",
+        "split_provenance_sha",
+        "duplicate_blacklist_count",
+        "dense_device",
+        "dense_backend",
+        "dense_embeddings_finite",
+        "reranker_device",
+        "optimizer_steps",
+        "loss_finite",
+        "param_diff",
+        "adapter_sha256",
+        "adapter_params",
+        "total_learned_params",
+        "prediction_validation",
+        "stage_timings",
+        "result",
+    ]
+    for field in required_fields:
+        assert field in report, f"Report missing required field: {field}"
+
+    assert report["loss_finite"] is True
+    assert report["param_diff"] >= 0.0
+    assert report["total_learned_params"] < 4_000_000_000
+    assert report["prediction_validation"]["valid"] is True
+    assert (work_dir / "colab_smoke_report.json").exists()
+
+
+
 

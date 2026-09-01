@@ -160,6 +160,20 @@ class DenseMacroRetriever:
         self.model.to(self.device)
         self.model.eval()
 
+    def unload_model(self) -> None:
+        """Explicitly release dense transformer model and free device memory."""
+        import gc
+        if hasattr(self, "model") and self.model is not None:
+            del self.model
+            self.model = None
+        if hasattr(self, "tokenizer") and self.tokenizer is not None:
+            del self.tokenizer
+            self.tokenizer = None
+        gc.collect()
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     def _move_inputs_to_device(self, inputs: Any) -> Any:
         if hasattr(inputs, "to"):
             return inputs.to(self.device)
