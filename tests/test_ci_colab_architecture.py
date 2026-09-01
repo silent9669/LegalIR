@@ -596,6 +596,135 @@ def test_kaggle_full_strict_dual_gpu_isolation(tmp_path, monkeypatch):
     assert "train_queries" not in prod_task1_cfg
 
 
+# ==============================================================================
+# Task 8: Score Promotion Guardrails
+# ==============================================================================
+
+def test_score_promotion_rules():
+    from scripts.check_score_promotion import evaluate_score_promotion
+
+    baseline = {
+        "baseline_metrics": {
+            "oof_recall_at_5": 0.7396,
+            "oof_precision_at_5": 0.1569,
+            "candidate_recall_at_50": 0.9400,
+            "candidate_recall_at_150": 0.9700,
+            "doc_disjoint_recall_at_5": 0.6600,
+        },
+        "guardrails": {
+            "require_leakage_checks_passed": True,
+            "require_doc_disjoint_eval": True,
+            "max_candidate_recall_regression": 0.005,
+            "max_doc_disjoint_recall_regression": 0.02,
+            "max_total_parameters": 4_000_000_000,
+        },
+    }
+
+    # Case 1: Higher Recall@5 -> Eligible
+    cand_higher_r5 = {
+        "oof_recall_at_5": 0.7450,
+        "oof_precision_at_5": 0.1570,
+        "candidate_recall_at_50": 0.9420,
+        "candidate_recall_at_150": 0.9710,
+        "doc_disjoint_recall_at_5": 0.6650,
+        "leakage_checks_passed": True,
+        "total_learned_parameters": 702_754_049,
+    }
+    is_promoted, metrics, reasons = evaluate_score_promotion(cand_higher_r5, baseline)
+    assert is_promoted is True
+    assert metrics["recall_at_5_delta"] > 0
+
+    # Case 2: Equal Recall@5 + higher Precision@5 -> Eligible
+    cand_equal_r5_higher_p5 = {
+        "oof_recall_at_5": 0.7396,
+        "oof_precision_at_5": 0.1620,
+        "candidate_recall_at_50": 0.9400,
+        "candidate_recall_at_150": 0.9700,
+        "doc_disjoint_recall_at_5": 0.6600,
+        "leakage_checks_passed": True,
+        "total_learned_parameters": 702_754_049,
+    }
+    is_promoted, metrics, reasons = evaluate_score_promotion(cand_equal_r5_higher_p5, baseline)
+    assert is_promoted is True
+    assert metrics["precision_at_5_delta"] > 0
+
+    # Case 3: Lower Recall@5 -> Rejected
+    cand_lower_r5 = {
+        "oof_recall_at_5": 0.7350,
+        "oof_precision_at_5": 0.1600,
+        "candidate_recall_at_50": 0.9400,
+        "candidate_recall_at_150": 0.9700,
+        "doc_disjoint_recall_at_5": 0.6600,
+        "leakage_checks_passed": True,
+        "total_learned_parameters": 702_754_049,
+    }
+    is_promoted, metrics, reasons = evaluate_score_promotion(cand_lower_r5, baseline)
+    assert is_promoted is False
+    assert any("Recall@5 regressed" in r for r in reasons)
+
+    # Case 4: Severe Candidate Recall regression -> Rejected
+    cand_bad_candidate = {
+        "oof_recall_at_5": 0.7450,
+        "oof_precision_at_5": 0.1570,
+        "candidate_recall_at_50": 0.9200,  # 2% drop > 0.5% tolerance
+        "candidate_recall_at_150": 0.9700,
+        "doc_disjoint_recall_at_5": 0.6600,
+        "leakage_checks_passed": True,
+        "total_learned_parameters": 702_754_049,
+    }
+    is_promoted, metrics, reasons = evaluate_score_promotion(cand_bad_candidate, baseline)
+    assert is_promoted is False
+    assert any("Candidate Recall@50 regressed" in r for r in reasons)
+
+    # Case 5: Missing doc-disjoint evaluation -> Rejected
+    cand_missing_disjoint = {
+        "oof_recall_at_5": 0.7450,
+        "oof_precision_at_5": 0.1570,
+        "candidate_recall_at_50": 0.9420,
+        "candidate_recall_at_150": 0.9710,
+        "leakage_checks_passed": True,
+        "total_learned_parameters": 702_754_049,
+    }
+    is_promoted, metrics, reasons = evaluate_score_promotion(cand_missing_disjoint, baseline)
+    assert is_promoted is False
+    assert any("doc-disjoint" in r.lower() for r in reasons)
+
+
+def test_production_score_guard_config_file():
+    guard_path = REPO_ROOT / "configs" / "production_score_guard.json"
+    assert guard_path.exists(), f"Missing {guard_path}"
+    data = json.loads(guard_path.read_text(encoding="utf-8"))
+    assert "baseline_metrics" in data
+    assert data["baseline_metrics"]["oof_recall_at_5"] >= 0.70
+    assert "guardrails" in data
+
+
+# ==============================================================================
+# Task 9: Operating Workflow Documentation & Release Governance
+# ==============================================================================
+
+def test_workflow_documentation_and_invariants():
+    doc_path = REPO_ROOT / "docs" / "CI_COLAB_KAGGLE_WORKFLOW.md"
+    assert doc_path.exists(), f"Missing {doc_path}"
+
+    content = doc_path.read_text(encoding="utf-8")
+    assert "LegalIR CI" in content
+    assert "Colab" in content
+    assert "Kaggle" in content
+    assert "Tesla T4" in content or "T4" in content
+    assert "TARGET_SHA" in content
+    assert "check_score_promotion.py" in content
+    assert "Recall@5" in content
+
+    # Check README updates
+    readme_path = REPO_ROOT / "README.md"
+    readme_content = readme_path.read_text(encoding="utf-8")
+    assert "CI_COLAB_KAGGLE_WORKFLOW" in readme_content or "Colab" in readme_content
+    assert "check_score_promotion.py" in readme_content or "Score Promotion" in readme_content
+
+
+
+
 
 
 

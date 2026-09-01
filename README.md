@@ -76,7 +76,40 @@ The total learned parameters of every model used in the final Task 1 system must
 
 ---
 
-## 3. Local Execution Guide
+## 3. Release Governance & Verification Architecture
+
+All code releases follow a strict three-gate release workflow documented in [`docs/CI_COLAB_KAGGLE_WORKFLOW.md`](docs/CI_COLAB_KAGGLE_WORKFLOW.md):
+
+```text
+Push code → [Gate A] GitHub `LegalIR CI` (GREEN) → [Gate B] Colab Single-T4 Smoke (PASS) → [Gate C] Manual Kaggle T4x2 FULL
+```
+
+1. **Gate A — GitHub Actions (`LegalIR CI`)**:
+   - CPU-only syntax compileall, import integrity, 375+ unit/integration tests, `<4B` parameter audit, tiny CPU pipeline smoke, and byte-for-byte notebook parity.
+   - Strictly zero pretrained model weight downloads.
+2. **Gate B — Google Colab Single-T4 Contract Smoke**:
+   - Executes `colab/legalir_t4_smoke.ipynb` on a real Tesla T4 GPU running sequential `cuda:0` stages.
+   - Pins the exact GREEN commit SHA, verifies official v2 canonical data, runs real DEk21 Dense inference & FAISS, unloads Dense model, mines subset pairs with zero validation leakage, executes real BGE+LoRA fine-tuning ($\Delta w > 0$, finite loss), verifies adapter SHA, and validates prediction formatting.
+   - Exports `colab_smoke_report.json` with PASS verdict.
+   - **Invalidation Rule**: Any commit pushed after Colab PASS invalidates the prior verification.
+3. **Gate C — Manual Kaggle T4x2 FULL**:
+   - Authorized only after Gate A and Gate B succeed for the exact same commit SHA.
+   - Strictly dual-GPU: Dense on `cuda:0`, BGE Cross-Encoder on `cuda:1` over the complete 8,532-document corpus.
+
+### Score Promotion Protocol (`scripts/check_score_promotion.py`)
+Score-affecting changes are gated on leakage-safe out-of-fold cross-validation evidence:
+- **Recall@5-First**: Higher Recall@5 wins; Precision@5 breaks ties.
+- **Guardrails**: Candidate Recall@50/150 must not regress by >0.5%; Document-disjoint Recall@5 must not regress by >2.0%.
+- **Sequential Ablation Order**:
+  1. Candidate retrieval branch & RRF weights
+  2. Rerank depth (`rerank_k = 40 / 50 / 80`)
+  3. Loss function (`bce` vs `pairwise_logistic`)
+  4. Training step scaling above coverage minimum
+  5. Candidate pool size (`candidate_k = 150 / 200` only after miss analysis)
+
+---
+
+## 4. Local Execution Guide
 
 All pipeline stages are modularized under `scripts/01_*.py` through `scripts/08_*.py`:
 
@@ -110,13 +143,16 @@ python scripts/07_predict_submission.py
 # 8. Strict Submission, Invariant, and Parameter Budget Validation
 python scripts/08_validate_submission.py
 
-# 9. Verify All 24 Mandatory Invariants via Pytest
-pytest tests/test_mandatory_24_invariants.py -v
+# 9. Verify All Mandatory Invariants via Pytest
+pytest -q
+
+# 10. Check Score Promotion Eligibility against Baseline
+python scripts/check_score_promotion.py --candidate artifacts/task1/cv/cv_report.json
 ```
 
 ---
 
-## 4. Kaggle GPU T4 x2 Execution Guide
+## 5. Kaggle GPU T4 x2 Execution Guide
 
 The system is optimized for Kaggle **Dual GPU T4 (T4 x2)** execution with automated device placement, mixed precision (FP16), and memory offloading.
 

@@ -1,0 +1,25 @@
+{
+  "baseline_label": "strict_baseline",
+  "baseline_run_id": "run_20260826_064838_strict_baseline",
+  "baseline_metrics": {
+    "oof_recall_at_5": 0.739636,
+    "oof_precision_at_5": 0.156914,
+    "candidate_recall_at_50": 0.940276,
+    "candidate_recall_at_150": 0.971626,
+    "doc_disjoint_recall_at_5": 0.660000
+  },
+  "guardrails": {
+    "require_leakage_checks_passed": true,
+    "require_doc_disjoint_eval": true,
+    "max_candidate_recall_regression": 0.005,
+    "max_doc_disjoint_recall_regression": 0.02,
+    "max_total_parameters": 4000000000
+  },
+  "ablation_sequence_order": [
+    "1. candidate retrieval / RRF branch weights",
+    "2. rerank_k: 40 vs 50 vs 80",
+    "3. BCE vs pairwise_logistic",
+    "4. training steps above full-query coverage minimum",
+    "5. candidate_k 150 vs 200 (only after miss analysis)"
+  ]
+}
