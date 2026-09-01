@@ -510,5 +510,42 @@ def test_colab_smoke_report_schema_and_execution(tmp_path, monkeypatch):
     assert (work_dir / "colab_smoke_report.json").exists()
 
 
+# ==============================================================================
+# Task 6: Colab Smoke Notebook Generator & Structure
+# ==============================================================================
+
+def test_colab_smoke_notebook_generator_and_content():
+    from scripts.generate_colab_smoke_notebook import generate_colab_notebook
+
+    nb_path = REPO_ROOT / "colab" / "legalir_t4_smoke.ipynb"
+    generated_path = generate_colab_notebook(nb_path)
+    assert generated_path.exists(), f"Failed to generate {generated_path}"
+
+    nb_json = json.loads(generated_path.read_text(encoding="utf-8"))
+    assert "cells" in nb_json
+    cells = nb_json["cells"]
+
+    all_source = "\n".join("".join(c.get("source", [])) for c in cells)
+
+    # Required cells / keywords
+    assert "nvidia-smi" in all_source, "Missing GPU inspection / nvidia-smi"
+    assert "userdata.get('HF_TOKEN')" in all_source or 'userdata.get("HF_TOKEN")' in all_source, "Missing HF_TOKEN userdata read"
+    assert "userdata.get('GITHUB_TOKEN')" in all_source or 'userdata.get("GITHUB_TOKEN")' in all_source, "Missing GITHUB_TOKEN userdata read"
+    assert "drive.mount" in all_source, "Missing Google Drive mount"
+    assert "TARGET_SHA" in all_source, "Missing TARGET_SHA configuration"
+    assert "git clone" in all_source, "Missing git clone step"
+    assert "git checkout" in all_source, "Missing detached checkout step"
+    assert "verify_github_ci.py" in all_source, "Missing CI verification step"
+    assert "run_colab_t4_smoke.py" in all_source, "Missing run_colab_t4_smoke execution step"
+    assert "colab_smoke_report.json" in all_source, "Missing report summary inspection"
+
+    # Reject any cell that prints secret values or token values
+    assert "print(HF_TOKEN)" not in all_source, "Secret HF_TOKEN must never be printed"
+    assert "print(GITHUB_TOKEN)" not in all_source, "Secret GITHUB_TOKEN must never be printed"
+    assert "hf_" not in all_source, "No hardcoded Hugging Face token"
+    assert "ghp_" not in all_source, "No hardcoded GitHub token"
+
+
+
 
 
