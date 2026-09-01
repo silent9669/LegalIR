@@ -95,3 +95,169 @@ def test_notebook_parity_script():
     assert sha_root == hashlib.sha256(root_nb.read_bytes()).hexdigest()
     assert sha_kaggle == hashlib.sha256(kaggle_nb.read_bytes()).hexdigest()
     assert is_identical == (sha_root == sha_kaggle)
+
+
+# ==============================================================================
+# Task 2: CI-Status Verification for Colab (verify_github_ci)
+# ==============================================================================
+
+def test_verify_github_ci_green(monkeypatch):
+    from scripts.verify_github_ci import check_ci_status
+
+    target_sha = "a" * 40
+
+    def mock_urlopen(req, *args, **kwargs):
+        class MockResponse:
+            def read(self):
+                payload = {
+                    "workflow_runs": [
+                        {
+                            "name": "LegalIR CI",
+                            "head_sha": target_sha,
+                            "status": "completed",
+                            "conclusion": "success",
+                            "html_url": "https://github.com/silent9669/LegalIR/actions/runs/123",
+                        }
+                    ]
+                }
+                return json.dumps(payload).encode("utf-8")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+        return MockResponse()
+
+    import urllib.request
+    monkeypatch.setattr(urllib.request, "urlopen", mock_urlopen)
+
+    is_green, msg = check_ci_status(repo="silent9669/LegalIR", sha=target_sha)
+    assert is_green is True
+    assert "GREEN" in msg or "success" in msg
+
+
+def test_verify_github_ci_failed(monkeypatch):
+    from scripts.verify_github_ci import check_ci_status
+
+    target_sha = "b" * 40
+
+    def mock_urlopen(req, *args, **kwargs):
+        class MockResponse:
+            def read(self):
+                payload = {
+                    "workflow_runs": [
+                        {
+                            "name": "LegalIR CI",
+                            "head_sha": target_sha,
+                            "status": "completed",
+                            "conclusion": "failure",
+                            "html_url": "https://github.com/silent9669/LegalIR/actions/runs/124",
+                        }
+                    ]
+                }
+                return json.dumps(payload).encode("utf-8")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+        return MockResponse()
+
+    import urllib.request
+    monkeypatch.setattr(urllib.request, "urlopen", mock_urlopen)
+
+    is_green, msg = check_ci_status(repo="silent9669/LegalIR", sha=target_sha)
+    assert is_green is False
+    assert "failure" in msg or "not successful" in msg
+
+
+def test_verify_github_ci_in_progress(monkeypatch):
+    from scripts.verify_github_ci import check_ci_status
+
+    target_sha = "c" * 40
+
+    def mock_urlopen(req, *args, **kwargs):
+        class MockResponse:
+            def read(self):
+                payload = {
+                    "workflow_runs": [
+                        {
+                            "name": "LegalIR CI",
+                            "head_sha": target_sha,
+                            "status": "in_progress",
+                            "conclusion": None,
+                            "html_url": "https://github.com/silent9669/LegalIR/actions/runs/125",
+                        }
+                    ]
+                }
+                return json.dumps(payload).encode("utf-8")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+        return MockResponse()
+
+    import urllib.request
+    monkeypatch.setattr(urllib.request, "urlopen", mock_urlopen)
+
+    is_green, msg = check_ci_status(repo="silent9669/LegalIR", sha=target_sha)
+    assert is_green is False
+    assert "in_progress" in msg or "not completed" in msg
+
+
+def test_verify_github_ci_no_workflow(monkeypatch):
+    from scripts.verify_github_ci import check_ci_status
+
+    target_sha = "d" * 40
+
+    def mock_urlopen(req, *args, **kwargs):
+        class MockResponse:
+            def read(self):
+                payload = {"workflow_runs": []}
+                return json.dumps(payload).encode("utf-8")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+        return MockResponse()
+
+    import urllib.request
+    monkeypatch.setattr(urllib.request, "urlopen", mock_urlopen)
+
+    is_green, msg = check_ci_status(repo="silent9669/LegalIR", sha=target_sha)
+    assert is_green is False
+    assert "No workflow runs found" in msg or "not found" in msg or "No matching" in msg
+
+
+def test_verify_github_ci_rate_limit_fail_closed(monkeypatch):
+    from scripts.verify_github_ci import check_ci_status
+    import urllib.error
+
+    target_sha = "e" * 40
+
+    def mock_urlopen(req, *args, **kwargs):
+        raise urllib.error.HTTPError(
+            url="https://api.github.com",
+            code=403,
+            msg="rate limit exceeded",
+            hdrs={},
+            fp=None,
+        )
+
+    import urllib.request
+    monkeypatch.setattr(urllib.request, "urlopen", mock_urlopen)
+
+    is_green, msg = check_ci_status(repo="silent9669/LegalIR", sha=target_sha)
+    assert is_green is False
+    assert "403" in msg or "rate limit" in msg.lower() or "GITHUB_TOKEN" in msg
+
