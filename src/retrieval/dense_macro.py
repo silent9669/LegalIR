@@ -298,7 +298,11 @@ class DenseMacroRetriever:
         last_successful: int | None = None
 
         # Ensure max_length never exceeds model positional embedding table
-        pos_emb = getattr(getattr(self.model, "config", None), "max_position_embeddings", 512)
+        pos_emb_val = getattr(getattr(self.model, "config", None), "max_position_embeddings", 512)
+        try:
+            pos_emb = int(pos_emb_val)
+        except (TypeError, ValueError):
+            pos_emb = 512
         effective_max_length = min(max_length, pos_emb - 2 if pos_emb <= 514 else pos_emb)
         if effective_max_length <= 0:
             effective_max_length = 256
