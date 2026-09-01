@@ -714,7 +714,7 @@ class RerankerTrainer:
                     accumulated_loss = 0.0
 
                     if global_step % max(1, total_training_steps // 10) == 0 or global_step == total_training_steps:
-                        print(f"Step {global_step}/{total_training_steps} | Loss: {avg_loss:.4f} | LR: {scheduler.get_last_lr()[0]:.2e}")
+                        print(f"Step {global_step}/{total_training_steps} | Loss: {avg_loss:.4f} | LR: {scheduler.get_last_lr()[0]:.2e}", flush=True)
 
         # Post-training weight change verification
         param_diff = 0.0

@@ -204,9 +204,11 @@ def build_training_pairs(
     queries_with_pos = set()
 
     fold_label = fold if fold is not None else "all"
-    print(f"Building training pairs for {len(train_qids)} queries (fold={fold_label}, use_all={use_all_queries})...")
+    print(f"Building training pairs for {len(train_qids)} queries (fold={fold_label}, use_all={use_all_queries})...", flush=True)
     t_loop_start = time.perf_counter()
-    for qid in tqdm(train_qids, desc=f"Mining pairs fold {fold_label}"):
+    for idx, qid in enumerate(tqdm(train_qids, desc=f"Mining pairs fold {fold_label}")):
+        if (idx + 1) % 5 == 0 or (idx + 1) == len(train_qids):
+            print(f"  • [{idx+1}/{len(train_qids)}] Mining pairs query {qid}...", flush=True)
         q_text = queries_dict.get(qid, "")
         gold_ids = qrels_dict.get(qid, [])
         if not gold_ids or not q_text:
