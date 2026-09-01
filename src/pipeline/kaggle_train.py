@@ -28,7 +28,9 @@ import gc
 import json
 import os
 from pathlib import Path
+import resource
 import subprocess
+import sys
 import time
 from typing import Any, Literal
 import numpy as np
@@ -67,6 +69,32 @@ from src.training.train_reranker import train_reranker
 
 
 @dataclass
+class StageTimingEntry:
+    """Telemetry entry for a pipeline execution stage."""
+    seconds: float
+    cache_hit: bool = False
+
+
+class StageTimingTelemetry:
+    """Collects structured performance and cache-hit telemetry across all pipeline stages."""
+
+    def __init__(self) -> None:
+        self._stages: dict[str, StageTimingEntry] = {}
+
+    def record(self, stage_name: str, elapsed_seconds: float, cache_hit: bool = False) -> None:
+        self._stages[stage_name] = StageTimingEntry(
+            seconds=round(float(elapsed_seconds), 4),
+            cache_hit=bool(cache_hit),
+        )
+
+    def to_dict(self) -> dict[str, dict[str, Any]]:
+        return {
+            name: {"seconds": entry.seconds, "cache_hit": entry.cache_hit}
+            for name, entry in self._stages.items()
+        }
+
+
+@dataclass
 class KaggleRunResult:
     """Structured result of an end-to-end LegalIR Kaggle pipeline run."""
 
@@ -89,6 +117,17 @@ def get_process_rss_mb() -> float:
     try:
         import psutil
         return round(psutil.Process(os.getpid()).memory_info().rss / (1024.0 * 1024.0), 2)
+    except Exception:
+        return 0.0
+
+
+def get_peak_process_rss_mb() -> float:
+    """Return true historical peak process resident set size in megabytes."""
+    try:
+        usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        if sys.platform == "darwin":
+            return round(usage / (1024.0 * 1024.0), 2)
+        return round(usage / 1024.0, 2)
     except Exception:
         return 0.0
 
@@ -374,6 +413,8 @@ def run_kaggle_pipeline(
     is_gpu_smoke = run_mode_str == "gpu_smoke"
     is_full = run_mode_str == "full"
 
+    stage_timings = StageTimingTelemetry()
+
     if strict_artifacts is None:
         strict_artifacts = is_full or is_gpu_smoke
 
@@ -462,10 +503,16 @@ def run_kaggle_pipeline(
     # 3. Canonical Dataset Loading & Validation (P1.5)
     print(f"[+] Canonical Data Directory: {canonical_data_dir}")
 
+    t_load0 = time.perf_counter()
     df_docs = pd.read_parquet(docs_path)
     df_chunks = pd.read_parquet(chunks_path)
     df_queries = pd.read_parquet(queries_train_path) if queries_train_path.exists() else pd.DataFrame()
     df_qrels = pd.read_parquet(qrels_train_path) if qrels_train_path.exists() else pd.DataFrame()
+
+    manifest_path = canonical_data_dir / "manifest.json"
+    audit_report_path = canonical_data_dir / "audit_report.json"
+    manifest_data = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
+    audit_data = json.loads(audit_report_path.read_text(encoding="utf-8")) if audit_report_path.exists() else {}
 
     if is_full or is_gpu_smoke:
         if len(df_docs) != 8532:
@@ -476,6 +523,10 @@ def run_kaggle_pipeline(
             raise ValueError(
                 f"{run_mode_str.upper()} mode requires official Task 1 dataset with exactly 7,000 training queries, got {len(df_queries)}"
             )
+        if manifest_data and manifest_data.get("version") not in (None, "v2", "mock"):
+            raise ValueError(
+                f"{run_mode_str.upper()} mode requires v2 canonical dataset, got {manifest_data.get('version')}"
+            )
 
     val_report = validate_canonical_dataset(
         canonical_data_dir,
@@ -484,6 +535,9 @@ def run_kaggle_pipeline(
     print(f"[+] Canonical Dataset Validation: is_valid = {val_report.get('is_valid')}")
     if not val_report.get("is_valid") and (is_full or is_gpu_smoke):
         raise ValueError(f"Canonical dataset validation failed in {run_mode_str.upper()} mode: {val_report.get('errors')}")
+
+    canonical_load_time = max(0.001, time.perf_counter() - t_load0)
+    stage_timings.record("canonical_load", elapsed_seconds=canonical_load_time, cache_hit=False)
 
     print(f"[+] Dataset Loaded: {len(df_docs):,} documents | {len(df_chunks):,} chunks | {len(df_queries):,} train queries")
     rss_after_load_mb = get_process_rss_mb()
@@ -540,7 +594,7 @@ def run_kaggle_pipeline(
             eligible_query_count=n_train_queries,
             batch_size=int(reranker_cfg.get("batch_size", 2)),
             gradient_accumulation_steps=int(reranker_cfg.get("gradient_accumulation_steps", 8)),
-            target_coverage_pct=0.99,
+            target_coverage_pct=1.0,
             require_pos_and_neg=True,
         )
         effective_max_steps = max(int(configured_max_steps), coverage_req_steps)
@@ -569,41 +623,46 @@ def run_kaggle_pipeline(
 
     # 5a. Fielded Legal BM25
     bm25_dir = index_dir / "bm25"
-    if (bm25_dir / "bm25_micro_index.pkl").exists() or (bm25_dir.exists() and list(bm25_dir.glob("*.pkl"))):
+    t_bm25_0 = time.perf_counter()
+    bm25_cached = (bm25_dir / "bm25_micro_index.pkl").exists() or (bm25_dir.exists() and list(bm25_dir.glob("*.pkl")))
+    if bm25_cached:
         print(f"[*] Loading cached Legal BM25 index from {bm25_dir}...")
         bm25_legal = BM25MicroRetriever.load(bm25_dir)
     else:
         print(f"[*] Building Legal BM25 index with metadata enrichment...")
         bm25_legal = BM25MicroRetriever(k1=1.5, b=0.75).fit(micro_chunks.to_dict("records"), show_progress=False)
         bm25_legal.save(bm25_dir)
+    bm25_legal_time = max(0.001, time.perf_counter() - t_bm25_0)
+    stage_timings.record("bm25_legal", elapsed_seconds=bm25_legal_time, cache_hit=bool(bm25_cached))
     print(f"[+] Legal BM25 ready ({len(bm25_legal.corpus):,} docs).")
 
     # 5b. PyVi Segmented BM25
     bm25_pyvi_dir = index_dir / "bm25_pyvi"
-    if (bm25_pyvi_dir / "bm25_pyvi_index.pkl").exists() or (bm25_pyvi_dir.exists() and list(bm25_pyvi_dir.glob("*.pkl"))):
+    t_pyvi_0 = time.perf_counter()
+    bm25_pyvi_cached = (bm25_pyvi_dir / "bm25_pyvi_index.pkl").exists() or (bm25_pyvi_dir.exists() and list(bm25_pyvi_dir.glob("*.pkl")))
+    if bm25_pyvi_cached:
         print(f"[*] Loading cached PyVi BM25 index from {bm25_pyvi_dir}...")
         bm25_pyvi = BM25PyViRetriever.load(bm25_pyvi_dir)
     else:
         print(f"[*] Building PyVi BM25 index with metadata enrichment...")
         bm25_pyvi = BM25PyViRetriever(k1=1.5, b=0.75).fit(micro_chunks.to_dict("records"), show_progress=False)
         bm25_pyvi.save(bm25_pyvi_dir)
+    bm25_pyvi_time = max(0.001, time.perf_counter() - t_pyvi_0)
+    stage_timings.record("bm25_pyvi", elapsed_seconds=bm25_pyvi_time, cache_hit=bool(bm25_pyvi_cached))
     print(f"[+] PyVi BM25 ready ({len(bm25_pyvi.corpus):,} docs).")
 
     # 6. Build / Load DEk21 Dense Macro Index (GPU 0)
     dense_dir = index_dir / "dense_dek21"
     dense_retriever: DenseMacroRetriever | None = None
-    dense_build_time = 0.1
-    train_query_enc_time = 0.1
-    final_pair_mining_time = 0.1
-    final_training_time = 0.1
-    public_inference_time = 0.1
+    dense_build_time = 0.001
+    dense_cached = (dense_dir / "embeddings.npy").exists()
 
-    t_dense0 = time.time()
-    if (dense_dir / "embeddings.npy").exists():
+    t_dense0 = time.perf_counter()
+    if dense_cached:
         print(f"[*] Loading cached DEk21 Dense index from {dense_dir} on {dense_device}...")
         try:
             dense_retriever = DenseMacroRetriever.load(dense_dir, device=dense_device)
-            dense_build_time = max(0.01, time.time() - t_dense0)
+            dense_build_time = max(0.001, time.perf_counter() - t_dense0)
         except Exception as e:
             if is_full or is_gpu_smoke:
                 raise RuntimeError(f"Failed to load DEk21 Dense index from {dense_dir} in {run_mode_str.upper()} mode: {e}") from e
@@ -624,14 +683,17 @@ def run_kaggle_pipeline(
         try:
             dense_retriever.fit(macro_chunks.to_dict("records"), batch_size=dense_batch, stage_name="corpus")
             dense_retriever.save(dense_dir)
-            dense_build_time = max(0.01, time.time() - t_dense0)
+            dense_build_time = max(0.001, time.perf_counter() - t_dense0)
             print(f"[+] DEk21 Dense Index ready ({len(dense_retriever.doc_ids):,} chunks).")
         except Exception as e:
             if is_full or is_gpu_smoke:
                 raise RuntimeError(f"Failed to build DEk21 Dense index on {dense_device} in {run_mode_str.upper()} mode: {e}") from e
             print(f"[-] Warning: Dense index building failed: {e}")
             dense_retriever = None
+    else:
+        dense_build_time = max(0.001, time.perf_counter() - t_dense0)
 
+    stage_timings.record("dense_index", elapsed_seconds=dense_build_time, cache_hit=bool(dense_cached))
     rss_after_dense_mb = get_process_rss_mb()
 
     if is_full or is_gpu_smoke:
@@ -643,32 +705,49 @@ def run_kaggle_pipeline(
 
     # 7. Precompute Train Query Dense Embeddings on GPU 0 (P1.10)
     train_query_embs: dict[str, np.ndarray] = {}
+    train_query_enc_time = 0.001
+    tq_cached = (index_dir / "train_query_embeddings.npy").exists()
+    t_tq0 = time.perf_counter()
     if not df_queries.empty and dense_retriever is not None:
         q_records = df_queries.to_dict("records")
         qids = [str(r["query_id"]) for r in q_records]
-        qtexts = [
-            str(r.get("question_norm") or r.get("question_raw") or r.get("question") or "")
-            for r in q_records
-        ]
-        try:
-            print(f"[*] Precomputing train query embeddings for {len(qids):,} queries on {dense_device}...")
-            embs = dense_retriever.encode_queries(
-                qtexts, batch_size=128 if "cuda" in str(dense_device) else 32
-            )
+        if tq_cached:
+            print(f"[*] Loading cached train query dense embeddings from {index_dir / 'train_query_embeddings.npy'}...")
+            embs = np.load(str(index_dir / "train_query_embeddings.npy"))
             for qid, emb in zip(qids, embs):
                 train_query_embs[qid] = emb
-            np.save(str(index_dir / "train_query_embeddings.npy"), embs)
-            print(f"[+] Precomputed and cached {len(train_query_embs):,} train query dense embeddings.")
-        except Exception as e:
-            if is_full or is_gpu_smoke:
-                raise RuntimeError(f"Failed to precompute train query embeddings on {dense_device} in {run_mode_str.upper()} mode: {e}") from e
-            print(f"[-] Warning: query embedding precomputation skipped: {e}")
+            train_query_enc_time = max(0.001, time.perf_counter() - t_tq0)
+        else:
+            qtexts = [
+                str(r.get("question_norm") or r.get("question_raw") or r.get("question") or "")
+                for r in q_records
+            ]
+            try:
+                print(f"[*] Precomputing train query embeddings for {len(qids):,} queries on {dense_device}...")
+                embs = dense_retriever.encode_queries(
+                    qtexts, batch_size=128 if "cuda" in str(dense_device) else 32, stage_name="train_query"
+                )
+                for qid, emb in zip(qids, embs):
+                    train_query_embs[qid] = emb
+                np.save(str(index_dir / "train_query_embeddings.npy"), embs)
+                train_query_enc_time = max(0.001, time.perf_counter() - t_tq0)
+                print(f"[+] Precomputed and cached {len(train_query_embs):,} train query dense embeddings.")
+            except Exception as e:
+                train_query_enc_time = max(0.001, time.perf_counter() - t_tq0)
+                if is_full or is_gpu_smoke:
+                    raise RuntimeError(f"Failed to precompute train query embeddings on {dense_device} in {run_mode_str.upper()} mode: {e}") from e
+                print(f"[-] Warning: query embedding precomputation skipped: {e}")
+    else:
+        train_query_enc_time = max(0.001, time.perf_counter() - t_tq0)
+
+    stage_timings.record("train_query_encoding", elapsed_seconds=train_query_enc_time, cache_hit=bool(tq_cached))
 
     # 8. Out-of-Fold (OOF) 5-Fold Cross-Validation with Fold-Trained LoRA Rerankers (P1.1, P1.2, P1.7, P1.10)
     print("\n" + "=" * 70)
     print(f"[*] Starting 5-Fold OOF Cross-Validation (Mode: {run_mode_str.upper()})...")
     print("=" * 70)
 
+    t_oof0 = time.perf_counter()
     oof_runner = OOFRunner(
         data_dir=canonical_data_dir,
         index_dir=index_dir,
@@ -691,6 +770,9 @@ def run_kaggle_pipeline(
         train_query_embeddings=train_query_embs,
     )
     cv_report = oof_runner.run()
+    oof_cv_time = max(0.001, time.perf_counter() - t_oof0)
+    stage_timings.record("oof_cv", elapsed_seconds=oof_cv_time, cache_hit=False)
+
     oof_num_folds = int(oof_runner.num_folds)
     doc_disjoint_report = dict(getattr(oof_runner, "doc_disjoint_report", {}) or {})
     rss_after_oof_mb = get_process_rss_mb()
@@ -704,6 +786,7 @@ def run_kaggle_pipeline(
     print("[*] Evaluating Cross-Fitted Learned Fusion vs Tuned RRF (P1.4)...")
     print("=" * 70)
 
+    t_fus0 = time.perf_counter()
     oof_feat_path = cv_dir / "oof_features.parquet"
     fusion_report: dict[str, Any] = {}
     if oof_feat_path.exists():
@@ -720,6 +803,8 @@ def run_kaggle_pipeline(
                 output_dir=fusion_final_dir,
                 num_boost_round=100 if not (is_smoke or is_gpu_smoke) else 10,
             )
+    fusion_time = max(0.001, time.perf_counter() - t_fus0)
+    stage_timings.record("fusion_training", elapsed_seconds=fusion_time, cache_hit=False)
 
     winning_fusion_method = fusion_report.get("winning_method", "reciprocal_rank_fusion")
     use_learned_fusion = bool(winning_fusion_method == "learned_ranker")
@@ -730,6 +815,7 @@ def run_kaggle_pipeline(
     print("=" * 70)
 
     # 10a. Full Question Memory
+    t_qm0 = time.perf_counter()
     if not df_queries.empty and not df_qrels.empty:
         queries_dict = {
             str(r["query_id"]): str(
@@ -754,8 +840,11 @@ def run_kaggle_pipeline(
         full_mem_dir = index_dir / "question_memory"
         full_memory.save(full_mem_dir)
         print(f"[+] Full Question Memory Index saved to {full_mem_dir} ({len(full_memory.qids):,} queries).")
+    qm_time = max(0.001, time.perf_counter() - t_qm0)
+    stage_timings.record("question_memory", elapsed_seconds=qm_time, cache_hit=False)
 
     # 10b. Mine hard-negative training pairs from ALL training queries
+    t_pm0 = time.perf_counter()
     limit_pairs = 100 if (is_smoke or is_gpu_smoke) else None
     print(f"[*] Mining hard-negative training pairs on all training queries (limit={limit_pairs})...")
     build_training_pairs(
@@ -769,6 +858,8 @@ def run_kaggle_pipeline(
         query_embeddings=train_query_embs,
     )
     final_pairs_file = pairs_dir / "reranker_pairs.parquet"
+    final_pair_mining_time = max(0.001, time.perf_counter() - t_pm0)
+    stage_timings.record("final_pair_mining", elapsed_seconds=final_pair_mining_time, cache_hit=False)
 
     # Audit pair coverage before loading/training final BGE reranker
     from src.training.trainer import audit_pair_coverage
@@ -789,6 +880,7 @@ def run_kaggle_pipeline(
     final_reranker_dir = checkpoints_dir / "reranker_final"
     max_final_steps = effective_max_steps
     print(f"[*] Training Final Supervised LoRA Reranker on {reranker_device} (max_steps={max_final_steps})...")
+    t_tr0 = time.perf_counter()
     final_reranker_report = train_reranker(
         pairs_file=final_pairs_file,
         config_path=resolved_reranker_config,
@@ -797,7 +889,10 @@ def run_kaggle_pipeline(
         max_steps=max_final_steps,
         base_model_name="mock" if is_smoke else "BAAI/bge-reranker-v2-m3",
         device=reranker_device,
+        enforce_full_coverage_steps=is_full,
     )
+    final_training_time = max(0.001, time.perf_counter() - t_tr0)
+    stage_timings.record("final_reranker_training", elapsed_seconds=final_training_time, cache_hit=False)
     print(f"[+] Final Reranker Training Status: {final_reranker_report.get('status')} | Checkpoint: {final_reranker_dir}")
 
     if is_full:
@@ -865,6 +960,7 @@ def run_kaggle_pipeline(
     fusion_model_load_path = (checkpoints_dir / "fusion_final") if use_learned_fusion else None
     reranker_adapter_load_path = final_reranker_dir if final_reranker_dir.exists() else None
 
+    t_pipe0 = time.perf_counter()
     final_audit_json = working_path / "parameter_audit.json"
     pipeline = LegalIRPipeline.load_pipeline(
         data_dir=canonical_data_dir,
@@ -885,6 +981,8 @@ def run_kaggle_pipeline(
         raise_on_violation=True,
         require_loaded_models=(is_full or is_gpu_smoke),
     )
+    pipe_load_audit_time = max(0.001, time.perf_counter() - t_pipe0)
+    stage_timings.record("final_pipeline_load_audit", elapsed_seconds=pipe_load_audit_time, cache_hit=False)
 
     # Strict final PEFT adapter audit verification
     if is_full or is_gpu_smoke:
@@ -897,7 +995,7 @@ def run_kaggle_pipeline(
             if final_audit_report.get("total_learned_parameters", 0) <= 702_754_049:
                 raise RuntimeError("Strict runtime audit failed: total parameters did not increase after adapter loading")
 
-    t0_infer = time.time()
+    t0_infer = time.perf_counter()
     predictions: dict[str, dict[str, list[str]]] = {}
     q_items = list(public_data.items())
     if (is_smoke or is_gpu_smoke) and len(q_items) > 20:
@@ -936,14 +1034,16 @@ def run_kaggle_pipeline(
         )
         predictions[str(qid)] = {"answer": pred_docs}
         if idx % 100 == 0 or idx == len(q_items):
-            elapsed = time.time() - t0_infer
+            elapsed = time.perf_counter() - t0_infer
             print(f"    [{idx:4d}/{len(q_items):4d}] queries predicted ({idx / elapsed:.2f} q/s)")
 
-    public_inference_time = max(0.01, time.time() - t0_infer)
+    public_inference_time = max(0.001, time.perf_counter() - t0_infer)
+    stage_timings.record("public_inference", elapsed_seconds=public_inference_time, cache_hit=False)
     print(f"[+] Public inference completed in {public_inference_time:.2f}s ({len(predictions)} queries predicted).")
-    rss_peak_mb = get_process_rss_mb()
+    rss_peak_mb = get_peak_process_rss_mb()
 
     # 12. Strict Submission Invariant Validation & Zip Packaging (P0.5, Invariants 1-24)
+    t_pkg0 = time.perf_counter()
     sub_json = submissions_dir / "submission.json"
     sub_zip = submissions_dir / "submission.zip"
     package_submission(predictions, sub_json, sub_zip)
@@ -957,6 +1057,8 @@ def run_kaggle_pipeline(
     zip_val_res = validate_submission_zip(sub_zip)
 
     is_submission_valid = bool(val_res.get("is_valid") and zip_val_res.get("is_valid"))
+    pkg_time = max(0.001, time.perf_counter() - t_pkg0)
+    stage_timings.record("submission_packaging", elapsed_seconds=pkg_time, cache_hit=False)
     print(f"[+] Submission Validation: JSON = {val_res.get('is_valid')} | ZIP = {zip_val_res.get('is_valid')} | Overall = {is_submission_valid}")
     if is_full and not is_submission_valid:
         raise RuntimeError(
@@ -985,6 +1087,8 @@ def run_kaggle_pipeline(
             "fusion_winning_method": winning_fusion_method,
             "devices": {"dense": dense_device, "reranker": reranker_device},
             "submission_valid": is_submission_valid,
+            "stage_timings": stage_timings.to_dict(),
+            "peak_rss_mb": rss_peak_mb,
         },
     )
 
@@ -1106,6 +1210,7 @@ def run_kaggle_pipeline(
                 "after_oof": rss_after_oof_mb,
                 "peak": rss_peak_mb,
             },
+            "stage_timings": stage_timings.to_dict(),
             "strict_artifacts": bool(strict_artifacts),
             "fusion_crossfit_folds": int(oof_num_folds),
         }
@@ -1150,8 +1255,18 @@ def run_kaggle_pipeline(
         dj_infer_sec = float(dj_report.get("doc_disjoint_inference_seconds", 5.0))
         projected_doc_disjoint_sec = dj_mining_sec + dj_training_sec + dj_infer_sec
 
-        # Setup and overhead
-        cold_start_setup_sec = round(dense_build_time + train_query_enc_time + 120.0, 2)
+        # Setup and overhead: explicit sum of all cold-start setup stages
+        cold_start_setup_sec = round(
+            bm25_legal_time
+            + bm25_pyvi_time
+            + dense_build_time
+            + train_query_enc_time
+            + canonical_load_time
+            + pipe_load_audit_time
+            + pkg_time
+            + 60.0,
+            2,
+        )
         warm_cache_setup_sec = 60.0
 
         cold_start_total_sec = (

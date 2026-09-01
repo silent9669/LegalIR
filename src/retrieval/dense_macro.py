@@ -533,9 +533,20 @@ class DenseMacroRetriever:
         """Backward-compatible alias for :meth:`search`."""
         return self.search(query, top_k=top_k, q_emb=q_emb)
 
-    def fit(self, corpus: Any, batch_size: int = 32, max_length: int = 512):
+    def fit(
+        self,
+        corpus: Any,
+        batch_size: int = 32,
+        max_length: int = 512,
+        stage_name: str = "corpus",
+    ):
         """Fit / encode corpus for retrieval."""
-        self.encode_corpus(corpus, batch_size=batch_size, max_length=max_length)
+        self.encode_corpus(
+            corpus,
+            batch_size=batch_size,
+            max_length=max_length,
+            stage_name=stage_name,
+        )
         return self
 
     def save(self, output_dir: str | Path) -> Path:

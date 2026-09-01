@@ -4,7 +4,7 @@ import math
 import os
 from pathlib import Path
 import time
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 import numpy as np
 import pandas as pd
 import torch

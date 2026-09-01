@@ -42,6 +42,7 @@ def train_reranker(
     batch_size: int | None = None,
     learning_rate: float | None = None,
     device: str | None = None,
+    enforce_full_coverage_steps: bool = True,
 ) -> dict[str, Any]:
     """
     Supervised Cross-Encoder fine-tuning with PEFT LoRA, verified weight updates,
@@ -107,13 +108,13 @@ def train_reranker(
         require_pos_and_neg=True,
     )
 
-    if max_steps is None:
+    if enforce_full_coverage_steps:
         cfg_steps = int(cfg.get("max_steps", 500))
-        effective_steps = max(cfg_steps, req_steps)
-        cfg["max_steps"] = effective_steps
+        requested = max_steps or 0
+        effective_steps = max(cfg_steps, requested, req_steps)
     else:
-        effective_steps = max_steps
-        cfg["max_steps"] = max_steps
+        effective_steps = max_steps if max_steps is not None else int(cfg.get("max_steps", 500))
+    cfg["max_steps"] = effective_steps
 
     # Load tokenizer and model
     if model_name_or_path == "mock":

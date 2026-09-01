@@ -462,6 +462,7 @@ class OOFRunner:
                     base_model_name=base_m_name,
                     max_steps=5 if self.smoke else None,
                     device=self.reranker_device,
+                    enforce_full_coverage_steps=not self.smoke,
                 )
                 train_sec = time.time() - t_tr0
                 opt_steps = int(train_report.get("optimizer_steps", train_report.get("global_steps", 0)))
@@ -770,6 +771,7 @@ class OOFRunner:
                 base_model_name=base_m_name,
                 max_steps=5 if self.smoke else None,
                 device=self.reranker_device,
+                enforce_full_coverage_steps=not self.smoke,
             )
             dj_train_sec = time.time() - t_dj_tr0
             dj_opt_steps = int(dj_train_report.get("optimizer_steps", dj_train_report.get("global_steps", 0)))
