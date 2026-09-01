@@ -90,7 +90,7 @@ def build_notebook_data() -> dict:
             "source": [
                 "# [3] User Configuration: Target Commit SHA and Official Data Path\n",
                 "# Update TARGET_SHA to the exact commit SHA that passed GitHub CI.\n",
-                "TARGET_SHA = '9dba7fc416a0b555962ea6e0f206095283115cb4'\n",
+                "TARGET_SHA = 'fd699cb77da9694e9f7831d1026b9a896d8591f1'\n",
                 "DATA_DIR = '/content/drive/MyDrive/legalir-task1-clean-data'\n",
                 "OUTPUT_DIR = '/content/drive/MyDrive/legalir-smoke-runs/colab_t4_smoke'\n",
                 "\n",
