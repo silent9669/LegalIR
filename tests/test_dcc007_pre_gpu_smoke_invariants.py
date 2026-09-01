@@ -160,7 +160,7 @@ def test_query_sampler_is_deterministic():
     assert s1 == s2
 
 
-def make_mock_canonical_dataset(data_dir: Path, num_docs: int = 8532, num_queries: int = 7000, num_public: int = 999):
+def make_mock_canonical_dataset(data_dir: Path, num_docs: int = 8532, num_queries: int = 7000, num_public: int = 1000):
     """Helper to generate schema-compliant mock canonical data."""
     data_dir.mkdir(parents=True, exist_ok=True)
     splits_dir = data_dir / "splits"
@@ -224,6 +224,33 @@ def make_mock_canonical_dataset(data_dir: Path, num_docs: int = 8532, num_querie
     ]
     pd.DataFrame(qrels).to_parquet(data_dir / "qrels_train.parquet", index=False)
 
+    manifest = {
+        "dataset": "task1_canonical",
+        "version": "mock",
+        "schema": "hierarchical_micro_macro_v2",
+        "total_documents": num_docs,
+        "total_chunks": num_docs,
+        "total_micro_chunks": 0,
+        "total_macro_chunks": num_docs,
+        "total_queries": num_queries,
+        "total_qrels": num_queries,
+        "empty_documents_count": 0,
+    }
+    (data_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    audit = {
+        "is_valid": True,
+        "total_documents": num_docs,
+        "total_chunks": num_docs,
+        "total_micro_chunks": 0,
+        "total_macro_chunks": num_docs,
+        "total_queries": num_queries,
+        "total_qrels": num_queries,
+        "empty_documents_count": 0,
+        "errors": [],
+    }
+    (data_dir / "audit_report.json").write_text(json.dumps(audit), encoding="utf-8")
+
     if num_public > 0:
         public_data = {f"pub_{i}": {"question": f"pub query {i}"} for i in range(num_public)}
         public_file = data_dir / "public-official.json"
@@ -234,7 +261,7 @@ def make_mock_canonical_dataset(data_dir: Path, num_docs: int = 8532, num_querie
 
 def test_final_training_hard_fails_below_required_query_coverage(tmp_path: Path):
     """Verify run_kaggle_pipeline raises in full mode if final query coverage is below 99%."""
-    data_dir, public_file = make_mock_canonical_dataset(tmp_path / "data", 8532, 7000, 999)
+    data_dir, public_file = make_mock_canonical_dataset(tmp_path / "data", 8532, 7000, 1000)
 
     mock_dense_inst = mock.MagicMock()
     mock_dense_inst.dense_search_backend = "faiss_index_flat_ip"
@@ -295,9 +322,9 @@ def test_full_rejects_toy_dataset(tmp_path: Path):
             )
 
 
-def test_gpu_smoke_requires_8532_docs_7000_train_999_public(tmp_path: Path):
-    """Verify gpu_smoke verifies all 3 official counts (8532 docs, 7000 train queries, 999 public queries)."""
-    data_dir, _ = make_mock_canonical_dataset(tmp_path / "partial_data", num_docs=8532, num_queries=5000, num_public=999)
+def test_gpu_smoke_requires_8532_docs_7000_train_1000_public(tmp_path: Path):
+    """Verify gpu_smoke verifies all 3 official counts (8532 docs, 7000 train queries, 1000 public queries)."""
+    data_dir, _ = make_mock_canonical_dataset(tmp_path / "partial_data", num_docs=8532, num_queries=5000, num_public=1000)
 
     with mock.patch("torch.cuda.is_available", return_value=True), mock.patch("torch.cuda.device_count", return_value=2):
         with pytest.raises(ValueError, match="GPU_SMOKE mode requires official Task 1 dataset with exactly 7,000 training queries"):
@@ -434,7 +461,7 @@ def test_reranker_oom_reduction_persists_across_later_batches():
 
 def test_dense_stage_telemetry_aggregates_public_encoder(tmp_path: Path):
     """Verify gpu_smoke_report aggregates public query Dense encoder telemetry."""
-    data_dir, public_file = make_mock_canonical_dataset(tmp_path / "data", 8532, 7000, 999)
+    data_dir, public_file = make_mock_canonical_dataset(tmp_path / "data", 8532, 7000, 1000)
 
     mock_dense_corpus = mock.MagicMock()
     mock_dense_corpus.dense_search_backend = "faiss_index_flat_ip"
@@ -496,7 +523,7 @@ def test_dense_stage_telemetry_aggregates_public_encoder(tmp_path: Path):
 
 def test_runtime_projection_counts_7000_oof_validation_queries_not_35000(tmp_path: Path):
     """Verify runtime_projection.json projects 7,000 total held-out OOF validation queries."""
-    data_dir, public_file = make_mock_canonical_dataset(tmp_path / "data", 8532, 7000, 999)
+    data_dir, public_file = make_mock_canonical_dataset(tmp_path / "data", 8532, 7000, 1000)
 
     mock_dense = mock.MagicMock()
     mock_dense.dense_search_backend = "faiss_index_flat_ip"
@@ -554,7 +581,7 @@ def test_runtime_projection_counts_7000_oof_validation_queries_not_35000(tmp_pat
 
 def test_gpu_smoke_requires_faiss_backend(tmp_path: Path):
     """Verify gpu_smoke raises if Dense macro index fails to initialize FAISS backend."""
-    data_dir, public_file = make_mock_canonical_dataset(tmp_path / "data", 8532, 7000, 999)
+    data_dir, public_file = make_mock_canonical_dataset(tmp_path / "data", 8532, 7000, 1000)
 
     mock_dense = mock.MagicMock()
     mock_dense._faiss_index = None  # NumPy fallback

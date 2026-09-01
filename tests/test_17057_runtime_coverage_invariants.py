@@ -38,7 +38,7 @@ from src.training.trainer import (
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
-def make_mock_canonical_dataset(data_dir: Path, num_docs: int = 8532, num_queries: int = 7000, num_public: int = 999):
+def make_mock_canonical_dataset(data_dir: Path, num_docs: int = 8532, num_queries: int = 7000, num_public: int = 1000):
     """Helper to generate schema-compliant mock canonical data."""
     data_dir.mkdir(parents=True, exist_ok=True)
     splits_dir = data_dir / "splits"
@@ -101,6 +101,33 @@ def make_mock_canonical_dataset(data_dir: Path, num_docs: int = 8532, num_querie
         for i in range(num_queries)
     ]
     pd.DataFrame(qrels).to_parquet(data_dir / "qrels_train.parquet", index=False)
+
+    manifest = {
+        "dataset": "task1_canonical",
+        "version": "mock",
+        "schema": "hierarchical_micro_macro_v2",
+        "total_documents": num_docs,
+        "total_chunks": num_docs,
+        "total_micro_chunks": 0,
+        "total_macro_chunks": num_docs,
+        "total_queries": num_queries,
+        "total_qrels": num_queries,
+        "empty_documents_count": 0,
+    }
+    (data_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    audit = {
+        "is_valid": True,
+        "total_documents": num_docs,
+        "total_chunks": num_docs,
+        "total_micro_chunks": 0,
+        "total_macro_chunks": num_docs,
+        "total_queries": num_queries,
+        "total_qrels": num_queries,
+        "empty_documents_count": 0,
+        "errors": [],
+    }
+    (data_dir / "audit_report.json").write_text(json.dumps(audit), encoding="utf-8")
 
     if num_public > 0:
         public_data = {f"pub_{i}": {"question": f"pub query {i}"} for i in range(num_public)}
@@ -204,7 +231,7 @@ def test_eligible_coverage_never_exceeds_100pct():
 
 def test_gpu_smoke_projection_scales_3_steps_to_full_final_steps(tmp_path: Path):
     """Verify runtime_projection.json extrapolates smoke steps to full production step counts (e.g. 875)."""
-    data_dir, public_file = make_mock_canonical_dataset(tmp_path / "data", 8532, 7000, 999)
+    data_dir, public_file = make_mock_canonical_dataset(tmp_path / "data", 8532, 7000, 1000)
 
     mock_dense = mock.MagicMock()
     mock_dense.dense_search_backend = "faiss_index_flat_ip"
@@ -293,7 +320,7 @@ def test_gpu_smoke_projection_scales_3_steps_to_full_final_steps(tmp_path: Path)
 
 def test_full_rejects_cpu(tmp_path: Path):
     """Verify run_kaggle_pipeline in full mode hard-fails if CUDA is unavailable."""
-    data_dir, public_file = make_mock_canonical_dataset(tmp_path / "data", 8532, 7000, 999)
+    data_dir, public_file = make_mock_canonical_dataset(tmp_path / "data", 8532, 7000, 1000)
 
     with mock.patch("torch.cuda.is_available", return_value=False):
         with pytest.raises(RuntimeError, match="(?i)full mode requires CUDA"):
@@ -308,7 +335,7 @@ def test_full_rejects_cpu(tmp_path: Path):
 
 def test_full_rejects_single_gpu(tmp_path: Path):
     """Verify run_kaggle_pipeline in full mode hard-fails if fewer than 2 GPUs are present."""
-    data_dir, public_file = make_mock_canonical_dataset(tmp_path / "data", 8532, 7000, 999)
+    data_dir, public_file = make_mock_canonical_dataset(tmp_path / "data", 8532, 7000, 1000)
 
     with mock.patch("torch.cuda.is_available", return_value=True), mock.patch("torch.cuda.device_count", return_value=1):
         with pytest.raises(RuntimeError, match="(?i)full mode requires Kaggle T4 x2 / >=2 CUDA devices"):
@@ -483,7 +510,7 @@ def test_fold_step_budget_uses_actual_fold_eligible_qids():
 
 def test_full_rejects_cuda0_cuda0_mapping(tmp_path: Path):
     """Verify FULL mode rejects assigning both Dense and Reranker to cuda:0."""
-    data_dir, public_file = make_mock_canonical_dataset(tmp_path / "data", 8532, 7000, 999)
+    data_dir, public_file = make_mock_canonical_dataset(tmp_path / "data", 8532, 7000, 1000)
 
     with mock.patch("torch.cuda.is_available", return_value=True), mock.patch("torch.cuda.device_count", return_value=2):
         with pytest.raises(RuntimeError, match="(?i)full mode requires reranker_device == 'cuda:1'"):

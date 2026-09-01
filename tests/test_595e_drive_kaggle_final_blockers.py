@@ -284,31 +284,66 @@ def test_get_peak_process_rss_mb_returns_positive():
 # P1-4 & P1-5: Dataset Identity & Kaggle Clean Data Cold-Start
 # ==============================================================================
 
-def test_v2_canonical_dataset_identity_validation():
-    """Verify v2 canonical dataset validation rule."""
-    from src.dataset.validator import validate_canonical_dataset
+def test_v2_canonical_dataset_identity_validation(tmp_path):
+    """Verify v2 canonical dataset validation rule and official identity helper with 1,000 public queries."""
+    from src.pipeline.kaggle_train import (
+        OFFICIAL_DOCUMENT_COUNT,
+        OFFICIAL_TOTAL_CHUNKS,
+        OFFICIAL_MICRO_CHUNKS,
+        OFFICIAL_MACRO_CHUNKS,
+        OFFICIAL_TRAIN_QUERIES,
+        OFFICIAL_QRELS,
+        OFFICIAL_PUBLIC_QUERY_COUNT,
+        validate_official_task1_identity,
+    )
 
-    # Expected official counts
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+
     manifest = {
         "dataset": "task1_canonical",
         "version": "v2",
         "schema": "hierarchical_micro_macro_v2",
-        "counts": {
-            "documents": 8532,
-            "chunks": 1153876,
-            "micro_chunks": 934416,
-            "macro_chunks": 219460,
-            "train_queries": 7000,
-            "qrels": 7637,
-            "public_queries": 999,
-        }
+        "total_documents": OFFICIAL_DOCUMENT_COUNT,
+        "total_chunks": OFFICIAL_TOTAL_CHUNKS,
+        "total_micro_chunks": OFFICIAL_MICRO_CHUNKS,
+        "total_macro_chunks": OFFICIAL_MACRO_CHUNKS,
+        "total_queries": OFFICIAL_TRAIN_QUERIES,
+        "total_qrels": OFFICIAL_QRELS,
+        "total_duplicate_groups": 4,
+        "empty_documents_count": 20,
+        "normalization": "nfc_whitespace_preserve_legal_ids",
     }
-    assert manifest["version"] == "v2"
-    assert manifest["counts"]["documents"] == 8532
-    assert manifest["counts"]["chunks"] == 1153876
-    assert manifest["counts"]["train_queries"] == 7000
-    assert manifest["counts"]["qrels"] == 7637
-    assert manifest["counts"]["public_queries"] == 999
+    (data_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    audit = {
+        "is_valid": True,
+        "total_documents": OFFICIAL_DOCUMENT_COUNT,
+        "total_chunks": OFFICIAL_TOTAL_CHUNKS,
+        "total_micro_chunks": OFFICIAL_MICRO_CHUNKS,
+        "total_macro_chunks": OFFICIAL_MACRO_CHUNKS,
+        "total_queries": OFFICIAL_TRAIN_QUERIES,
+        "total_qrels": OFFICIAL_QRELS,
+        "empty_documents_count": 20,
+        "errors": [],
+    }
+    (data_dir / "audit_report.json").write_text(json.dumps(audit, indent=2), encoding="utf-8")
+
+    public_data = {f"pub_{i:04d}": {"question": f"Question {i}"} for i in range(OFFICIAL_PUBLIC_QUERY_COUNT)}
+    pub_file = data_dir / "public-official.json"
+    pub_file.write_text(json.dumps(public_data), encoding="utf-8")
+
+    report = validate_official_task1_identity(
+        data_dir=data_dir,
+        public_json_path=pub_file,
+        strict=True,
+    )
+    assert report["is_valid"] is True
+    assert report["public_queries"] == 1000
+    assert report["documents"] == 8532
+    assert report["chunks"] == 1153876
+    assert report["train_queries"] == 7000
+    assert report["qrels"] == 7637
 
 
 def test_kaggle_clean_data_layout_discovery(tmp_path):

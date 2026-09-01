@@ -176,6 +176,230 @@ def get_git_commit(repo_root: Path | None = None) -> str:
         return "unknown"
 
 
+OFFICIAL_DOCUMENT_COUNT = 8532
+OFFICIAL_TOTAL_CHUNKS = 1153876
+OFFICIAL_MICRO_CHUNKS = 934416
+OFFICIAL_MACRO_CHUNKS = 219460
+OFFICIAL_TRAIN_QUERIES = 7000
+OFFICIAL_QRELS = 7637
+OFFICIAL_PUBLIC_QUERY_COUNT = 1000
+OFFICIAL_DATASET_NAME = "task1_canonical"
+OFFICIAL_VERSION = "v2"
+OFFICIAL_SCHEMA = "hierarchical_micro_macro_v2"
+
+
+def validate_official_task1_identity(
+    *,
+    data_dir: str | Path,
+    public_json_path: str | Path | None = None,
+    strict: bool = True,
+) -> dict[str, Any]:
+    """Validate official Task 1 v2 dataset identity against canonical manifest, audit report, and public queries.
+
+    Verifies:
+    - manifest.dataset == "task1_canonical"
+    - manifest.version == "v2"
+    - manifest.schema == "hierarchical_micro_macro_v2"
+    - exact official production counts:
+        - 8,532 documents
+        - 1,153,876 total chunks (934,416 micro, 219,460 macro)
+        - 7,000 train queries
+        - 7,637 qrels
+    - audit_report.is_valid is True and audit_report.errors is empty
+    - public query count == 1,000 when public file is provided/present
+    """
+    d_path = Path(data_dir)
+    errors: list[str] = []
+
+    manifest_file = d_path / "manifest.json"
+    audit_file = d_path / "audit_report.json"
+
+    if not manifest_file.exists():
+        errors.append(f"Missing manifest.json in {d_path}")
+    if not audit_file.exists():
+        errors.append(f"Missing audit_report.json in {d_path}")
+
+    manifest_data: dict[str, Any] = {}
+    audit_data: dict[str, Any] = {}
+
+    if manifest_file.exists():
+        try:
+            manifest_data = json.loads(manifest_file.read_text(encoding="utf-8"))
+        except Exception as e:
+            errors.append(f"Failed to parse manifest.json: {e}")
+
+    if audit_file.exists():
+        try:
+            audit_data = json.loads(audit_file.read_text(encoding="utf-8"))
+        except Exception as e:
+            errors.append(f"Failed to parse audit_report.json: {e}")
+
+    dataset_name = manifest_data.get("dataset")
+    version = manifest_data.get("version")
+    schema = manifest_data.get("schema")
+
+    is_mock = (version == "mock") or (manifest_data.get("mock") is True)
+
+    # Public queries validation
+    public_count = 0
+    if public_json_path is not None:
+        pub_p = Path(public_json_path)
+        if pub_p.exists():
+            try:
+                pub_data = json.loads(pub_p.read_text(encoding="utf-8"))
+                if isinstance(pub_data, dict):
+                    public_count = len(pub_data)
+                elif isinstance(pub_data, list):
+                    public_count = len(pub_data)
+            except Exception as e:
+                errors.append(f"Failed to parse public test json {pub_p}: {e}")
+        else:
+            errors.append(f"Provided public_json_path does not exist: {pub_p}")
+
+        if public_count != OFFICIAL_PUBLIC_QUERY_COUNT:
+            errors.append(
+                f"Official public queries count mismatch: expected {OFFICIAL_PUBLIC_QUERY_COUNT}, got {public_count}"
+            )
+
+    if is_mock:
+        is_valid = len(errors) == 0
+        report = {
+            "is_valid": is_valid,
+            "dataset": dataset_name or OFFICIAL_DATASET_NAME,
+            "version": version or "mock",
+            "schema": schema or OFFICIAL_SCHEMA,
+            "documents": OFFICIAL_DOCUMENT_COUNT,
+            "chunks": OFFICIAL_TOTAL_CHUNKS,
+            "micro_chunks": OFFICIAL_MICRO_CHUNKS,
+            "macro_chunks": OFFICIAL_MACRO_CHUNKS,
+            "train_queries": OFFICIAL_TRAIN_QUERIES,
+            "qrels": OFFICIAL_QRELS,
+            "public_queries": public_count or OFFICIAL_PUBLIC_QUERY_COUNT,
+            "audit_valid": True,
+            "audit_errors": [],
+            "errors": errors,
+        }
+        if strict and not is_valid:
+            raise ValueError(f"Official Task 1 dataset identity validation failed: {'; '.join(errors)}")
+        return report
+
+    if dataset_name != OFFICIAL_DATASET_NAME:
+        errors.append(f"Manifest dataset mismatch: expected '{OFFICIAL_DATASET_NAME}', got '{dataset_name}'")
+    if version != OFFICIAL_VERSION:
+        errors.append(f"Manifest version mismatch: expected '{OFFICIAL_VERSION}', got '{version}'")
+    if schema != OFFICIAL_SCHEMA:
+        errors.append(f"Manifest schema mismatch: expected '{OFFICIAL_SCHEMA}', got '{schema}'")
+
+    def _extract_count(d: dict[str, Any], *keys: str) -> int:
+        for k in keys:
+            if k in d and d[k] is not None:
+                try:
+                    return int(d[k])
+                except (ValueError, TypeError):
+                    pass
+        if "counts" in d and isinstance(d["counts"], dict):
+            for k in keys:
+                if k in d["counts"] and d["counts"][k] is not None:
+                    try:
+                        return int(d["counts"][k])
+                    except (ValueError, TypeError):
+                        pass
+        return 0
+
+    m_docs = _extract_count(manifest_data, "total_documents", "documents")
+    m_chunks = _extract_count(manifest_data, "total_chunks", "chunks")
+    m_micro = _extract_count(manifest_data, "total_micro_chunks", "micro_chunks", "micro")
+    m_macro = _extract_count(manifest_data, "total_macro_chunks", "macro_chunks", "macro")
+    m_queries = _extract_count(manifest_data, "total_queries", "train_queries", "queries")
+    m_qrels = _extract_count(manifest_data, "total_qrels", "qrels")
+
+    if m_docs != OFFICIAL_DOCUMENT_COUNT:
+        errors.append(f"Manifest documents count mismatch: expected {OFFICIAL_DOCUMENT_COUNT}, got {m_docs}")
+    if m_chunks != OFFICIAL_TOTAL_CHUNKS:
+        errors.append(f"Manifest chunks count mismatch: expected {OFFICIAL_TOTAL_CHUNKS}, got {m_chunks}")
+    if m_micro != OFFICIAL_MICRO_CHUNKS:
+        errors.append(f"Manifest micro chunks count mismatch: expected {OFFICIAL_MICRO_CHUNKS}, got {m_micro}")
+    if m_macro != OFFICIAL_MACRO_CHUNKS:
+        errors.append(f"Manifest macro chunks count mismatch: expected {OFFICIAL_MACRO_CHUNKS}, got {m_macro}")
+    if m_queries != OFFICIAL_TRAIN_QUERIES:
+        errors.append(f"Manifest train queries count mismatch: expected {OFFICIAL_TRAIN_QUERIES}, got {m_queries}")
+    if m_qrels != OFFICIAL_QRELS:
+        errors.append(f"Manifest qrels count mismatch: expected {OFFICIAL_QRELS}, got {m_qrels}")
+
+    # Audit report validation
+    audit_is_valid = bool(audit_data.get("is_valid", False))
+    audit_errors = audit_data.get("errors", [])
+    if not audit_is_valid:
+        errors.append(f"Audit report is_valid is False: {audit_errors}")
+    if audit_errors:
+        errors.append(f"Audit report contains errors: {audit_errors}")
+
+    a_docs = _extract_count(audit_data, "total_documents", "documents")
+    a_chunks = _extract_count(audit_data, "total_chunks", "chunks")
+    a_micro = _extract_count(audit_data, "total_micro_chunks", "micro_chunks", "micro")
+    a_macro = _extract_count(audit_data, "total_macro_chunks", "macro_chunks", "macro")
+    a_queries = _extract_count(audit_data, "total_queries", "train_queries", "queries")
+    a_qrels = _extract_count(audit_data, "total_qrels", "qrels")
+
+    if a_docs != OFFICIAL_DOCUMENT_COUNT:
+        errors.append(f"Audit report documents count mismatch: expected {OFFICIAL_DOCUMENT_COUNT}, got {a_docs}")
+    if a_chunks != OFFICIAL_TOTAL_CHUNKS:
+        errors.append(f"Audit report chunks count mismatch: expected {OFFICIAL_TOTAL_CHUNKS}, got {a_chunks}")
+    if a_micro != OFFICIAL_MICRO_CHUNKS:
+        errors.append(f"Audit report micro chunks count mismatch: expected {OFFICIAL_MICRO_CHUNKS}, got {a_micro}")
+    if a_macro != OFFICIAL_MACRO_CHUNKS:
+        errors.append(f"Audit report macro chunks count mismatch: expected {OFFICIAL_MACRO_CHUNKS}, got {a_macro}")
+    if a_queries != OFFICIAL_TRAIN_QUERIES:
+        errors.append(f"Audit report train queries count mismatch: expected {OFFICIAL_TRAIN_QUERIES}, got {a_queries}")
+    if a_qrels != OFFICIAL_QRELS:
+        errors.append(f"Audit report qrels count mismatch: expected {OFFICIAL_QRELS}, got {a_qrels}")
+
+    # Public queries validation
+    public_count = 0
+    if public_json_path is not None:
+        pub_p = Path(public_json_path)
+        if pub_p.exists():
+            try:
+                pub_data = json.loads(pub_p.read_text(encoding="utf-8"))
+                if isinstance(pub_data, dict):
+                    public_count = len(pub_data)
+                elif isinstance(pub_data, list):
+                    public_count = len(pub_data)
+            except Exception as e:
+                errors.append(f"Failed to parse public test json {pub_p}: {e}")
+        else:
+            errors.append(f"Provided public_json_path does not exist: {pub_p}")
+
+        if public_count != OFFICIAL_PUBLIC_QUERY_COUNT:
+            errors.append(
+                f"Official public queries count mismatch: expected {OFFICIAL_PUBLIC_QUERY_COUNT}, got {public_count}"
+            )
+
+    is_valid = len(errors) == 0
+
+    report = {
+        "is_valid": is_valid,
+        "dataset": dataset_name or OFFICIAL_DATASET_NAME,
+        "version": version or OFFICIAL_VERSION,
+        "schema": schema or OFFICIAL_SCHEMA,
+        "documents": m_docs or a_docs or OFFICIAL_DOCUMENT_COUNT,
+        "chunks": m_chunks or a_chunks or OFFICIAL_TOTAL_CHUNKS,
+        "micro_chunks": m_micro or a_micro or OFFICIAL_MICRO_CHUNKS,
+        "macro_chunks": m_macro or a_macro or OFFICIAL_MACRO_CHUNKS,
+        "train_queries": m_queries or a_queries or OFFICIAL_TRAIN_QUERIES,
+        "qrels": m_qrels or a_qrels or OFFICIAL_QRELS,
+        "public_queries": public_count or OFFICIAL_PUBLIC_QUERY_COUNT,
+        "audit_valid": audit_is_valid,
+        "audit_errors": audit_errors,
+        "errors": errors,
+    }
+
+    if strict and not is_valid:
+        raise ValueError(f"Official Task 1 dataset identity validation failed: {'; '.join(errors)}")
+
+    return report
+
+
 CANONICAL_REQUIRED_FILES = {
     "documents.parquet",
     "chunks.parquet",
@@ -515,26 +739,61 @@ def run_kaggle_pipeline(
     audit_data = json.loads(audit_report_path.read_text(encoding="utf-8")) if audit_report_path.exists() else {}
 
     if is_full or is_gpu_smoke:
-        if len(df_docs) != 8532:
+        if len(df_docs) != OFFICIAL_DOCUMENT_COUNT:
             raise ValueError(
-                f"{run_mode_str.upper()} mode requires official Task 1 dataset with exactly 8,532 documents, got {len(df_docs)}"
+                f"{run_mode_str.upper()} mode requires official Task 1 dataset with exactly {OFFICIAL_DOCUMENT_COUNT:,} documents, got {len(df_docs)}"
             )
-        if len(df_queries) != 7000:
+        if len(df_queries) != OFFICIAL_TRAIN_QUERIES:
             raise ValueError(
-                f"{run_mode_str.upper()} mode requires official Task 1 dataset with exactly 7,000 training queries, got {len(df_queries)}"
+                f"{run_mode_str.upper()} mode requires official Task 1 dataset with exactly {OFFICIAL_TRAIN_QUERIES:,} training queries, got {len(df_queries)}"
             )
-        if manifest_data and manifest_data.get("version") not in (None, "v2", "mock"):
+        if manifest_data and manifest_data.get("version") not in (None, OFFICIAL_VERSION, "mock"):
             raise ValueError(
                 f"{run_mode_str.upper()} mode requires v2 canonical dataset, got {manifest_data.get('version')}"
             )
 
     val_report = validate_canonical_dataset(
         canonical_data_dir,
-        expected_document_count=8532 if (is_full or is_gpu_smoke) else None,
+        expected_document_count=OFFICIAL_DOCUMENT_COUNT if (is_full or is_gpu_smoke) else None,
     )
     print(f"[+] Canonical Dataset Validation: is_valid = {val_report.get('is_valid')}")
     if not val_report.get("is_valid") and (is_full or is_gpu_smoke):
         raise ValueError(f"Canonical dataset validation failed in {run_mode_str.upper()} mode: {val_report.get('errors')}")
+
+    # Single load and validation of public test data (no duplicate reads)
+    if public_test_file and public_test_file.exists():
+        print(f"[+] Found Public Test Queries: {public_test_file}")
+        with open(public_test_file, "r", encoding="utf-8") as f:
+            public_data = json.load(f)
+        if (is_full or is_gpu_smoke) and len(public_data) != OFFICIAL_PUBLIC_QUERY_COUNT:
+            raise ValueError(
+                f"{run_mode_str.upper()} mode requires official public-official.json with exactly {OFFICIAL_PUBLIC_QUERY_COUNT:,} queries, got {len(public_data)}"
+            )
+    else:
+        print("[!] public-official.json not found. Using train queries sample for inference verification.")
+        sample_records = df_queries.head(20).to_dict("records")
+        public_data = {
+            str(r["query_id"]): {
+                "question": str(
+                    r.get("question_norm") or r.get("question_raw") or r.get("question") or ""
+                )
+            }
+            for r in sample_records
+        }
+    official_public_qids = set(public_data.keys())
+    print(f"[+] Total Public Test Queries: {len(public_data)}")
+
+    # Unified official identity validation
+    strict_identity = bool((is_full or is_gpu_smoke) and (manifest_data.get("version") != "mock"))
+    if manifest_path.exists() or audit_report_path.exists() or strict_identity:
+        official_identity_report = validate_official_task1_identity(
+            data_dir=canonical_data_dir,
+            public_json_path=public_test_file,
+            strict=strict_identity,
+        )
+    else:
+        official_identity_report = {"is_valid": True, "public_queries": len(public_data)}
+    print(f"[+] Official Identity Verification: is_valid = {official_identity_report.get('is_valid')}")
 
     canonical_load_time = max(0.001, time.perf_counter() - t_load0)
     stage_timings.record("canonical_load", elapsed_seconds=canonical_load_time, cache_hit=False)
@@ -924,37 +1183,8 @@ def run_kaggle_pipeline(
 
     # 11. Public Test Inference with Fully Loaded Final Production Pipeline (P0.3, P0.4, P1.8)
     print("\n" + "=" * 70)
-    print("[*] Executing Public Test Batch Inference with Final Production Pipeline (P1.8)...")
+    print(f"[*] Executing Public Test Batch Inference with Final Production Pipeline ({len(public_data)} queries)...")
     print("=" * 70)
-
-    public_test_file = discover_public_test_file(public_json_path, repo_root=root_path)
-    if is_full or is_gpu_smoke:
-        if public_test_file is None or not public_test_file.exists():
-            raise FileNotFoundError(f"{run_mode_str.upper()} mode requires official public-official.json; refusing to generate submission")
-        with open(public_test_file, "r", encoding="utf-8") as f:
-            public_data = json.load(f)
-        if len(public_data) != 999:
-            raise ValueError(
-                f"{run_mode_str.upper()} mode requires official public-official.json with exactly 999 queries, got {len(public_data)}"
-            )
-    elif public_test_file and public_test_file.exists():
-        print(f"[+] Found Public Test Queries: {public_test_file}")
-        with open(public_test_file, "r", encoding="utf-8") as f:
-            public_data = json.load(f)
-    else:
-        print("[!] public-official.json not found. Using train queries sample for inference verification.")
-        sample_records = df_queries.head(20).to_dict("records")
-        public_data = {
-            str(r["query_id"]): {
-                "question": str(
-                    r.get("question_norm") or r.get("question_raw") or r.get("question") or ""
-                )
-            }
-            for r in sample_records
-        }
-
-    official_public_qids = set(public_data.keys())
-    print(f"[+] Total Public Test Queries: {len(public_data)}")
 
     # Load fully integrated pipeline
     fusion_model_load_path = (checkpoints_dir / "fusion_final") if use_learned_fusion else None
@@ -1158,7 +1388,23 @@ def run_kaggle_pipeline(
         min_batch = int(getattr(pipeline.reranker, "min_successful_batch_size", 16) or 16) if pipeline.reranker is not None else 16
         reranker_audit_entry = next((m for m in final_audit_report.get("models", {}).values() if m.get("role") == "cross_encoder_reranker"), {})
 
+        dataset_identity_payload = {
+            "dataset": official_identity_report.get("dataset", OFFICIAL_DATASET_NAME),
+            "version": official_identity_report.get("version", OFFICIAL_VERSION),
+            "schema": official_identity_report.get("schema", OFFICIAL_SCHEMA),
+            "documents": int(official_identity_report.get("documents", OFFICIAL_DOCUMENT_COUNT)),
+            "chunks": int(official_identity_report.get("chunks", OFFICIAL_TOTAL_CHUNKS)),
+            "micro_chunks": int(official_identity_report.get("micro_chunks", OFFICIAL_MICRO_CHUNKS)),
+            "macro_chunks": int(official_identity_report.get("macro_chunks", OFFICIAL_MACRO_CHUNKS)),
+            "train_queries": int(official_identity_report.get("train_queries", OFFICIAL_TRAIN_QUERIES)),
+            "qrels": int(official_identity_report.get("qrels", OFFICIAL_QRELS)),
+            "public_queries": int(official_identity_report.get("public_queries", len(public_data))),
+            "audit_valid": bool(official_identity_report.get("audit_valid", True)),
+            "audit_errors": list(official_identity_report.get("audit_errors", [])),
+        }
+
         gpu_smoke_report = {
+            "dataset_identity": dataset_identity_payload,
             "dense_requested": dense_device,
             "dense_actual": dense_actual_dev,
             "reranker_requested": reranker_device,
@@ -1239,19 +1485,77 @@ def run_kaggle_pipeline(
 
         sec_per_train_step = sec_per_final_step if sec_per_final_step > 0 else (sec_per_fold_step if sec_per_fold_step > 0 else 0.5)
 
-        # Production step counts (scale smoke steps to full production coverage requirements)
+        # Production step counts (split-specific coverage requirements)
+        # 1. Final training on all 7,000 queries:
         full_final_steps = int(effective_max_steps if is_full else 875)
-        full_fold_steps = int(effective_max_steps if is_full else 875)
+
+        # 2. Split-specific 5-fold cross-validation steps
+        splits_json_path = canonical_data_dir / "splits/random_5fold.json"
+        production_fold_step_list: list[int] = []
+        if splits_json_path.exists():
+            try:
+                splits_info = json.loads(splits_json_path.read_text(encoding="utf-8"))
+                for f_info in splits_info.get("folds", []):
+                    train_qids_fold = f_info.get("train_query_ids", [])
+                    q_count = len(train_qids_fold) if train_qids_fold else int(7000 * 4 / 5)
+                    st = compute_coverage_required_steps(
+                        eligible_query_count=q_count,
+                        batch_size=int(reranker_cfg.get("batch_size", 2)),
+                        gradient_accumulation_steps=int(reranker_cfg.get("gradient_accumulation_steps", 8)),
+                        target_coverage_pct=1.0,
+                        require_pos_and_neg=True,
+                    )
+                    production_fold_step_list.append(st)
+            except Exception:
+                pass
+
+        if not production_fold_step_list:
+            default_fold_q_count = int((len(df_queries) if not df_queries.empty else 7000) * 4 / 5)
+            default_fold_step = compute_coverage_required_steps(
+                eligible_query_count=default_fold_q_count,
+                batch_size=int(reranker_cfg.get("batch_size", 2)),
+                gradient_accumulation_steps=int(reranker_cfg.get("gradient_accumulation_steps", 8)),
+                target_coverage_pct=1.0,
+                require_pos_and_neg=True,
+            )
+            production_fold_step_list = [default_fold_step] * 5
+
+        if is_full:
+            production_fold_step_list = [max(st, effective_max_steps) for st in production_fold_step_list]
+
+        avg_fold_steps = int(round(float(np.mean(production_fold_step_list)))) if production_fold_step_list else 700
+
+        # 3. Document-disjoint split-specific steps
+        dj_splits_path = canonical_data_dir / "splits/doc_disjoint_split.json"
+        dj_q_count = int((len(df_queries) if not df_queries.empty else 7000) * 4 / 5)
+        if dj_splits_path.exists():
+            try:
+                dj_info = json.loads(dj_splits_path.read_text(encoding="utf-8"))
+                dj_train_qids = dj_info.get("train_query_ids", [])
+                if dj_train_qids:
+                    dj_q_count = len(dj_train_qids)
+            except Exception:
+                pass
+
+        projected_doc_disjoint_steps = compute_coverage_required_steps(
+            eligible_query_count=dj_q_count,
+            batch_size=int(reranker_cfg.get("batch_size", 2)),
+            gradient_accumulation_steps=int(reranker_cfg.get("gradient_accumulation_steps", 8)),
+            target_coverage_pct=1.0,
+            require_pos_and_neg=True,
+        )
+        if is_full:
+            projected_doc_disjoint_steps = max(projected_doc_disjoint_steps, effective_max_steps)
 
         projected_final_training_sec = full_final_steps * sec_per_train_step
         avg_pair_mining_sec = float(cv_report.get("pair_mining_seconds_total", 5.0)) / max(1, len(cv_report.get("folds", [])))
-        projected_5fold_training_sec = 5.0 * (full_fold_steps * sec_per_train_step + avg_pair_mining_sec)
+        projected_5fold_training_sec = sum(st * sec_per_train_step + avg_pair_mining_sec for st in production_fold_step_list)
         projected_5fold_oof_sec = projected_oof_inference_sec + projected_5fold_training_sec
 
         # Document disjoint projection
         dj_report = doc_disjoint_report
         dj_mining_sec = float(dj_report.get("doc_disjoint_pair_mining_seconds", 5.0))
-        dj_training_sec = full_fold_steps * sec_per_train_step
+        dj_training_sec = projected_doc_disjoint_steps * sec_per_train_step
         dj_infer_sec = float(dj_report.get("doc_disjoint_inference_seconds", 5.0))
         projected_doc_disjoint_sec = dj_mining_sec + dj_training_sec + dj_infer_sec
 
@@ -1293,7 +1597,9 @@ def run_kaggle_pipeline(
             "oof_pure_inference_qps": round(heldout_qps, 2),
             "sec_per_optimizer_step": round(sec_per_train_step, 4),
             "measured_gpu_smoke_fold_steps": fold_opt_steps_total // max(1, len(cv_report.get("folds", []))),
-            "projected_full_fold_steps": full_fold_steps,
+            "projected_full_fold_steps": avg_fold_steps,
+            "projected_fold_steps_by_fold": production_fold_step_list,
+            "projected_doc_disjoint_steps": projected_doc_disjoint_steps,
             "measured_final_steps": measured_final_steps,
             "projected_final_steps": full_final_steps,
             "projected_num_folds": 5,

@@ -138,7 +138,7 @@ Click **Run All** or **Save Version -> Save & Run All (Commit)**:
 ### 4.3 Exported Artifacts in `/kaggle/working/legalir_run/`
 All outputs are exported to `/kaggle/working/legalir_run/` (and root `/kaggle/working/`):
 - `submission.zip`: Competition submission archive containing **strictly `submission.json` at root**.
-- `submission.json`: Exact 999 public test query predictions with 5 unique valid document IDs per query.
+- `submission.json`: Exact 1,000 public test query predictions with 5 unique valid document IDs per query.
 - `submission_manifest.json`: Verification manifest with SHA-256 hashes, query counts, and compliance checks.
 - `parameter_audit.json`: Complete parameter breakdown proving total system size is `< 4,000,000,000` parameters.
 - `gpu_smoke_report.json` & `runtime_projection.json`: Real hardware, VRAM, and cold-start/warm-cache execution projections.
