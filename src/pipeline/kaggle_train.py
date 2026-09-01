@@ -64,7 +64,7 @@ from src.retrieval.build_indexes import (
 )
 from src.retrieval.dense_macro import DenseMacroRetriever
 from src.retrieval.question_memory import TrainQuestionMemory
-from src.training.build_pairs import build_training_pairs
+from src.training.build_pairs import build_training_pairs, project_pair_mining_seconds
 from src.training.train_reranker import train_reranker
 
 
@@ -400,6 +400,195 @@ def validate_official_task1_identity(
     return report
 
 
+@dataclass(frozen=True)
+class SplitArtifactResolution:
+    random_5fold_path: Path
+    doc_disjoint_path: Path
+    random_source: str
+    doc_disjoint_source: str
+    random_sha256: str = ""
+    doc_disjoint_sha256: str = ""
+
+
+def compute_file_sha256(path: str | Path) -> str:
+    """Compute SHA-256 hash of a file."""
+    import hashlib
+    hasher = hashlib.sha256()
+    with open(path, "rb") as f:
+        while chunk := f.read(65536):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def resolve_split_artifacts(
+    canonical_data_dir: str | Path,
+    working_dir: str | Path,
+    repo_root: str | Path | None = None,
+) -> SplitArtifactResolution:
+    """Deterministically resolve split artifacts across input, repo, and generated locations.
+
+    Resolution order:
+    1. canonical_data_dir/splits/<file>.json
+    2. repo_root/artifacts/task1/data/splits/<file>.json
+    3. generate deterministic seed=42 files in working_dir/splits/
+    """
+    canonical_data_dir = Path(canonical_data_dir)
+    working_dir = Path(working_dir)
+    repo = Path(repo_root) if repo_root else Path.cwd()
+
+    cand_input_random = canonical_data_dir / "splits/random_5fold.json"
+    cand_input_disjoint = canonical_data_dir / "splits/doc_disjoint_split.json"
+
+    cand_repo_random = repo / "artifacts/task1/data/splits/random_5fold.json"
+    cand_repo_disjoint = repo / "artifacts/task1/data/splits/doc_disjoint_split.json"
+
+    # 1. Random 5-fold split
+    if cand_input_random.exists():
+        random_path = cand_input_random.resolve()
+        random_source = "input"
+    elif cand_repo_random.exists():
+        random_path = cand_repo_random.resolve()
+        random_source = "repo"
+    else:
+        splits_out = working_dir / "splits"
+        splits_out.mkdir(parents=True, exist_ok=True)
+        random_path = (splits_out / "random_5fold.json").resolve()
+        queries_path = canonical_data_dir / "queries_train.parquet"
+        q_df = pd.read_parquet(queries_path) if queries_path.exists() else pd.DataFrame()
+        queries_list = [{"query_id": str(qid)} for qid in q_df.get("query_id", [])]
+        from src.evaluation.splits import generate_random_5fold_split, verify_fold_isolation
+        folds = generate_random_5fold_split(queries_list, seed=42, num_folds=5)
+        qrels_path = canonical_data_dir / "qrels_train.parquet"
+        qr_df = pd.read_parquet(qrels_path) if qrels_path.exists() else pd.DataFrame()
+        qrels_map = defaultdict(list)
+        if not qr_df.empty:
+            for r in qr_df.to_dict("records"):
+                qrels_map[str(r["query_id"])].append(str(r["doc_id"]))
+        verify_fold_isolation(folds, qrels_map)
+        random_path.write_text(json.dumps(folds, indent=2), encoding="utf-8")
+        random_source = "generated"
+
+    # 2. Document-disjoint split
+    if cand_input_disjoint.exists():
+        disjoint_path = cand_input_disjoint.resolve()
+        disjoint_source = "input"
+    elif cand_repo_disjoint.exists():
+        disjoint_path = cand_repo_disjoint.resolve()
+        disjoint_source = "repo"
+    else:
+        splits_out = working_dir / "splits"
+        splits_out.mkdir(parents=True, exist_ok=True)
+        disjoint_path = (splits_out / "doc_disjoint_split.json").resolve()
+        docs_path = canonical_data_dir / "documents.parquet"
+        queries_path = canonical_data_dir / "queries_train.parquet"
+        qrels_path = canonical_data_dir / "qrels_train.parquet"
+        d_df = pd.read_parquet(docs_path) if docs_path.exists() else pd.DataFrame()
+        q_df = pd.read_parquet(queries_path) if queries_path.exists() else pd.DataFrame()
+        qr_df = pd.read_parquet(qrels_path) if qrels_path.exists() else pd.DataFrame()
+        d_list = [{"doc_id": str(did)} for did in d_df.get("doc_id", [])]
+        q_list = [{"query_id": str(qid)} for qid in q_df.get("query_id", [])]
+        qr_list = qr_df.to_dict("records") if not qr_df.empty else []
+        from src.evaluation.splits import generate_document_disjoint_split, verify_document_disjoint_isolation
+        dj_split = generate_document_disjoint_split(q_list, qr_list, val_ratio=0.2, seed=42)
+        qrels_map = defaultdict(list)
+        for r in qr_list:
+            qrels_map[str(r["query_id"])].append(str(r["doc_id"]))
+        verify_document_disjoint_isolation(dj_split, qrels_map)
+        disjoint_path.write_text(json.dumps(dj_split, indent=2), encoding="utf-8")
+        disjoint_source = "generated"
+
+    random_sha = compute_file_sha256(random_path)
+    disjoint_sha = compute_file_sha256(disjoint_path)
+
+    return SplitArtifactResolution(
+        random_5fold_path=random_path,
+        doc_disjoint_path=disjoint_path,
+        random_source=random_source,
+        doc_disjoint_source=disjoint_source,
+        random_sha256=random_sha,
+        doc_disjoint_sha256=disjoint_sha,
+    )
+
+
+def resolve_duplicate_groups_path(
+    canonical_data_dir: str | Path,
+    repo_root: str | Path | None = None,
+) -> tuple[Path | None, str]:
+    """Resolve duplicate_groups.json across canonical data dir and repo root."""
+    canonical_data_dir = Path(canonical_data_dir)
+    repo = Path(repo_root) if repo_root else Path.cwd()
+
+    candidates = [
+        (canonical_data_dir / "duplicate_groups.json", "input"),
+        (canonical_data_dir / "splits/duplicate_groups.json", "input_splits"),
+        (repo / "artifacts/task1/data/duplicate_groups.json", "repo"),
+    ]
+    for cand, src_name in candidates:
+        if cand.exists():
+            return cand.resolve(), src_name
+    return None, "none"
+
+
+def validate_duplicate_groups_file(
+    duplicate_groups_path: str | Path | None,
+    corpus_doc_ids: set[str] | None = None,
+    strict: bool = True,
+) -> dict[str, Any]:
+    """Validate duplicate_groups.json format, count (4 groups), and corpus validity."""
+    if duplicate_groups_path is None:
+        if strict:
+            raise FileNotFoundError("duplicate_groups.json could not be resolved and is required in production")
+        return {"is_valid": False, "errors": ["duplicate_groups_path is None"]}
+
+    p = Path(duplicate_groups_path)
+    if not p.exists():
+        if strict:
+            raise FileNotFoundError(f"duplicate_groups.json not found at: {p}")
+        return {"is_valid": False, "errors": [f"File not found: {p}"]}
+
+    errors: list[str] = []
+    try:
+        dup_groups = json.loads(p.read_text(encoding="utf-8"))
+    except Exception as e:
+        if strict:
+            raise ValueError(f"Failed to parse duplicate groups JSON {p}: {e}")
+        return {"is_valid": False, "errors": [str(e)]}
+
+    if not isinstance(dup_groups, dict):
+        errors.append(f"duplicate_groups must be a JSON object mapping group_id -> list[doc_id], got {type(dup_groups)}")
+
+    group_count = len(dup_groups)
+    if group_count != 4:
+        errors.append(f"Expected exactly 4 duplicate groups, got {group_count}")
+
+    total_dup_docs = set()
+    invalid_ids = set()
+    for g_id, doc_list in dup_groups.items():
+        if not isinstance(doc_list, list) or len(doc_list) < 2:
+            errors.append(f"Group {g_id} must have >= 2 doc IDs, got {doc_list}")
+            continue
+        for did in doc_list:
+            s_did = str(did)
+            total_dup_docs.add(s_did)
+            if corpus_doc_ids is not None and s_did not in corpus_doc_ids:
+                invalid_ids.add(s_did)
+
+    if invalid_ids:
+        errors.append(f"Duplicate doc IDs not in corpus: {sorted(invalid_ids)}")
+
+    is_valid = len(errors) == 0
+    if strict and not is_valid:
+        raise ValueError(f"Duplicate groups validation failed: {'; '.join(errors)}")
+
+    return {
+        "is_valid": is_valid,
+        "group_count": group_count,
+        "total_duplicate_docs": len(total_dup_docs),
+        "invalid_ids": sorted(invalid_ids),
+        "errors": errors,
+    }
+
+
 CANONICAL_REQUIRED_FILES = {
     "documents.parquet",
     "chunks.parquet",
@@ -685,6 +874,19 @@ def run_kaggle_pipeline(
     if (is_full or is_gpu_smoke) and (public_test_file is None or not public_test_file.exists()):
         raise FileNotFoundError(f"{run_mode_str} mode requires official public-official.json; refusing to proceed")
 
+    # Resolve split artifacts with strict provenance tracking
+    split_res = resolve_split_artifacts(
+        canonical_data_dir=canonical_data_dir,
+        working_dir=working_path,
+        repo_root=root_path,
+    )
+    split_provenance_report = {
+        "random_5fold": {"source": split_res.random_source, "sha256": split_res.random_sha256, "path": str(split_res.random_5fold_path)},
+        "doc_disjoint": {"source": split_res.doc_disjoint_source, "sha256": split_res.doc_disjoint_sha256, "path": str(split_res.doc_disjoint_path)},
+    }
+    print(f"[+] Split Provenance: random_5fold from '{split_res.random_source}' (SHA: {split_res.random_sha256[:12]}...), "
+          f"doc_disjoint from '{split_res.doc_disjoint_source}' (SHA: {split_res.doc_disjoint_sha256[:12]}...)")
+
     # 2. Hardware and GPU Device Allocation (P1.10)
     if (is_gpu_smoke or is_full) and not allow_nonstandard_production_devices:
         if not torch.cuda.is_available():
@@ -794,6 +996,21 @@ def run_kaggle_pipeline(
     else:
         official_identity_report = {"is_valid": True, "public_queries": len(public_data)}
     print(f"[+] Official Identity Verification: is_valid = {official_identity_report.get('is_valid')}")
+
+    # Resolve and validate duplicate groups false-negative blacklist
+    dup_groups_path, dup_groups_source = resolve_duplicate_groups_path(
+        canonical_data_dir=canonical_data_dir,
+        repo_root=root_path,
+    )
+    strict_dup = bool((is_full or is_gpu_smoke) and (manifest_data.get("version") != "mock"))
+    corpus_ids = set(df_docs["doc_id"].astype(str)) if ("doc_id" in df_docs.columns and strict_dup) else None
+    dup_report = validate_duplicate_groups_file(
+        dup_groups_path,
+        corpus_doc_ids=corpus_ids,
+        strict=strict_dup,
+    )
+    print(f"[+] Duplicate Groups Blacklist: source='{dup_groups_source}' | groups={dup_report.get('group_count')} | "
+          f"docs={dup_report.get('total_duplicate_docs')} | valid={dup_report.get('is_valid')}")
 
     canonical_load_time = max(0.001, time.perf_counter() - t_load0)
     stage_timings.record("canonical_load", elapsed_seconds=canonical_load_time, cache_hit=False)
@@ -1011,8 +1228,8 @@ def run_kaggle_pipeline(
         data_dir=canonical_data_dir,
         index_dir=index_dir,
         output_dir=cv_dir,
-        splits_path=canonical_data_dir / "splits/random_5fold.json" if (canonical_data_dir / "splits/random_5fold.json").exists() else None,
-        doc_disjoint_splits_path=canonical_data_dir / "splits/doc_disjoint_split.json" if (canonical_data_dir / "splits/doc_disjoint_split.json").exists() else None,
+        splits_path=split_res.random_5fold_path,
+        doc_disjoint_splits_path=split_res.doc_disjoint_path,
         config_path=resolved_runtime_config,
         reranker_config_path=resolved_reranker_config,
         num_folds=2 if (is_smoke or is_gpu_smoke) else 5,
@@ -1027,6 +1244,8 @@ def run_kaggle_pipeline(
         smoke_sample_size=20 if (is_smoke or is_gpu_smoke) else 50,
         doc_disjoint=True,
         train_query_embeddings=train_query_embs,
+        duplicate_groups_path=dup_groups_path,
+        split_provenance=split_provenance_report,
     )
     cv_report = oof_runner.run()
     oof_cv_time = max(0.001, time.perf_counter() - t_oof0)
@@ -1115,6 +1334,7 @@ def run_kaggle_pipeline(
         limit=limit_pairs,
         negatives_per_positive=8,
         query_embeddings=train_query_embs,
+        duplicate_groups_path=dup_groups_path,
     )
     final_pairs_file = pairs_dir / "reranker_pairs.parquet"
     final_pair_mining_time = max(0.001, time.perf_counter() - t_pm0)
@@ -1405,6 +1625,15 @@ def run_kaggle_pipeline(
 
         gpu_smoke_report = {
             "dataset_identity": dataset_identity_payload,
+            "split_provenance": split_provenance_report,
+            "duplicate_groups": {
+                "source": dup_groups_source,
+                "group_count": dup_report.get("group_count", 0),
+                "total_duplicate_docs": dup_report.get("total_duplicate_docs", 0),
+                "is_valid": dup_report.get("is_valid", False),
+            },
+            "max_pair_validation_leakage_count": cv_report.get("max_pair_validation_leakage_count", 0),
+            "max_pair_unknown_train_count": cv_report.get("max_pair_unknown_train_count", 0),
             "dense_requested": dense_device,
             "dense_actual": dense_actual_dev,
             "reranker_requested": reranker_device,
@@ -1547,45 +1776,84 @@ def run_kaggle_pipeline(
         if is_full:
             projected_doc_disjoint_steps = max(projected_doc_disjoint_steps, effective_max_steps)
 
+        # Scale pair mining runtime from measured queries to full fold / doc disjoint / final counts (Task 4)
+        is_smoke_run = is_smoke or is_gpu_smoke
+        fold_measured_queries = 20 if is_smoke_run else default_fold_q_count
+        avg_measured_fold_pm_sec = float(cv_report.get("pair_mining_seconds_total", 5.0)) / max(1, len(cv_report.get("folds", [])))
+        setup_fold_pm = min(1.0, avg_measured_fold_pm_sec * 0.2)
+        loop_fold_pm = max(0.001, avg_measured_fold_pm_sec - setup_fold_pm)
+        projected_single_fold_pm_sec = project_pair_mining_seconds(
+            setup_seconds=setup_fold_pm,
+            query_loop_seconds=loop_fold_pm,
+            measured_queries=fold_measured_queries,
+            target_queries=default_fold_q_count,
+            safety_factor=1.10,
+        )
+
         projected_final_training_sec = full_final_steps * sec_per_train_step
-        avg_pair_mining_sec = float(cv_report.get("pair_mining_seconds_total", 5.0)) / max(1, len(cv_report.get("folds", [])))
-        projected_5fold_training_sec = sum(st * sec_per_train_step + avg_pair_mining_sec for st in production_fold_step_list)
+        projected_5fold_training_sec = sum(st * sec_per_train_step + projected_single_fold_pm_sec for st in production_fold_step_list)
         projected_5fold_oof_sec = projected_oof_inference_sec + projected_5fold_training_sec
 
-        # Document disjoint projection
+        # Document disjoint projection with scaled pair mining
         dj_report = doc_disjoint_report
-        dj_mining_sec = float(dj_report.get("doc_disjoint_pair_mining_seconds", 5.0))
+        dj_measured_queries = 20 if is_smoke_run else dj_q_count
+        raw_dj_mining_sec = float(dj_report.get("doc_disjoint_pair_mining_seconds", 5.0))
+        setup_dj_pm = min(1.0, raw_dj_mining_sec * 0.2)
+        loop_dj_pm = max(0.001, raw_dj_mining_sec - setup_dj_pm)
+        projected_doc_disjoint_pm_sec = project_pair_mining_seconds(
+            setup_seconds=setup_dj_pm,
+            query_loop_seconds=loop_dj_pm,
+            measured_queries=dj_measured_queries,
+            target_queries=dj_q_count,
+            safety_factor=1.10,
+        )
         dj_training_sec = projected_doc_disjoint_steps * sec_per_train_step
         dj_infer_sec = float(dj_report.get("doc_disjoint_inference_seconds", 5.0))
-        projected_doc_disjoint_sec = dj_mining_sec + dj_training_sec + dj_infer_sec
+        projected_doc_disjoint_sec = projected_doc_disjoint_pm_sec + dj_training_sec + dj_infer_sec
 
-        # Setup and overhead: explicit sum of all cold-start setup stages
-        cold_start_setup_sec = round(
-            bm25_legal_time
-            + bm25_pyvi_time
-            + dense_build_time
-            + train_query_enc_time
-            + canonical_load_time
+        # Final pair mining projection (scaled to 7,000 queries)
+        final_measured_queries = 100 if is_smoke_run else 7000
+        setup_final_pm = min(1.0, final_pair_mining_time * 0.2)
+        loop_final_pm = max(0.001, final_pair_mining_time - setup_final_pm)
+        projected_final_pair_mining_sec = project_pair_mining_seconds(
+            setup_seconds=setup_final_pm,
+            query_loop_seconds=loop_final_pm,
+            measured_queries=final_measured_queries,
+            target_queries=7000,
+            safety_factor=1.10,
+        )
+
+        # Component-complete cold-start projection map (Task 5)
+        projection_components = {
+            "canonical_load": round(canonical_load_time, 2),
+            "bm25_legal": round(bm25_legal_time, 2),
+            "bm25_pyvi": round(bm25_pyvi_time, 2),
+            "dense_index": round(dense_build_time, 2),
+            "train_query_encoding": round(train_query_enc_time, 2),
+            "projected_oof": round(projected_5fold_oof_sec, 2),
+            "fusion_training": round(fusion_time, 2),
+            "projected_doc_disjoint": round(projected_doc_disjoint_sec, 2),
+            "question_memory": round(qm_time, 2),
+            "projected_final_pair_mining": round(projected_final_pair_mining_sec, 2),
+            "projected_final_reranker": round(projected_final_training_sec, 2),
+            "final_pipeline_load_audit": round(pipe_load_audit_time, 2),
+            "projected_public_inference": round(projected_public_infer_sec, 2),
+            "submission_packaging": round(pkg_time, 2),
+            "safety_overhead": 60.0,
+        }
+        cold_start_total_sec = round(sum(projection_components.values()), 2)
+        warm_cache_total_sec = round(
+            projected_5fold_oof_sec
+            + fusion_time
+            + projected_doc_disjoint_sec
+            + qm_time
+            + projected_final_pair_mining_sec
+            + projected_final_training_sec
             + pipe_load_audit_time
+            + projected_public_infer_sec
             + pkg_time
             + 60.0,
             2,
-        )
-        warm_cache_setup_sec = 60.0
-
-        cold_start_total_sec = (
-            projected_5fold_oof_sec
-            + projected_final_training_sec
-            + projected_doc_disjoint_sec
-            + projected_public_infer_sec
-            + cold_start_setup_sec
-        )
-        warm_cache_total_sec = (
-            projected_5fold_oof_sec
-            + projected_final_training_sec
-            + projected_doc_disjoint_sec
-            + projected_public_infer_sec
-            + warm_cache_setup_sec
         )
 
         KAGGLE_MAX_SECONDS = 12 * 3600.0  # 43,200s
@@ -1616,6 +1884,10 @@ def run_kaggle_pipeline(
             "projected_final_training_seconds": round(projected_final_training_sec, 2),
             "projected_doc_disjoint_seconds": round(projected_doc_disjoint_sec, 2),
             "projected_public_inference_seconds": round(projected_public_infer_sec, 2),
+            "projected_final_pair_mining_seconds": round(projected_final_pair_mining_sec, 2),
+            "projected_oof_pair_mining_seconds": round(projected_single_fold_pm_sec * 5, 2),
+            "projected_doc_disjoint_pair_mining_seconds": round(projected_doc_disjoint_pm_sec, 2),
+            "projection_components_seconds": projection_components,
             "cold_start_total_seconds": round(cold_start_total_sec, 2),
             "cold_start_total_hours": round(cold_start_total_sec / 3600.0, 3),
             "warm_cache_total_seconds": round(warm_cache_total_sec, 2),

@@ -72,9 +72,13 @@ class OOFRunner:
         doc_disjoint_splits_path: str | Path | None = None,
         train_query_embeddings: Any | None = None,
         reranker_config_path: str | Path | None = None,
+        duplicate_groups_path: str | Path | None = None,
+        split_provenance: dict[str, Any] | None = None,
     ):
         self.data_dir = Path(data_dir)
         self.index_dir = Path(index_dir)
+        self.duplicate_groups_path = Path(duplicate_groups_path) if duplicate_groups_path else None
+        self.split_provenance = split_provenance or {}
         if splits_path is not None and Path(splits_path).exists():
             self.splits_path = Path(splits_path)
         elif (self.data_dir / "splits" / "random_5fold.json").exists():
@@ -437,17 +441,34 @@ class OOFRunner:
                 from src.training.build_pairs import build_training_pairs
                 from src.training.train_reranker import train_reranker
 
+                train_ids = sorted(str(x) for x in fold_info.get("train_query_ids", fold_info.get("train", [])))
+                val_ids = sorted(str(x) for x in fold_info.get("val_query_ids", fold_info.get("val", [])))
+
                 t_pm0 = time.time()
                 _, pairs_df = build_training_pairs(
                     data_dir=self.data_dir,
                     index_dir=self.index_dir,
                     output_dir=pairs_dir,
                     fold=f_idx,
+                    train_query_ids=train_ids,
                     use_all_queries=False,
                     limit=self.smoke_sample_size if self.smoke else None,
                     query_embeddings=self.train_query_embeddings,
+                    duplicate_groups_path=self.duplicate_groups_path,
                 )
                 pair_mining_sec = time.time() - t_pm0
+
+                pair_qids = set(pairs_df["query_id"].astype(str)) if not pairs_df.empty else set()
+                train_set = set(map(str, train_ids))
+                val_set = set(map(str, val_ids))
+
+                unknown = pair_qids - train_set
+                leaked = pair_qids & val_set
+                if unknown or leaked:
+                    raise AssertionError(
+                        f"Fold {f_idx} pair isolation failed: "
+                        f"unknown={sorted(unknown)[:10]}, leaked={sorted(leaked)[:10]}"
+                    )
 
                 adapter_dir = fold_dir / "reranker_adapter"
                 reranker_cfg = self.reranker_config_path or self.config_path or "configs/experiments/reranker_lora.yaml"
@@ -489,15 +510,20 @@ class OOFRunner:
             f_metrics["heldout_inference_seconds"] = round(infer_sec, 3)
             f_metrics["heldout_queries"] = val_q_count
             f_metrics["heldout_queries_per_second"] = round(val_q_count / max(0.001, infer_sec), 2)
+            f_metrics["training_query_count"] = len(train_ids) if 'train_ids' in locals() else len(fold_info.get("train_query_ids", []))
+            f_metrics["pair_query_count"] = len(pair_qids) if 'pair_qids' in locals() else 0
+            f_metrics["validation_query_count"] = len(val_ids) if 'val_ids' in locals() else len(fold_info.get("val_query_ids", []))
+            f_metrics["pair_unknown_train_count"] = len(unknown) if 'unknown' in locals() else 0
+            f_metrics["pair_validation_leakage_count"] = len(leaked) if 'leaked' in locals() else 0
+            f_metrics["pair_validation_leakage_ids"] = sorted(leaked) if 'leaked' in locals() else []
 
             if fold_reranker is not None:
                 f_metrics["reranker_oom_events"] = int(getattr(fold_reranker, "oom_events", 0))
                 f_metrics["min_successful_batch_size"] = int(getattr(fold_reranker, "min_successful_batch_size", 16))
 
             if self.train_reranker_per_fold and fold_reranker is not None:
-                train_ids = set(str(x) for x in fold_info.get("train_query_ids", fold_info.get("train", [])))
-                f_metrics["training_queries"] = len(train_ids)
-                f_metrics["training_pairs"] = len(pairs_df)
+                f_metrics["training_queries"] = len(train_ids) if 'train_ids' in locals() else len(fold_info.get("train_query_ids", []))
+                f_metrics["training_pairs"] = len(pairs_df) if 'pairs_df' in locals() else 0
                 f_metrics["adapter_path"] = str(adapter_dir)
                 f_metrics["adapter_checksum"] = train_report.get("adapter_checksum")
                 f_metrics["param_diff"] = train_report.get("param_diff")
@@ -593,6 +619,9 @@ class OOFRunner:
             "is_smoke_mode": self.smoke,
             "num_folds": len(active_folds),
             "folds": fold_records,
+            "split_provenance": self.split_provenance,
+            "max_pair_validation_leakage_count": max((f.get("pair_validation_leakage_count", 0) for f in fold_records), default=0),
+            "max_pair_unknown_train_count": max((f.get("pair_unknown_train_count", 0) for f in fold_records), default=0),
             "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -748,16 +777,30 @@ class OOFRunner:
             from src.training.train_reranker import train_reranker
 
             t_dj_pm0 = time.time()
+            dj_train_list = sorted(str(x) for x in train_ids)
+            dj_val_list = sorted(str(x) for x in val_ids)
             _, pairs_df = build_training_pairs(
                 data_dir=self.data_dir,
                 index_dir=self.index_dir,
                 output_dir=pairs_dir,
-                train_query_ids=list(train_ids),
+                train_query_ids=dj_train_list,
                 use_all_queries=False,
                 limit=self.smoke_sample_size if self.smoke else None,
                 query_embeddings=self.train_query_embeddings,
+                duplicate_groups_path=self.duplicate_groups_path,
             )
             dj_pair_mining_sec = time.time() - t_dj_pm0
+
+            dj_pair_qids = set(pairs_df["query_id"].astype(str)) if not pairs_df.empty else set()
+            dj_train_set = set(map(str, dj_train_list))
+            dj_val_set = set(map(str, dj_val_list))
+            dj_unknown = dj_pair_qids - dj_train_set
+            dj_leaked = dj_pair_qids & dj_val_set
+            if dj_unknown or dj_leaked:
+                raise AssertionError(
+                    f"Doc-disjoint pair isolation failed: "
+                    f"unknown={sorted(dj_unknown)[:10]}, leaked={sorted(dj_leaked)[:10]}"
+                )
 
             doc_disjoint_adapter_dir = doc_disjoint_dir / "reranker_adapter"
             reranker_cfg = self.reranker_config_path or self.config_path or "configs/experiments/reranker_lora.yaml"

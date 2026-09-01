@@ -1,6 +1,7 @@
 from collections import defaultdict
 from collections.abc import Mapping
 from pathlib import Path
+import time
 from typing import Any
 import argparse
 import json
@@ -18,6 +19,19 @@ from src.training.hard_negative_miner import HardNegativeMiner
 from src.training.positive_localizer import PositiveLocalizer
 
 
+def project_pair_mining_seconds(
+    *,
+    setup_seconds: float,
+    query_loop_seconds: float,
+    measured_queries: int,
+    target_queries: int,
+    safety_factor: float = 1.10,
+) -> float:
+    """Project full training pair mining runtime from a measured smoke or partial run."""
+    per_query = float(query_loop_seconds) / max(1, int(measured_queries))
+    return float(setup_seconds) + per_query * float(target_queries) * float(safety_factor)
+
+
 def build_training_pairs(
     *,
     data_dir: str | Path,
@@ -32,11 +46,13 @@ def build_training_pairs(
     include_dense_negatives: bool = True,
     include_pyvi_negatives: bool = True,
     query_embeddings: Mapping[str, Any] | None = None,
+    duplicate_groups_path: str | Path | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Build fold-safe positive and multi-band hard negative pairs for cross-encoder training.
     Saves reranker_pairs.parquet, retriever_pairs.parquet, and manifest.json with full provenance.
     """
+    t_start = time.perf_counter()
     data_dir = Path(data_dir)
     index_dir = Path(index_dir)
     output_dir = Path(output_dir)
@@ -146,13 +162,30 @@ def build_training_pairs(
     )
 
     # Build false-negative blacklist from duplicate groups
-    dup_path = data_dir / "duplicate_groups.json"
-    if not dup_path.exists():
-        dup_path = data_dir / "splits" / "duplicate_groups.json"
-    dup_groups = json.loads(dup_path.read_text(encoding="utf-8")) if dup_path.exists() else {}
+    dup_file = None
+    dup_source = "none"
+    if duplicate_groups_path is not None:
+        p = Path(duplicate_groups_path)
+        if p.exists():
+            dup_file = p
+            dup_source = "explicit"
+    if dup_file is None:
+        for cand, src_name in [
+            (data_dir / "duplicate_groups.json", "input"),
+            (data_dir / "splits" / "duplicate_groups.json", "input_splits"),
+            (Path("artifacts/task1/data/duplicate_groups.json"), "repo"),
+        ]:
+            if cand.exists():
+                dup_file = cand
+                dup_source = src_name
+                break
+
+    dup_groups = json.loads(dup_file.read_text(encoding="utf-8")) if (dup_file and dup_file.exists()) else {}
     doc_to_dups = defaultdict(set)
+    total_dup_docs = set()
     for group in dup_groups.values():
         doc_set = set(str(x) for x in group)
+        total_dup_docs.update(doc_set)
         for did in doc_set:
             doc_to_dups[did].update(doc_set)
 
@@ -163,11 +196,16 @@ def build_training_pairs(
 
     miner = HardNegativeMiner(false_negative_blacklist=query_blacklist)
 
+    t_setup_end = time.perf_counter()
+    setup_seconds = max(0.0001, t_setup_end - t_start)
+
     retriever_rows: list[dict[str, Any]] = []
     reranker_rows: list[dict[str, Any]] = []
+    queries_with_pos = set()
 
     fold_label = fold if fold is not None else "all"
     print(f"Building training pairs for {len(train_qids)} queries (fold={fold_label}, use_all={use_all_queries})...")
+    t_loop_start = time.perf_counter()
     for qid in tqdm(train_qids, desc=f"Mining pairs fold {fold_label}"):
         q_text = queries_dict.get(qid, "")
         gold_ids = qrels_dict.get(qid, [])
@@ -235,6 +273,7 @@ def build_training_pairs(
                 "evidence_text": pos_evidence,
                 "fold": fold if fold is not None else 0,
             })
+            queries_with_pos.add(qid)
 
             for neg_record in mined_neg_records:
                 neg_id = str(neg_record["doc_id"])
@@ -265,6 +304,12 @@ def build_training_pairs(
                     "fold": fold if fold is not None else 0,
                 })
 
+    t_loop_end = time.perf_counter()
+    query_loop_seconds = max(0.0001, t_loop_end - t_loop_start)
+    total_seconds = setup_seconds + query_loop_seconds
+    queries_attempted = len(train_qids)
+    seconds_per_attempted_query = query_loop_seconds / max(1, queries_attempted)
+
     retriever_df = pd.DataFrame(retriever_rows)
     reranker_df = pd.DataFrame(reranker_rows)
 
@@ -275,10 +320,21 @@ def build_training_pairs(
     pos_count = sum(1 for r in reranker_rows if r["label"] == 1.0)
     neg_count = sum(1 for r in reranker_rows if r["label"] == 0.0)
 
+    timing_telemetry = {
+        "setup_seconds": round(float(setup_seconds), 4),
+        "query_loop_seconds": round(float(query_loop_seconds), 4),
+        "total_seconds": round(float(total_seconds), 4),
+        "queries_attempted": queries_attempted,
+        "queries_with_positive_pairs": len(queries_with_pos),
+        "seconds_per_attempted_query": round(float(seconds_per_attempted_query), 6),
+    }
+    (output_dir / "pair_mining_telemetry.json").write_text(json.dumps(timing_telemetry, indent=2), encoding="utf-8")
+
     manifest = {
         "fold": fold,
         "use_all_queries": use_all_queries,
         "total_queries": len(train_qids),
+        "queries_attempted": queries_attempted,
         "positive_pairs_count": pos_count,
         "negative_pairs_count": neg_count,
         "total_pairs_count": len(reranker_df),
@@ -286,6 +342,10 @@ def build_training_pairs(
         "counts_by_negative_source": stats["mined_counts_by_source"],
         "excluded_duplicate_cases_count": stats["excluded_duplicates_count"],
         "excluded_gold_cases_count": stats["excluded_golds_count"],
+        "duplicate_groups_source": dup_source,
+        "duplicate_groups_count": len(dup_groups),
+        "duplicate_doc_ids_count": len(total_dup_docs),
+        "timing_telemetry": timing_telemetry,
     }
     (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     print(f"Generated {pos_count} positives, {neg_count} negatives in {output_dir}")
