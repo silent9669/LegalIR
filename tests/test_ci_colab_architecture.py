@@ -348,3 +348,72 @@ def test_colab_smoke_yaml_file():
     assert "weights" not in data
 
 
+# ==============================================================================
+# Task 4: Deterministic Official-Data Smoke Subset
+# ==============================================================================
+
+def test_build_colab_smoke_subset(tmp_path):
+    from scripts.smoke_kaggle_pipeline import create_toy_canonical_dataset
+    from src.pipeline.colab_smoke import ColabSmokeConfig, build_colab_subset
+
+    toy_data_dir = tmp_path / "toy_data"
+    create_toy_canonical_dataset(toy_data_dir)
+
+    out_subset_1 = tmp_path / "subset_1"
+    out_subset_2 = tmp_path / "subset_2"
+
+    cfg = ColabSmokeConfig(
+        seed=42,
+        train_queries=4,
+        validation_queries=2,
+        public_queries=2,
+        max_documents=5,
+        folds=2,
+    )
+
+    manifest_1 = build_colab_subset(toy_data_dir, out_subset_1, cfg)
+    manifest_2 = build_colab_subset(toy_data_dir, out_subset_2, cfg)
+
+    # 1. Determinism: same seed -> exact same QIDs, doc IDs, and SHA
+    assert manifest_1.selected_train_qids == manifest_2.selected_train_qids
+    assert manifest_1.selected_val_qids == manifest_2.selected_val_qids
+    assert manifest_1.selected_doc_ids == manifest_2.selected_doc_ids
+    assert manifest_1.manifest_sha256 == manifest_2.manifest_sha256
+
+    # 2. Output files exist
+    assert (out_subset_1 / "documents.parquet").exists()
+    assert (out_subset_1 / "chunks.parquet").exists()
+    assert (out_subset_1 / "queries_train.parquet").exists()
+    assert (out_subset_1 / "qrels_train.parquet").exists()
+    assert (out_subset_1 / "public-official.json").exists()
+    assert (out_subset_1 / "subset_manifest.json").exists()
+
+    # 3. Selected train QIDs come from official train set
+    import pandas as pd
+    orig_queries = pd.read_parquet(toy_data_dir / "queries_train.parquet")
+    orig_qids = set(orig_queries["query_id"].astype(str))
+    for qid in manifest_1.selected_train_qids:
+        assert qid in orig_qids
+
+    # 4. All qrel-positive docs for selected queries are included
+    orig_qrels = pd.read_parquet(toy_data_dir / "qrels_train.parquet")
+    all_selected_qids = set(manifest_1.selected_train_qids) | set(manifest_1.selected_val_qids)
+    pos_qrels = orig_qrels[orig_qrels["query_id"].astype(str).isin(all_selected_qids)]
+    for doc_id in pos_qrels["doc_id"].astype(str):
+        assert doc_id in manifest_1.selected_doc_ids
+
+    # 5. Subset chunks belong ONLY to selected docs
+    sub_chunks = pd.read_parquet(out_subset_1 / "chunks.parquet")
+    assert set(sub_chunks["doc_id"].astype(str)).issubset(set(manifest_1.selected_doc_ids))
+
+    # 6. No synthetic qrels (all subset qrels must be in original qrels)
+    sub_qrels = pd.read_parquet(out_subset_1 / "qrels_train.parquet")
+    orig_tuples = set(zip(orig_qrels["query_id"].astype(str), orig_qrels["doc_id"].astype(str)))
+    sub_tuples = set(zip(sub_qrels["query_id"].astype(str), sub_qrels["doc_id"].astype(str)))
+    assert sub_tuples.issubset(orig_tuples)
+
+    # 7. Validation QIDs never enter smoke pair-training / train QIDs
+    assert set(manifest_1.selected_train_qids).isdisjoint(set(manifest_1.selected_val_qids))
+
+
+
