@@ -557,48 +557,22 @@ def run_colab_t4_smoke_pipeline(
     sub_queries = pd.read_parquet(subset_dir / "queries_train.parquet")
     sub_qrels = pd.read_parquet(subset_dir / "qrels_train.parquet")
 
-    # Build BM25 micro index on subset
-    bm25_dir = index_dir / "bm25"
-    if not (bm25_dir / "bm25_micro_index.pkl").exists() and not sub_chunks.empty:
-        micro_chunks = sub_chunks[sub_chunks["granularity"] == "micro"] if "granularity" in sub_chunks.columns else sub_chunks
-        if (subset_dir / "documents.parquet").exists():
-            from src.retrieval.build_indexes import enrich_chunks_with_doc_metadata
-            micro_chunks = enrich_chunks_with_doc_metadata(micro_chunks, subset_dir / "documents.parquet")
-        from src.retrieval.bm25_micro import BM25MicroRetriever
-        bm25_legal = BM25MicroRetriever(k1=1.5, b=0.75).fit(micro_chunks.to_dict("records"), show_progress=False)
-        bm25_legal.save(bm25_dir)
-
-    dup_path, dup_src = resolve_duplicate_groups_path(data_dir, repo_root=Path(__file__).resolve().parent.parent.parent)
-
-    try:
-        build_training_pairs(
-            data_dir=subset_dir,
-            index_dir=index_dir,
-            output_dir=pairs_dir,
-            train_query_ids=manifest.selected_train_qids,
-            use_all_queries=True,
-            duplicate_groups_path=dup_path,
-        )
-    except Exception as exc:
-        print(f"[!] Standard pair builder note: {exc}, using direct subset pair generation")
-
     pairs_file = pairs_dir / "reranker_pairs.parquet"
-    if not pairs_file.exists() or pd.read_parquet(pairs_file).empty:
-        pair_records = []
-        # Ensure only selected train QIDs are used
-        train_queries_df = sub_queries[sub_queries["query_id"].isin(manifest.selected_train_qids)]
-        for _, qrow in train_queries_df.iterrows():
-            qid = str(qrow["query_id"])
-            q_text = str(qrow.get("question_norm") or qrow.get("question_raw", ""))
-            pos_docs = set(sub_qrels[sub_qrels["query_id"] == qid]["doc_id"].astype(str))
-            for pdoc in pos_docs:
-                doc_text = " ".join(sub_chunks[sub_chunks["doc_id"] == pdoc]["text_norm"].dropna().tolist()[:2])
-                pair_records.append({"query_id": qid, "doc_id": pdoc, "query_text": q_text, "evidence_text": doc_text, "label": 1.0})
-            neg_docs = set(sub_docs["doc_id"].astype(str)) - pos_docs
-            for ndoc in list(neg_docs)[:2]:
-                doc_text = " ".join(sub_chunks[sub_chunks["doc_id"] == ndoc]["text_norm"].dropna().tolist()[:2])
-                pair_records.append({"query_id": qid, "doc_id": ndoc, "query_text": q_text, "evidence_text": doc_text, "label": 0.0})
-        pd.DataFrame(pair_records).to_parquet(pairs_file, index=False)
+    pair_records = []
+    # Build training pairs strictly from selected train QIDs (zero validation leakage)
+    train_queries_df = sub_queries[sub_queries["query_id"].isin(manifest.selected_train_qids)]
+    for _, qrow in train_queries_df.iterrows():
+        qid = str(qrow["query_id"])
+        q_text = str(qrow.get("question_norm") or qrow.get("question_raw", ""))
+        pos_docs = set(sub_qrels[sub_qrels["query_id"] == qid]["doc_id"].astype(str))
+        for pdoc in pos_docs:
+            doc_text = " ".join(sub_chunks[sub_chunks["doc_id"] == pdoc]["text_norm"].dropna().tolist()[:2])
+            pair_records.append({"query_id": qid, "doc_id": pdoc, "query_text": q_text, "evidence_text": doc_text, "label": 1.0})
+        neg_docs = set(sub_docs["doc_id"].astype(str)) - pos_docs
+        for ndoc in list(neg_docs)[:4]:
+            doc_text = " ".join(sub_chunks[sub_chunks["doc_id"] == ndoc]["text_norm"].dropna().tolist()[:2])
+            pair_records.append({"query_id": qid, "doc_id": ndoc, "query_text": q_text, "evidence_text": doc_text, "label": 0.0})
+    pd.DataFrame(pair_records).to_parquet(pairs_file, index=False)
 
     pairs_df = pd.read_parquet(pairs_file)
     pair_qids = set(pairs_df["query_id"].astype(str))
