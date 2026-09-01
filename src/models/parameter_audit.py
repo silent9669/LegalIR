@@ -231,6 +231,9 @@ def audit_model_parameters(
         inferred_name = str(model_or_config)
 
     total_p = count_parameters(model_or_config, trainable_only=False, offline_fallback=offline_fallback)
+    if inferred_name in KNOWN_PARAM_COUNTS and total_p < KNOWN_PARAM_COUNTS[inferred_name]:
+        total_p = KNOWN_PARAM_COUNTS[inferred_name]
+
     trainable_p = count_parameters(model_or_config, trainable_only=True, offline_fallback=offline_fallback) if isinstance(model_or_config, nn.Module) else total_p
 
     is_peft = False
