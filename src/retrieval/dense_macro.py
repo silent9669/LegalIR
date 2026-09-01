@@ -297,6 +297,12 @@ class DenseMacroRetriever:
         min_successful: int | None = None
         last_successful: int | None = None
 
+        # Ensure max_length never exceeds model positional embedding table
+        pos_emb = getattr(getattr(self.model, "config", None), "max_position_embeddings", 512)
+        effective_max_length = min(max_length, pos_emb - 2 if pos_emb <= 514 else pos_emb)
+        if effective_max_length <= 0:
+            effective_max_length = 256
+
         idx = 0
         while idx < len(normalized_texts):
             curr_chunk = normalized_texts[idx : idx + curr_batch_size]
@@ -305,7 +311,7 @@ class DenseMacroRetriever:
                     curr_chunk,
                     padding=True,
                     truncation=True,
-                    max_length=max_length,
+                    max_length=effective_max_length,
                     return_tensors="pt",
                 )
                 inputs = self._move_inputs_to_device(inputs)
