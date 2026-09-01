@@ -546,6 +546,58 @@ def test_colab_smoke_notebook_generator_and_content():
     assert "ghp_" not in all_source, "No hardcoded GitHub token"
 
 
+# ==============================================================================
+# Task 7: Preserve Kaggle FULL as Strict Dual-T4 Production
+# ==============================================================================
+
+def test_kaggle_full_strict_dual_gpu_isolation(tmp_path, monkeypatch):
+    import torch
+    from scripts.smoke_kaggle_pipeline import create_toy_canonical_dataset
+    from src.pipeline.kaggle_train import run_kaggle_pipeline
+
+    toy_data = tmp_path / "toy_data"
+    create_toy_canonical_dataset(toy_data)
+    work_dir = tmp_path / "kaggle_work"
+
+    # 1. Colab smoke runner uses 1 GPU sequentially
+    from src.pipeline.colab_smoke import ColabSmokeConfig
+    smoke_cfg = ColabSmokeConfig()
+    assert smoke_cfg.device == "cuda:0"
+    assert smoke_cfg.folds == 2
+    assert smoke_cfg.train_queries == 64
+
+    # 2. FULL mode rejects 1 CUDA device
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+
+    with pytest.raises(RuntimeError, match="requires Kaggle T4 x2 / >=2 CUDA devices"):
+        run_kaggle_pipeline(
+            data_dir=toy_data,
+            working_dir=work_dir,
+            run_mode="full",
+            allow_nonstandard_production_devices=False,
+        )
+
+    # 3. FULL mode requires dense on cuda:0 and reranker on cuda:1
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+    with pytest.raises(RuntimeError, match="requires dense_device == 'cuda:0'"):
+        run_kaggle_pipeline(
+            data_dir=toy_data,
+            working_dir=work_dir,
+            run_mode="full",
+            dense_device="cuda:1",
+            reranker_device="cuda:0",
+            allow_nonstandard_production_devices=False,
+        )
+
+    # 4. Production configs are not polluted by smoke limits
+    prod_task1_cfg = yaml.safe_load((REPO_ROOT / "configs" / "task1.yaml").read_text(encoding="utf-8"))
+    assert "max_documents" not in prod_task1_cfg.get("dataset", {})
+    assert "train_queries" not in prod_task1_cfg
+
+
+
+
 
 
 
