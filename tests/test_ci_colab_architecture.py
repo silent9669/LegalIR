@@ -261,3 +261,90 @@ def test_verify_github_ci_rate_limit_fail_closed(monkeypatch):
     assert is_green is False
     assert "403" in msg or "rate limit" in msg.lower() or "GITHUB_TOKEN" in msg
 
+
+# ==============================================================================
+# Task 3: Protected Score Configuration & Smoke Overrides
+# ==============================================================================
+
+def test_protected_score_keys_rejected():
+    from src.pipeline.colab_smoke import validate_smoke_overrides, PROTECTED_SCORE_KEYS
+
+    assert "loss_type" in PROTECTED_SCORE_KEYS or any("loss" in k for k in PROTECTED_SCORE_KEYS)
+    assert any("lora" in k for k in PROTECTED_SCORE_KEYS)
+    assert any("weight" in k for k in PROTECTED_SCORE_KEYS)
+    assert any("fusion" in k for k in PROTECTED_SCORE_KEYS)
+
+    prod_config = {
+        "retrieval": {"fusion": {"weights": {"bm25": 1.0, "dense": 1.5}}},
+        "ranking": {"reranker": {"model_name": "BAAI/bge-reranker-v2-m3", "loss_type": "bce"}},
+        "training": {"lora_r": 16, "learning_rate": 2e-5},
+    }
+
+    # Attempting to override RRF weights must raise ValueError
+    bad_smoke_1 = {"weights": {"bm25": 2.0, "dense": 0.5}}
+    with pytest.raises(ValueError, match="Protected score key"):
+        validate_smoke_overrides(prod_config, bad_smoke_1)
+
+    # Attempting to override loss_type must raise ValueError
+    bad_smoke_2 = {"loss_type": "pairwise_logistic"}
+    with pytest.raises(ValueError, match="Protected score key"):
+        validate_smoke_overrides(prod_config, bad_smoke_2)
+
+    # Attempting to override LoRA rank must raise ValueError
+    bad_smoke_3 = {"lora_r": 8}
+    with pytest.raises(ValueError, match="Protected score key"):
+        validate_smoke_overrides(prod_config, bad_smoke_3)
+
+    # Attempting to override learning rate must raise ValueError
+    bad_smoke_4 = {"learning_rate": 1e-3}
+    with pytest.raises(ValueError, match="Protected score key"):
+        validate_smoke_overrides(prod_config, bad_smoke_4)
+
+
+def test_allowed_smoke_overrides_accepted():
+    from src.pipeline.colab_smoke import validate_smoke_overrides
+
+    prod_config = {
+        "retrieval": {"fusion": {"weights": {"bm25": 1.0, "dense": 1.5}}},
+        "ranking": {"reranker": {"model_name": "BAAI/bge-reranker-v2-m3", "loss_type": "bce"}},
+        "training": {"lora_r": 16, "learning_rate": 2e-5},
+    }
+
+    valid_smoke = {
+        "train_queries": 64,
+        "validation_queries": 32,
+        "public_queries": 16,
+        "max_documents": 2000,
+        "folds": 2,
+        "reranker_optimizer_steps": 10,
+        "dense_batch_size": 16,
+        "reranker_batch_size": 8,
+        "seed": 42,
+    }
+
+    # Should succeed without raising exceptions
+    validate_smoke_overrides(prod_config, valid_smoke)
+
+
+def test_colab_smoke_yaml_file():
+    yaml_path = REPO_ROOT / "configs" / "colab_smoke.yaml"
+    assert yaml_path.exists(), f"Missing {yaml_path}"
+
+    data = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
+    assert data.get("seed") == 42
+    assert data.get("train_queries") == 64
+    assert data.get("validation_queries") == 32
+    assert data.get("public_queries") == 16
+    assert data.get("max_documents") == 2000
+    assert data.get("folds") == 2
+    assert data.get("reranker_optimizer_steps") == 10
+    assert data.get("dense_batch_size") == 16
+    assert data.get("reranker_batch_size") == 8
+
+    # Must NOT contain model names or ranking weights
+    content = yaml_path.read_text(encoding="utf-8")
+    assert "BAAI/bge-reranker-v2-m3" not in content
+    assert "CODE4LIFEOFFICIAL" not in content
+    assert "weights" not in data
+
+
