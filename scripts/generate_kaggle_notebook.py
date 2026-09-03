@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 
-def build_legalir_notebook(expected_commit: str = "76bb4c3a483ee7946bc5a8b19c42a0b6e5e0f2a4") -> dict:
+def build_legalir_notebook(expected_commit: str = "a0efb25eade80a8964e610a5ba67c08886d0835f") -> dict:
     """Build the clean, thin 5-cell Kaggle orchestrator notebook."""
     cells = []
 
