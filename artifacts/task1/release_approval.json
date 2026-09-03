@@ -1,7 +1,6 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "runtime_sha": "a0efb25eade80a8964e610a5ba67c08886d0835f",
-  "release_sha": "a0efb25eade80a8964e610a5ba67c08886d0835f",
   "ci": {
     "workflow": "LegalIR CI",
     "runtime_sha": "a0efb25eade80a8964e610a5ba67c08886d0835f",
@@ -13,10 +12,6 @@
     "report_sha256": "ae7e28351b3275c8dec713ed72c503c8e6dc6e09e5d009abe45ea157458428bd",
     "result": "PASS",
     "gpu": "Tesla T4"
-  },
-  "dataset": {
-    "version": "v2",
-    "public_queries": 1000
   },
   "production": {
     "kaggle_expected_commit": "a0efb25eade80a8964e610a5ba67c08886d0835f",
