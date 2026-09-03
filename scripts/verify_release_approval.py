@@ -79,8 +79,29 @@ def derive_git_head(repo_root: Path) -> str:
         raise RuntimeError(f"Failed to derive Git HEAD via 'git rev-parse HEAD': {exc}") from exc
 
 
+def ensure_git_commit(commit_sha: str, repo_root: Path) -> None:
+    """Ensure commit object is available locally, fetching if repository is shallow."""
+    try:
+        check = subprocess.run(
+            ["git", "cat-file", "-e", f"{commit_sha}^{{commit}}"],
+            cwd=repo_root,
+            capture_output=True,
+        )
+        if check.returncode != 0:
+            # Try fetching the commit or unshallowing if shallow
+            subprocess.run(
+                ["git", "fetch", "--depth=100", "origin", commit_sha],
+                cwd=repo_root,
+                capture_output=True,
+            )
+    except Exception:
+        pass
+
+
 def is_git_ancestor(ancestor_sha: str, descendant_sha: str, repo_root: Path) -> bool:
     """Check if ancestor_sha is an ancestor of descendant_sha."""
+    ensure_git_commit(ancestor_sha, repo_root)
+    ensure_git_commit(descendant_sha, repo_root)
     try:
         ret = subprocess.run(
             ["git", "merge-base", "--is-ancestor", ancestor_sha, descendant_sha],
@@ -95,6 +116,8 @@ def is_git_ancestor(ancestor_sha: str, descendant_sha: str, repo_root: Path) -> 
 
 def get_git_diff_files(base_sha: str, head_sha: str, repo_root: Path) -> list[str]:
     """Get list of changed file paths between base_sha and head_sha."""
+    ensure_git_commit(base_sha, repo_root)
+    ensure_git_commit(head_sha, repo_root)
     try:
         diff_output = subprocess.check_output(
             ["git", "diff", "--name-only", f"{base_sha}..{head_sha}"],
