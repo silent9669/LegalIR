@@ -112,6 +112,15 @@ class CrossEncoderReranker:
                 except Exception:
                     pass
 
+            manifest_file = adapter_dir / "training_manifest.json"
+            if manifest_file.is_file():
+                try:
+                    m_data = json.loads(manifest_file.read_text(encoding="utf-8"))
+                    if "base_model" in m_data and m_data["base_model"]:
+                        base_model_source = m_data["base_model"]
+                except Exception:
+                    pass
+
             if base_model_source == "mock":
                 import tempfile
                 from transformers import BertConfig, BertForSequenceClassification, BertTokenizerFast
