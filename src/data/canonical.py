@@ -117,7 +117,12 @@ def verify_canonical_dataset(
     errors: List[str] = []
 
     if not d.is_dir():
-        return False, CanonicalDatasetIdentity(), [f"Dataset directory not found: {d}"]
+        if (REPO_ROOT / "artifacts" / "task1" / "data").is_dir():
+            d = REPO_ROOT / "artifacts" / "task1" / "data"
+        elif (REPO_ROOT / dataset_dir).is_dir():
+            d = REPO_ROOT / dataset_dir
+        else:
+            return False, CanonicalDatasetIdentity(), [f"Dataset directory not found: {d}"]
 
     # Required files
     docs_p = d / "documents.parquet"

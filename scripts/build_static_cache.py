@@ -248,6 +248,12 @@ def main():
     args = parser.parse_args()
 
     dataset_p = Path(args.dataset_dir)
+    if not dataset_p.is_dir():
+        if (REPO_ROOT / "artifacts" / "task1" / "data").is_dir():
+            dataset_p = REPO_ROOT / "artifacts" / "task1" / "data"
+        elif (REPO_ROOT / args.dataset_dir).is_dir():
+            dataset_p = REPO_ROOT / args.dataset_dir
+
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     indexes_p = Path(args.indexes_dir) if args.indexes_dir else None
