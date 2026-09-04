@@ -13,6 +13,10 @@ import json
 import sys
 from pathlib import Path
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 from src.bundle.verifier import verify_production_bundle
 from src.core.memory import check_memory_guard, release_memory, take_memory_snapshot, format_memory_report
 from src.data.canonical import verify_canonical_dataset
@@ -60,12 +64,22 @@ def main():
     print("[*] Stage K6 & K7: Reranking public candidates and fusing top-5 ...")
     cands_p = bundle_p / "public_candidates.parquet"
     lock_p = bundle_p / "production_lock.json"
-    predictions = rerank_and_fuse_public_predictions(cands_p, lock_p, top_k=5)
+    evidence_p = bundle_p / "public_evidence.parquet"
+
+    with open(dataset_p / "public-official.json", "r", encoding="utf-8") as f:
+        public_dict = json.load(f)
+    expected_qids = set(str(k) for k in public_dict.keys())
+
+    predictions = rerank_and_fuse_public_predictions(
+        public_candidates_path=cands_p,
+        production_lock_path=lock_p,
+        adapter_dir=adapter_out,
+        public_evidence_path=evidence_p if evidence_p.is_file() else None,
+        top_k=5,
+        public_queries_dict=public_dict,
+    )
 
     print("[*] Stage K8: Validating submission format ...")
-    # Load expected public query IDs
-    with open(dataset_p / "public-official.json", "r", encoding="utf-8") as f:
-        expected_qids = set(json.load(f).keys())
 
     sub_valid, sub_errors = validate_submission(predictions, expected_qids=expected_qids, max_predictions=5)
     if not sub_valid:
