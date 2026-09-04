@@ -1,0 +1,182 @@
+"""Canonical Task 1 v2 dataset verification and metadata inspection."""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Tuple, Union
+import pyarrow.parquet as pq
+
+from src.core.hashing import sha256_file
+
+
+EXPECTED_DOCS = 8532
+EXPECTED_CHUNKS = 1153876
+EXPECTED_MICRO = 934416
+EXPECTED_MACRO = 219460
+EXPECTED_TRAIN_QUERIES = 7000
+EXPECTED_QRELS = 7637
+EXPECTED_PUBLIC_QUERIES = 1000
+EXPECTED_DUPLICATE_GROUPS = 4
+
+
+@dataclass
+class CanonicalDatasetIdentity:
+    """Canonical dataset metadata and verification parameters."""
+
+    dataset_name: str = "task1_canonical"
+    version: str = "v2"
+    schema_version: str = "hierarchical_micro_macro_v2"
+    num_docs: int = EXPECTED_DOCS
+    num_chunks: int = EXPECTED_CHUNKS
+    num_micro: int = EXPECTED_MICRO
+    num_macro: int = EXPECTED_MACRO
+    num_train_queries: int = EXPECTED_TRAIN_QUERIES
+    num_qrels: int = EXPECTED_QRELS
+    num_public_queries: int = EXPECTED_PUBLIC_QUERIES
+    num_duplicate_groups: int = EXPECTED_DUPLICATE_GROUPS
+
+    def is_canonical_match(self) -> bool:
+        return (
+            self.num_docs == EXPECTED_DOCS
+            and self.num_chunks == EXPECTED_CHUNKS
+            and self.num_micro == EXPECTED_MICRO
+            and self.num_macro == EXPECTED_MACRO
+            and self.num_train_queries == EXPECTED_TRAIN_QUERIES
+            and self.num_qrels == EXPECTED_QRELS
+            and self.num_public_queries == EXPECTED_PUBLIC_QUERIES
+            and self.num_duplicate_groups == EXPECTED_DUPLICATE_GROUPS
+        )
+
+
+def read_parquet_metadata_fast(path: Union[str, Path]) -> Dict[str, Any]:
+    """Read Parquet metadata without loading the dataset into memory."""
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(f"Parquet file not found: {path}")
+
+    parquet_file = pq.ParquetFile(str(path))
+    metadata = parquet_file.metadata
+    schema = parquet_file.schema_arrow
+
+    return {
+        "num_rows": metadata.num_rows,
+        "num_columns": metadata.num_columns,
+        "num_row_groups": metadata.num_row_groups,
+        "columns": [col.name for col in schema],
+        "size_bytes": path.stat().st_size,
+    }
+
+
+def verify_canonical_dataset(
+    dataset_dir: Union[str, Path],
+) -> Tuple[bool, CanonicalDatasetIdentity, List[str]]:
+    """
+    Verify canonical Task 1 dataset against authoritative specification.
+    Returns (is_valid, identity, list_of_errors).
+    """
+    d = Path(dataset_dir)
+    errors: List[str] = []
+
+    if not d.is_dir():
+        return False, CanonicalDatasetIdentity(), [f"Dataset directory not found: {d}"]
+
+    # Required files
+    docs_p = d / "documents.parquet"
+    chunks_p = d / "chunks.parquet"
+    queries_train_p = d / "queries_train.parquet"
+    qrels_train_p = d / "qrels_train.parquet"
+    public_p = d / "public-official.json"
+    dup_p = d / "duplicate_groups.json"
+
+    num_docs = 0
+    num_chunks = 0
+    num_micro = 0
+    num_macro = 0
+    num_train_queries = 0
+    num_qrels = 0
+    num_public_queries = 0
+    num_duplicate_groups = 0
+
+    if docs_p.is_file():
+        meta = read_parquet_metadata_fast(docs_p)
+        num_docs = meta["num_rows"]
+        if num_docs != EXPECTED_DOCS:
+            errors.append(f"Expected {EXPECTED_DOCS} docs, found {num_docs}")
+    else:
+        errors.append(f"Missing {docs_p.name}")
+
+    if chunks_p.is_file():
+        meta = read_parquet_metadata_fast(chunks_p)
+        num_chunks = meta["num_rows"]
+        if num_chunks != EXPECTED_CHUNKS:
+            errors.append(f"Expected {EXPECTED_CHUNKS} chunks, found {num_chunks}")
+        # To count micro/macro, inspect table chunk_type column efficiently
+        try:
+            tbl = pq.read_table(str(chunks_p), columns=["chunk_type"])
+            chunk_types = tbl["chunk_type"].to_pylist()
+            num_micro = sum(1 for t in chunk_types if t == "micro")
+            num_macro = sum(1 for t in chunk_types if t == "macro")
+            if num_micro != EXPECTED_MICRO:
+                errors.append(f"Expected {EXPECTED_MICRO} micro chunks, found {num_micro}")
+            if num_macro != EXPECTED_MACRO:
+                errors.append(f"Expected {EXPECTED_MACRO} macro chunks, found {num_macro}")
+        except Exception as e:
+            errors.append(f"Error inspecting chunk_type: {e}")
+    else:
+        errors.append(f"Missing {chunks_p.name}")
+
+    if queries_train_p.is_file():
+        meta = read_parquet_metadata_fast(queries_train_p)
+        num_train_queries = meta["num_rows"]
+        if num_train_queries != EXPECTED_TRAIN_QUERIES:
+            errors.append(f"Expected {EXPECTED_TRAIN_QUERIES} train queries, found {num_train_queries}")
+    else:
+        errors.append(f"Missing {queries_train_p.name}")
+
+    if qrels_train_p.is_file():
+        meta = read_parquet_metadata_fast(qrels_train_p)
+        num_qrels = meta["num_rows"]
+        if num_qrels != EXPECTED_QRELS:
+            errors.append(f"Expected {EXPECTED_QRELS} qrels, found {num_qrels}")
+    else:
+        errors.append(f"Missing {qrels_train_p.name}")
+
+    if public_p.is_file():
+        try:
+            with open(public_p, "r", encoding="utf-8") as f:
+                pub_data = json.load(f)
+            num_public_queries = len(pub_data)
+            if num_public_queries != EXPECTED_PUBLIC_QUERIES:
+                errors.append(f"Expected {EXPECTED_PUBLIC_QUERIES} public queries, found {num_public_queries}")
+        except Exception as e:
+            errors.append(f"Failed parsing public-official.json: {e}")
+    else:
+        errors.append(f"Missing {public_p.name}")
+
+    if dup_p.is_file():
+        try:
+            with open(dup_p, "r", encoding="utf-8") as f:
+                dup_data = json.load(f)
+            num_duplicate_groups = len(dup_data)
+            if num_duplicate_groups != EXPECTED_DUPLICATE_GROUPS:
+                errors.append(f"Expected {EXPECTED_DUPLICATE_GROUPS} duplicate groups, found {num_duplicate_groups}")
+        except Exception as e:
+            errors.append(f"Failed parsing duplicate_groups.json: {e}")
+    else:
+        errors.append(f"Missing {dup_p.name}")
+
+    identity = CanonicalDatasetIdentity(
+        num_docs=num_docs,
+        num_chunks=num_chunks,
+        num_micro=num_micro,
+        num_macro=num_macro,
+        num_train_queries=num_train_queries,
+        num_qrels=num_qrels,
+        num_public_queries=num_public_queries,
+        num_duplicate_groups=num_duplicate_groups,
+    )
+
+    is_valid = len(errors) == 0 and identity.is_canonical_match()
+    return is_valid, identity, errors
