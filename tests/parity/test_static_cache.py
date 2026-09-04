@@ -99,6 +99,11 @@ def test_static_cache_cli_writes_nonempty_train_and_public_cache(tmp_path):
     import subprocess
     import sys
 
+    # Skip in CI if canonical dataset Parquet files are not present
+    dataset_p = Path("data/task1_canonical_v2")
+    if not (dataset_p / "chunks.parquet").is_file() and not Path("artifacts/task1/data/chunks.parquet").is_file():
+        pytest.skip("Full canonical dataset not present on disk.")
+
     out_dir = tmp_path / "cli_cache"
     cmd = [
         sys.executable,
