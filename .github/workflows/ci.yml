@@ -33,11 +33,6 @@ jobs:
       - run: python -m pip install --upgrade pip
       - run: pip install -r requirements.txt
       - run: python -m compileall -q src scripts
-      - run: python -c "from src.pipeline.kaggle_train import run_kaggle_pipeline; print('PIPELINE_IMPORT_OK')"
-      - run: python -c "from src.pipeline.oof_runner import OOFRunner; print('OOF_IMPORT_OK')"
-      - run: python -c "from src.training.build_pairs import build_training_pairs; print('PAIR_IMPORT_OK')"
-      - run: pytest -q
+      - run: pytest -q tests/unit tests/parity tests/leakage tests/memory tests/integration tests/release
       - run: python scripts/audit_parameters.py
-      - run: python scripts/smoke_kaggle_pipeline.py --tiny --run-mode smoke
-      - run: python scripts/check_notebook_parity.py
-      - run: python scripts/verify_release_approval.py --repo-root .
+      - run: python scripts/verify_release.py
