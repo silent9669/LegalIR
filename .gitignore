@@ -50,7 +50,7 @@ artifacts/local/
 
 # Raw BTC data
 artifacts/raw/
-artifacts/shared/raw/
+artifacts/shared/
 train.json
 public-official.json
 selected-contexts.zip
@@ -60,6 +60,8 @@ selected-contexts/
 artifacts/task1/indexes/
 artifacts/task1/checkpoints/
 artifacts/task1/smoke_run/
+artifacts/test_out/
+artifacts/test_out_fold/
 data/task1_canonical/
 artifacts/data/
 artifacts/indexes/
