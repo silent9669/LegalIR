@@ -1,0 +1,8 @@
+-r base.txt
+lightgbm>=4.0.0
+sentencepiece>=0.1.99
+bm25s>=0.2.0
+pyvi>=0.1.1
+peft>=0.7.0
+accelerate>=0.26.0
+faiss-cpu>=1.7.0
