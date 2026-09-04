@@ -34,6 +34,8 @@ RELEASE_ONLY_DIFF_ALLOWLIST: tuple[str, ...] = (
     "scripts/generate_colab_smoke_notebook.py",
     "legalir_training.ipynb",
     "kaggle_kernel_task1/legalir_training.ipynb",
+    "kaggle_kernel/legalir_training.ipynb",
+    "kaggle_kernel/legalqa_gpu_pipeline.ipynb",
     "notebooks/kaggle_final.ipynb",
     "notebooks/colab_t4_smoke.ipynb",
     "colab/legalir_t4_smoke.ipynb",
