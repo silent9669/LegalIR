@@ -1,27 +1,390 @@
-#!/usr/bin/env python3
-"""Generate the Kaggle Final Production Notebook pinning approved runtime commit."""
+"""
+Generate production-grade thin 5-cell Kaggle orchestrator notebook (legalir_training.ipynb)
+and refreshed pure-production notebook (notebooks/kaggle_final.ipynb).
+Zero PyTorch reinstallation on Kaggle.
+"""
+
+from __future__ import annotations
 
 import argparse
 import json
+import subprocess
+import sys
 from pathlib import Path
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
-def generate_kaggle_notebook(output_path: Path, runtime_commit: str = "a0efb25"):
+
+def get_current_git_commit(default: str = "572318b40bdcdef518d7ee55af22c6ad77fa9005") -> str:
+    """Get the current 40-character git commit SHA."""
+    try:
+        sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO_ROOT).decode("utf-8").strip()
+        if len(sha) == 40:
+            return sha
+    except Exception:
+        pass
+    return default
+
+
+def build_legalir_notebook(expected_commit: str | None = None) -> dict:
+    """Build the clean, thin 5-cell Kaggle orchestrator notebook with zero PyTorch reinstallation."""
+    commit_sha = expected_commit or get_current_git_commit()
+    cells = []
+
+    # Cell 0: Markdown - Title, objective, rules summary, competition constraints
+    cell_0 = {
+        "cell_type": "markdown",
+        "metadata": {},
+        "source": [
+            "# LegalIR Task 1: High-Recall Vietnamese Legal Information Retrieval\n",
+            "## UIT Data Science Challenge 2026 — End-to-End Kaggle T4 x2 Production Pipeline\n",
+            "\n",
+            "### System Architecture & Objectives:\n",
+            "- **Canonical Legal Structure**: Micro-chunks for statutory precision + Macro-chunks for semantic retrieval.\n",
+            "- **5-Branch Hybrid Candidate Retrieval**: Raw/Legal BM25 + PyVi BM25 + DEk21 Dense Macro + Train-Question Memory + Exact Matcher.\n",
+            "- **Query-Aware Evidence Localization**: Dynamic chunk selection within documents (2–4 chunks/doc).\n",
+            "- **Supervised Cross-Encoder Reranker**: Real LoRA/PEFT fine-tuning on fold-safe hard-negative pairs with duplicate-group blacklist.\n",
+            "- **Learned / OOF Fusion**: Out-of-fold validation with official Codabench scorer equivalence.\n",
+            "- **Strict Invariant Validation & Packaging**: Verification of query completeness, candidate bounds ($1 \\le |answer| \\le 5$, default 5), duplicate elimination, valid corpus IDs, <4B parameter budget audit, and `submission.zip` packaging containing strictly `submission.json` at root.\n",
+            "- **Dataset Source**: `phucdangg/legalir-task1-clean-data` (8,532 documents, 7,000 train queries, 1,000 public test queries).\n",
+            "\n",
+            "### Non-Negotiable Competition Constraints:\n",
+            "1. **Learned Parameter Budget**: Total system parameters strictly `< 4,000,000,000` (4B).\n",
+            "2. **Data Restriction**: Organizer Task 1 data only (no Task 2, no external legal texts, no external LLM APIs).\n",
+            "3. **Hardware Target**: Dual GPU T4 x2 optimized execution (GPU 0: Dense, GPU 1: Reranker).\n"
+        ]
+    }
+    cells.append(cell_0)
+
+    # Cell 1: Environment Setup, Global Seed & Kaggle Secret / GPU Detection
+    cell_1 = {
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": [
+            "# ==============================================================================\n",
+            "# Cell 1: Environment Setup, Global Seed & Kaggle Secret / GPU Detection\n",
+            "# ==============================================================================\n",
+            "import os\n",
+            "import sys\n",
+            "import gc\n",
+            "import json\n",
+            "import time\n",
+            "import random\n",
+            "from pathlib import Path\n",
+            "import numpy as np\n",
+            "import torch\n",
+            "\n",
+            "# 1. Global reproducibility seed\n",
+            "SEED = 42\n",
+            "random.seed(SEED)\n",
+            "np.random.seed(SEED)\n",
+            "torch.manual_seed(SEED)\n",
+            "if torch.cuda.is_available():\n",
+            "    torch.cuda.manual_seed_all(SEED)\n",
+            "    torch.backends.cudnn.deterministic = True\n",
+            "\n",
+            "# 2. Execution mode configuration: \"gpu_smoke\" for fast verification, \"full\" for complete competition run\n",
+            "RUN_MODE = os.environ.get(\"LEGALIR_RUN_MODE\", \"full\")  # \"full\" (default) or \"gpu_smoke\"\n",
+            "print(f\"[*] LegalIR Execution Mode: {RUN_MODE.upper()}\")\n",
+            "\n",
+            "# 3. Secure Kaggle Secret HF_TOKEN retrieval (NEVER print token value)\n",
+            "hf_token = os.environ.get(\"HF_TOKEN\")\n",
+            "try:\n",
+            "    from kaggle_secrets import UserSecretsClient\n",
+            "    user_secrets = UserSecretsClient()\n",
+            "    hf_token = user_secrets.get_secret(\"HF_TOKEN\")\n",
+            "    os.environ[\"HF_TOKEN\"] = hf_token\n",
+            "    print(\"[+] Hugging Face token securely loaded from Kaggle Secrets.\")\n",
+            "except Exception:\n",
+            "    if hf_token:\n",
+            "        print(\"[+] Hugging Face token present in environment.\")\n",
+            "    else:\n",
+            "        print(\"[-] HF_TOKEN not found in Kaggle Secrets (public models will be used).\")\n",
+            "\n",
+            "# 4. Hardware and Dual GPU (T4 x2) Detection (P1.10)\n",
+            "device_count = torch.cuda.device_count()\n",
+            "print(f\"[+] CUDA Available: {torch.cuda.is_available()} | Device Count: {device_count}\")\n",
+            "if device_count > 0:\n",
+            "    for i in range(device_count):\n",
+            "        prop = torch.cuda.get_device_properties(i)\n",
+            "        vram_gb = prop.total_memory / (1024**3)\n",
+            "        print(f\"    - GPU {i}: {prop.name} | Total VRAM: {vram_gb:.2f} GB | Compute Capability: {prop.major}.{prop.minor}\")\n",
+            "    if device_count >= 2:\n",
+            "        print(\"[+] Dual GPU environment detected (T4 x2). Multi-GPU staging enabled (GPU 0: Dense, GPU 1: Reranker).\")\n",
+            "else:\n",
+            "    print(\"[!] Running on CPU.\")\n"
+        ]
+    }
+    cells.append(cell_1)
+
+    # Cell 2: Repository Bootstrap & Minimal Dependencies Installation (Zero torch reinstall)
+    cell_2 = {
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": [
+            "# ==============================================================================\n",
+            "# Cell 2: Repository Bootstrap & Minimal Dependencies Installation (Zero Torch Reinstall)\n",
+            "# ==============================================================================\n",
+            "import subprocess\n",
+            "\n",
+            "# Ensure repo root or /kaggle/working/LegalIR is in sys.path\n",
+            "CWD = Path.cwd()\n",
+            "possible_repo_paths = [\n",
+            "    CWD,\n",
+            "    CWD / \"LegalIR\",\n",
+            "    Path(\"/kaggle/working/LegalIR\"),\n",
+            "    Path(\"/kaggle/working\"),\n",
+            "]\n",
+            "\n",
+            f'EXPECTED_COMMIT = os.environ.get("LEGALIR_COMMIT_SHA", "{commit_sha}")\n',
+            "REPO_ROOT = None\n",
+            "for p in possible_repo_paths:\n",
+            "    if (p / \"src\" / \"pipeline\").exists():\n",
+            "        REPO_ROOT = p.resolve()\n",
+            "        break\n",
+            "\n",
+            "if REPO_ROOT is None:\n",
+            "    print(\"[*] Cloning LegalIR repository into /kaggle/working/LegalIR...\")\n",
+            "    target_dir = Path(\"/kaggle/working/LegalIR\")\n",
+            "    if not target_dir.exists():\n",
+            "        subprocess.run([\"git\", \"clone\", \"https://github.com/silent9669/LegalIR.git\", str(target_dir)], check=True)\n",
+            "    if EXPECTED_COMMIT and EXPECTED_COMMIT != \"main\":\n",
+            "        subprocess.run([\"git\", \"fetch\", \"--all\"], cwd=target_dir, check=True)\n",
+            "        subprocess.run([\"git\", \"checkout\", \"--detach\", EXPECTED_COMMIT], cwd=target_dir, check=True)\n",
+            "    REPO_ROOT = target_dir.resolve()\n",
+            "\n",
+            "# Verify actual commit SHA matches EXPECTED_COMMIT (fail-closed)\n",
+            "try:\n",
+            "    actual_commit = subprocess.check_output([\"git\", \"rev-parse\", \"HEAD\"], cwd=REPO_ROOT).decode(\"utf-8\").strip()\n",
+            "except Exception as e:\n",
+            "    raise RuntimeError(f\"Failed to determine git commit SHA in {REPO_ROOT}: {e}\") from e\n",
+            "\n",
+            "if EXPECTED_COMMIT and EXPECTED_COMMIT != \"main\":\n",
+            "    if actual_commit != EXPECTED_COMMIT:\n",
+            "        try:\n",
+            "            subprocess.run([\"git\", \"fetch\", \"--all\"], cwd=REPO_ROOT, check=True)\n",
+            "            subprocess.run([\"git\", \"checkout\", \"--detach\", EXPECTED_COMMIT], cwd=REPO_ROOT, check=True)\n",
+            "            actual_commit = subprocess.check_output([\"git\", \"rev-parse\", \"HEAD\"], cwd=REPO_ROOT).decode(\"utf-8\").strip()\n",
+            "        except Exception as e:\n",
+            "            raise RuntimeError(f\"Fail-closed bootstrap error: failed to checkout EXPECTED_COMMIT={EXPECTED_COMMIT} in {REPO_ROOT}: {e}\") from e\n",
+            "    if actual_commit != EXPECTED_COMMIT:\n",
+            "        raise RuntimeError(f\"Fail-closed commit pin violation: expected {EXPECTED_COMMIT}, got {actual_commit}\")\n",
+            "\n",
+            "if str(REPO_ROOT) not in sys.path:\n",
+            "    sys.path.insert(0, str(REPO_ROOT))\n",
+            "\n",
+            "# Check and install minimal missing dependencies (zero PyTorch reinstallation)\n",
+            "print(\"[*] Checking and installing minimal required dependencies (zero torch reinstall)...\")\n",
+            "required_pkgs = []\n",
+            "for mod, pkg in [\n",
+            "    (\"lightgbm\", \"lightgbm\"),\n",
+            "    (\"sentencepiece\", \"sentencepiece\"),\n",
+            "    (\"bm25s\", \"bm25s\"),\n",
+            "    (\"pyvi\", \"pyvi\"),\n",
+            "    (\"peft\", \"peft\"),\n",
+            "    (\"accelerate\", \"accelerate\"),\n",
+            "    (\"faiss\", \"faiss-cpu\"),\n",
+            "    (\"psutil\", \"psutil\"),\n",
+            "]:\n",
+            "    try:\n",
+            "        __import__(mod)\n",
+            "    except ImportError:\n",
+            "        required_pkgs.append(pkg)\n",
+            "\n",
+            "if required_pkgs:\n",
+            "    print(f\"[*] Installing missing packages: {required_pkgs}\")\n",
+            "    subprocess.run([sys.executable, \"-m\", \"pip\", \"install\", \"-q\", \"--no-warn-script-location\"] + required_pkgs, check=True)\n",
+            "    print(\"[+] Minimal dependencies installed successfully.\")\n",
+            "else:\n",
+            "    print(\"[+] All required dependencies are already available.\")\n",
+            "\n",
+            "# Verify critical dependencies\n",
+            "for mod in [\"lightgbm\", \"sentencepiece\", \"bm25s\", \"pyvi\", \"peft\", \"accelerate\", \"faiss\", \"psutil\"]:\n",
+            "    __import__(mod)\n",
+            "print(\"[+] All critical dependencies verified.\")\n",
+            "\n",
+            "print(f\"[+] Repository Root: {REPO_ROOT}\")\n",
+            "print(f\"[+] Git Commit SHA : {actual_commit}\")\n",
+            "print(f\"[+] Python Version  : {sys.version.split()[0]}\")\n",
+            "print(f\"[+] PyTorch Version : {torch.__version__}\")\n"
+        ]
+    }
+    cells.append(cell_2)
+
+    # Cell 3: Canonical Dataset & Working Directory Discovery & Lightweight Identity Check
+    cell_3 = {
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": [
+            "# ==============================================================================\n",
+            "# Cell 3: Canonical Dataset & Working Directory Discovery & Lightweight Identity Check\n",
+            "# ==============================================================================\n",
+            "import pyarrow.parquet as pq\n",
+            "from src.pipeline.kaggle_train import (\n",
+            "    OFFICIAL_PUBLIC_QUERY_COUNT,\n",
+            "    discover_data_dir,\n",
+            "    discover_public_test_file,\n",
+            "    validate_official_task1_identity,\n",
+            ")\n",
+            "\n",
+            "DATA_DIR = discover_data_dir(repo_root=REPO_ROOT)\n",
+            "WORKING_DIR = Path(\"/kaggle/working/legalir_run\") if Path(\"/kaggle/working\").exists() else REPO_ROOT / \"artifacts/task1/submissions\"\n",
+            "WORKING_DIR.mkdir(parents=True, exist_ok=True)\n",
+            "PUBLIC_TEST_FILE = discover_public_test_file(repo_root=REPO_ROOT)\n",
+            "\n",
+            "print(f\"[+] Canonical Data Directory: {DATA_DIR}\")\n",
+            "print(f\"[+] Working Directory       : {WORKING_DIR}\")\n",
+            "print(f\"[+] Public Test Queries     : {PUBLIC_TEST_FILE}\")\n",
+            "\n",
+            "# Lightweight Parquet metadata row counts\n",
+            "docs_rows = pq.ParquetFile(DATA_DIR / \"documents.parquet\").metadata.num_rows if (DATA_DIR / \"documents.parquet\").exists() else 0\n",
+            "chunks_rows = pq.ParquetFile(DATA_DIR / \"chunks.parquet\").metadata.num_rows if (DATA_DIR / \"chunks.parquet\").exists() else 0\n",
+            "queries_rows = pq.ParquetFile(DATA_DIR / \"queries_train.parquet\").metadata.num_rows if (DATA_DIR / \"queries_train.parquet\").exists() else 0\n",
+            "qrels_rows = pq.ParquetFile(DATA_DIR / \"qrels_train.parquet\").metadata.num_rows if (DATA_DIR / \"qrels_train.parquet\").exists() else 0\n",
+            "public_data = json.loads(PUBLIC_TEST_FILE.read_text(encoding=\"utf-8\")) if (PUBLIC_TEST_FILE and PUBLIC_TEST_FILE.exists()) else {}\n",
+            "public_rows = len(public_data)\n",
+            "\n",
+            "# Strict v2 Dataset Identity Verification\n",
+            "manifest_file = DATA_DIR / \"manifest.json\"\n",
+            "audit_file = DATA_DIR / \"audit_report.json\"\n",
+            "manifest_data = json.loads(manifest_file.read_text(encoding=\"utf-8\")) if manifest_file.exists() else {}\n",
+            "audit_data = json.loads(audit_file.read_text(encoding=\"utf-8\")) if audit_file.exists() else {}\n",
+            "\n",
+            "n_micro = manifest_data.get(\"total_micro_chunks\", manifest_data.get(\"micro_chunks\", 0))\n",
+            "n_macro = manifest_data.get(\"total_macro_chunks\", manifest_data.get(\"macro_chunks\", 0))\n",
+            "\n",
+            "print(f\"[+] Canonical Manifest Version: {manifest_data.get('version', 'unknown')}\")\n",
+            "print(f\"[+] Canonical Schema          : {manifest_data.get('schema', 'unknown')}\")\n",
+            "print(f\"[+] Documents Count           : {docs_rows:,} (expected 8,532)\")\n",
+            "print(f\"[+] Total Chunks Count        : {chunks_rows:,} (expected 1,153,876) [Micro: {n_micro:,}, Macro: {n_macro:,}]\")\n",
+            "print(f\"[+] Train Queries Count       : {queries_rows:,} (expected 7,000)\")\n",
+            "print(f\"[+] Qrels Count               : {qrels_rows:,} (expected 7,637)\")\n",
+            "print(f\"[+] Public Queries Count      : {public_rows:,} (expected 1,000)\")\n",
+            "print(f\"[+] Audit Report Valid        : {audit_data.get('is_valid', False)} | Errors: {audit_data.get('errors', [])}\")\n",
+            "\n",
+            "if docs_rows != 8532:\n",
+            "    raise ValueError(f\"Dataset identity mismatch: documents count is {docs_rows}, expected 8,532\")\n",
+            "if chunks_rows != 1153876:\n",
+            "    raise ValueError(f\"Dataset identity mismatch: chunks count is {chunks_rows}, expected 1,153,876\")\n",
+            "if queries_rows != 7000:\n",
+            "    raise ValueError(f\"Dataset identity mismatch: train queries count is {queries_rows}, expected 7,000\")\n",
+            "if qrels_rows != 7637:\n",
+            "    raise ValueError(f\"Dataset identity mismatch: qrels count is {qrels_rows}, expected 7,637\")\n",
+            "if public_rows != 1000:\n",
+            "    raise ValueError(f\"Dataset identity mismatch: public queries count is {public_rows}, expected 1,000\")\n",
+            "identity_report = validate_official_task1_identity(\n",
+            "    data_dir=DATA_DIR,\n",
+            "    public_json_path=PUBLIC_TEST_FILE,\n",
+            "    strict=True,\n",
+            ")\n",
+            "print(\"[+] Dataset identity verification passed: Exact official v2 canonical dataset confirmed.\")\n"
+        ]
+    }
+    cells.append(cell_3)
+
+    # Cell 4: Execute Complete End-to-End Pipeline
+    cell_4 = {
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": [
+            "# ==============================================================================\n",
+            "# Cell 4: Execute Complete End-to-End Pipeline via run_kaggle_pipeline(...)\n",
+            "# ==============================================================================\n",
+            "from src.pipeline.kaggle_train import run_kaggle_pipeline\n",
+            "\n",
+            "print(\"[*] Launching LegalIR 24-Step Production Pipeline...\")\n",
+            "result = run_kaggle_pipeline(\n",
+            "    data_dir=DATA_DIR,\n",
+            "    working_dir=WORKING_DIR,\n",
+            "    run_mode=RUN_MODE,\n",
+            "    hf_token=hf_token,\n",
+            "    public_json_path=PUBLIC_TEST_FILE,\n",
+            "    repo_root=REPO_ROOT,\n",
+            ")\n",
+            "\n",
+            "print(\"\\n\" + \"=\" * 80)\n",
+            "print(\"LEGALIR KAGGLE RUN RESULTS SUMMARY:\")\n",
+            "print(\"=\" * 80)\n",
+            "print(f\"  - Pipeline Valid                      : {result.is_valid}\")\n",
+            "print(f\"  - Reranker OOF Mean Recall@5          : {result.cv_report.get('mean_recall@5', 0.0) * 100:.4f}%\")\n",
+            "print(f\"  - Fusion Winner                       : {result.fusion_report.get('winning_method', 'N/A')}\")\n",
+            "print(f\"  - Fusion Winner Cross-Fitted Recall@5 : {result.fusion_report.get('winner_mean_recall@5', result.cv_report.get('mean_recall@5', 0.0)) * 100:.4f}%\")\n",
+            "print(f\"  - Candidate Recall@150                : {result.cv_report.get('mean_candidate@150', 0.0) * 100:.4f}%\")\n",
+            "print(f\"  - Public Predictions                  : {result.public_predictions_count:,} queries\")\n",
+            "print(f\"  - Learned Parameters                  : {result.audit_report.get('total_learned_parameters', 0):,} / 4.0B limit ({result.audit_report.get('budget_utilization_pct', 0.0):.2f}%)\")\n",
+            "print(f\"  - Total Execution Time                : {result.execution_time_seconds:.2f}s\")\n",
+            "print(f\"  - Submission JSON                     : {result.submission_path}\")\n",
+            "print(f\"  - Submission ZIP                      : {result.submission_zip_path} ({result.submission_zip_path.stat().st_size:,} bytes)\")\n",
+            "print(f\"  - Submission Manifest                 : {result.manifest_path}\")\n",
+            "print(\"=\" * 80)\n"
+        ]
+    }
+    cells.append(cell_4)
+
+    return {
+        "cells": cells,
+        "metadata": {
+            "kaggle": {
+                "accelerator": "nvidiaTeslaT4",
+                "isGpuEnabled": True,
+                "isInternetEnabled": True,
+                "language": "python",
+                "sourceType": "notebook"
+            },
+            "language_info": {"name": "python", "version": "3.10.12"}
+        },
+        "nbformat": 4,
+        "nbformat_minor": 4,
+    }
+
+
+def generate_and_save_notebooks(repo_root: Path | None = None) -> tuple[Path, Path]:
+    """Generate legalir_training.ipynb and ensure byte-level identity across root and kaggle_kernel_task1/."""
+    root = repo_root or REPO_ROOT
+    nb_dict = build_legalir_notebook()
+
+    nb_json = json.dumps(nb_dict, indent=1, ensure_ascii=False) + "\n"
+
+    root_nb = root / "legalir_training.ipynb"
+    kernel_dir = root / "kaggle_kernel_task1"
+    kernel_dir.mkdir(parents=True, exist_ok=True)
+    kernel_nb = kernel_dir / "legalir_training.ipynb"
+
+    root_nb.write_text(nb_json, encoding="utf-8")
+    kernel_nb.write_text(nb_json, encoding="utf-8")
+
+    assert root_nb.read_bytes() == kernel_nb.read_bytes(), "Root and kernel notebooks must be byte-identical"
+    return root_nb, kernel_nb
+
+
+def generate_kaggle_notebook(output_path: Path, runtime_commit: str | None = None) -> Path:
+    """Generate refreshed pure-production Kaggle final notebook (notebooks/kaggle_final.ipynb)."""
+    commit_sha = runtime_commit or get_current_git_commit()
+    if len(commit_sha) != 40:
+        raise ValueError(f"runtime_commit must be a 40-character Git commit SHA, got: '{commit_sha}'")
+
     cells = [
         {
             "cell_type": "markdown",
             "metadata": {},
             "source": [
                 "# LegalIR Kaggle Final Production Trainer\n",
-                f"**Pinned Runtime Commit:** `{runtime_commit}`\n",
+                f"**Pinned Runtime Commit:** `{commit_sha}`\n",
                 "\n",
-                "This notebook executes the pure production run:\n",
-                "- Verifies approved runtime SHA and canonical dataset identity\n",
-                "- Verifies production bundle fingerprints\n",
-                "- Trains exactly one final BGE LoRA adapter on all 7,000 queries (effective batch 16)\n",
-                "- Reranks public candidates using frozen fusion & top-5 selector\n",
-                "- Validates strict submission criteria and packages `submission.zip`\n",
-                "*(Does NOT run 5-fold OOF, doc-disjoint validation, or heavy index builds)*\n",
+                "Production execution:\n",
+                "- Verify exact runtime SHA and canonical dataset identity\n",
+                "- Verify production bundle fingerprints\n",
+                "- Train one final BGE LoRA adapter on all 7,000 queries (effective batch 16)\n",
+                "- Rerank public candidates using frozen fusion & top-5 selector\n",
+                "- Validate strict submission criteria and package `submission.zip`\n",
             ],
         },
         {
@@ -34,8 +397,7 @@ def generate_kaggle_notebook(output_path: Path, runtime_commit: str = "a0efb25")
                 "!nvidia-smi\n",
                 "import torch\n",
                 "assert torch.cuda.is_available(), 'CUDA required!'\n",
-                "num_gpus = torch.cuda.device_count()\n",
-                "print(f'CUDA GPUs available: {num_gpus}')\n",
+                "print(f'CUDA Devices: {torch.cuda.device_count()}')\n",
             ],
         },
         {
@@ -44,11 +406,22 @@ def generate_kaggle_notebook(output_path: Path, runtime_commit: str = "a0efb25")
             "metadata": {},
             "outputs": [],
             "source": [
-                "# K0.1: Checkout pinned approved runtime\n",
-                "!git clone https://github.com/silent9669/LegalIR.git repo\n",
-                "%cd repo\n",
-                f"!git checkout {runtime_commit}\n",
-                "!pip install -q -r requirements.txt\n",
+                "# K0.1: Clone and checkout pinned approved runtime (Zero torch reinstall)\n",
+                "import subprocess, sys\n",
+                "from pathlib import Path\n",
+                "!git clone https://github.com/silent9669/LegalIR.git /kaggle/working/LegalIR\n",
+                "%cd /kaggle/working/LegalIR\n",
+                f"!git checkout {commit_sha}\n",
+                "\n",
+                "# Check and install minimal dependencies (zero PyTorch reinstallation)\n",
+                "required_pkgs = []\n",
+                "for mod, pkg in [('lightgbm', 'lightgbm'), ('sentencepiece', 'sentencepiece'), ('bm25s', 'bm25s'), ('pyvi', 'pyvi'), ('peft', 'peft'), ('accelerate', 'accelerate'), ('faiss', 'faiss-cpu'), ('psutil', 'psutil')]:\n",
+                "    try:\n",
+                "        __import__(mod)\n",
+                "    except ImportError:\n",
+                "        required_pkgs.append(pkg)\n",
+                "if required_pkgs:\n",
+                "    subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', '--no-warn-script-location'] + required_pkgs, check=True)\n",
             ],
         },
         {
@@ -81,8 +454,14 @@ def generate_kaggle_notebook(output_path: Path, runtime_commit: str = "a0efb25")
     nb_data = {
         "cells": cells,
         "metadata": {
+            "kaggle": {
+                "accelerator": "nvidiaTeslaT4",
+                "isGpuEnabled": True,
+                "isInternetEnabled": True,
+                "language": "python",
+                "sourceType": "notebook"
+            },
             "language_info": {"name": "python"},
-            "accelerator": "GPU",
         },
         "nbformat": 4,
         "nbformat_minor": 2,
@@ -91,16 +470,20 @@ def generate_kaggle_notebook(output_path: Path, runtime_commit: str = "a0efb25")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(nb_data, f, indent=2)
-    print(f"[+] Kaggle final notebook generated at {output_path}")
+
+    return output_path
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate Kaggle final notebook.")
+    parser = argparse.ArgumentParser(description="Generate Kaggle production notebooks.")
     parser.add_argument("--output", type=str, default="notebooks/kaggle_final.ipynb")
-    parser.add_argument("--commit", type=str, default="a0efb25")
+    parser.add_argument("--commit", type=str, default=None)
     args = parser.parse_args()
 
-    generate_kaggle_notebook(Path(args.output), runtime_commit=args.commit)
+    commit_sha = args.commit or get_current_git_commit()
+    generate_and_save_notebooks(REPO_ROOT)
+    generate_kaggle_notebook(Path(args.output), runtime_commit=commit_sha)
+    print(f"[+] All Kaggle notebooks generated with commit pin: {commit_sha}")
 
 
 if __name__ == "__main__":

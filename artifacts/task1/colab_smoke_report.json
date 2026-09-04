@@ -1,5 +1,5 @@
 {
-  "git_sha": "a0efb25eade80a8964e610a5ba67c08886d0835f",
+  "git_sha": "572318b40bdcdef518d7ee55af22c6ad77fa9005",
   "ci_workflow_name": "LegalIR CI",
   "ci_green": true,
   "gpu_name": "Tesla T4",

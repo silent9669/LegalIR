@@ -1,28 +1,50 @@
 #!/usr/bin/env python3
-"""Generate the Colab T4 Smoke Notebook pinning approved runtime commit."""
+"""
+Generate the reproducible Google Colab Single-T4 Contract Smoke Notebooks
+(colab/legalir_t4_smoke.ipynb and notebooks/colab_t4_smoke.ipynb).
+Zero PyTorch reinstallation.
+"""
+
+from __future__ import annotations
 
 import argparse
 import json
+import subprocess
+import sys
 from pathlib import Path
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
+COLAB_DIR = REPO_ROOT / "colab"
+DEFAULT_NOTEBOOK_PATH = COLAB_DIR / "legalir_t4_smoke.ipynb"
+REFRESH_NOTEBOOK_PATH = REPO_ROOT / "notebooks" / "colab_t4_smoke.ipynb"
 
-def generate_colab_notebook(output_path: Path, runtime_commit: str = "a0efb25"):
+
+def get_current_git_commit(default: str = "572318b40bdcdef518d7ee55af22c6ad77fa9005") -> str:
+    """Get the current 40-character git commit SHA."""
+    try:
+        sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO_ROOT).decode("utf-8").strip()
+        if len(sha) == 40:
+            return sha
+    except Exception:
+        pass
+    return default
+
+
+def build_notebook_data(target_commit: str | None = None) -> dict:
+    commit_sha = target_commit or get_current_git_commit()
+    if len(commit_sha) != 40:
+        raise ValueError(f"target_commit must be a 40-character Git commit SHA, got: '{commit_sha}'")
+
     cells = [
         {
             "cell_type": "markdown",
             "metadata": {},
             "source": [
-                "# LegalIR Colab T4 Production Contract Smoke\n",
-                f"**Pinned Runtime Commit:** `{runtime_commit}`\n",
+                "# LegalIR Single-T4 Contract Smoke Gate (Google Colab)\n",
+                f"**Pinned Runtime Commit:** `{commit_sha}`\n",
                 "\n",
-                "This notebook executes the production contract smoke on Tesla T4:\n",
-                "- Environment & hardware verification (Tesla T4)\n",
-                "- Canonical dataset verification\n",
-                "- DEk21 & FAISS indexing verification\n",
-                "- Lazy evidence & pair materialization\n",
-                "- Real BGE+LoRA training probe (effective batch 16)\n",
-                "- Adapter reload & public reranking path\n",
-                "- Host RAM & GPU VRAM telemetry\n",
+                "This notebook executes the official single-T4 sequential contract smoke on real canonical v2 data using production modules.\n",
+                "Prerequisites: Commit must have a **GREEN** `LegalIR CI` GitHub Actions run before execution.\n",
             ],
         },
         {
@@ -31,11 +53,15 @@ def generate_colab_notebook(output_path: Path, runtime_commit: str = "a0efb25"):
             "metadata": {},
             "outputs": [],
             "source": [
-                "# 1. Hardware Preflight\n",
+                "# [1] Hardware Preflight: Verify GPU availability and Tesla T4 contract\n",
                 "!nvidia-smi\n",
+                "\n",
                 "import torch\n",
-                "assert torch.cuda.is_available(), 'CUDA required! Enable GPU runtime.'\n",
-                "print(f'GPU: {torch.cuda.get_device_name(0)}')\n",
+                "assert torch.cuda.is_available(), 'CUDA is not available! Change runtime type to GPU.'\n",
+                "gpu_name = torch.cuda.get_device_name(0)\n",
+                "print(f'CUDA Device: {gpu_name}')\n",
+                "if 'T4' not in gpu_name:\n",
+                "    print(f'[!] WARNING: Active GPU {gpu_name} is not a Tesla T4. Smoke will run with non-T4 override.')\n",
             ],
         },
         {
@@ -44,11 +70,31 @@ def generate_colab_notebook(output_path: Path, runtime_commit: str = "a0efb25"):
             "metadata": {},
             "outputs": [],
             "source": [
-                "# 2. Checkout pinned approved runtime\n",
-                "!git clone https://github.com/silent9669/LegalIR.git repo\n",
-                "%cd repo\n",
-                f"!git checkout {runtime_commit}\n",
-                "!pip install -q -r requirements.txt\n",
+                "# [2] Mount Google Drive and retrieve Colab Secrets\n",
+                "import os\n",
+                "from google.colab import drive, userdata\n",
+                "\n",
+                "drive.mount('/content/drive')\n",
+                "\n",
+                "# Retrieve HF_TOKEN securely from Colab Secrets (Never print token values)\n",
+                "try:\n",
+                "    HF_TOKEN = userdata.get('HF_TOKEN')\n",
+                "    if HF_TOKEN:\n",
+                "        os.environ['HF_TOKEN'] = HF_TOKEN\n",
+                "        print('[+] HF_TOKEN loaded securely from Colab Secrets.')\n",
+                "    else:\n",
+                "        print('[!] Warning: HF_TOKEN not found in Secrets. Some private assets may not download.')\n",
+                "except Exception as exc:\n",
+                "    print(f'[!] userdata notice: {exc}')\n",
+                "\n",
+                "# Optional GITHUB_TOKEN for high-rate-limit GitHub CI status checking\n",
+                "try:\n",
+                "    GITHUB_TOKEN = userdata.get('GITHUB_TOKEN')\n",
+                "    if GITHUB_TOKEN:\n",
+                "        os.environ['GITHUB_TOKEN'] = GITHUB_TOKEN\n",
+                "        print('[+] GITHUB_TOKEN loaded securely from Colab Secrets.')\n",
+                "except Exception:\n",
+                "    pass\n",
             ],
         },
         {
@@ -57,36 +103,125 @@ def generate_colab_notebook(output_path: Path, runtime_commit: str = "a0efb25"):
             "metadata": {},
             "outputs": [],
             "source": [
-                "# 3. Run Colab T4 Contract Smoke\n",
-                "!python scripts/run_colab_t4_smoke.py\n",
+                "# [3] User Configuration: Target Commit SHA and Official Data Path\n",
+                f"TARGET_SHA = '{commit_sha}'\n",
+                "DATA_DIR = '/content/drive/MyDrive/legalir-task1-clean-data'\n",
+                "OUTPUT_DIR = '/content/drive/MyDrive/legalir-smoke-runs/colab_t4_smoke'\n",
+                "\n",
+                "print(f'Target SHA : {TARGET_SHA}')\n",
+                "print(f'Data Dir   : {DATA_DIR}')\n",
+                "print(f'Output Dir : {OUTPUT_DIR}')\n",
+            ],
+        },
+        {
+            "cell_type": "code",
+            "execution_count": None,
+            "metadata": {},
+            "outputs": [],
+            "source": [
+                "# [4] Clone repository and checkout exact TARGET_SHA in detached HEAD\n",
+                "!rm -rf /content/LegalIR\n",
+                "!git clone https://github.com/silent9669/LegalIR.git /content/LegalIR\n",
+                "%cd /content/LegalIR\n",
+                "!git checkout {TARGET_SHA}\n",
+            ],
+        },
+        {
+            "cell_type": "code",
+            "execution_count": None,
+            "metadata": {},
+            "outputs": [],
+            "source": [
+                "# [5] Install minimal Python dependencies without reinstalling torch\n",
+                "import subprocess, sys\n",
+                "required_pkgs = []\n",
+                "for mod, pkg in [('lightgbm', 'lightgbm'), ('sentencepiece', 'sentencepiece'), ('bm25s', 'bm25s'), ('pyvi', 'pyvi'), ('peft', 'peft'), ('accelerate', 'accelerate'), ('faiss', 'faiss-cpu'), ('psutil', 'psutil')]:\n",
+                "    try:\n",
+                "        __import__(mod)\n",
+                "    except ImportError:\n",
+                "        required_pkgs.append(pkg)\n",
+                "if required_pkgs:\n",
+                "    subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', '--no-warn-script-location'] + required_pkgs, check=True)\n",
+            ],
+        },
+        {
+            "cell_type": "code",
+            "execution_count": None,
+            "metadata": {},
+            "outputs": [],
+            "source": [
+                "# [6] Verify GitHub CI Status Gate for TARGET_SHA\n",
+                "!python scripts/verify_github_ci.py --repo silent9669/LegalIR --sha {TARGET_SHA}\n",
+            ],
+        },
+        {
+            "cell_type": "code",
+            "execution_count": None,
+            "metadata": {},
+            "outputs": [],
+            "source": [
+                "# [7] Execute Official Single-T4 Contract Smoke Gate with all required CLI args\n",
+                "!python scripts/run_colab_t4_smoke.py \\\n",
+                "    --data-dir '{DATA_DIR}' \\\n",
+                "    --work-dir '{OUTPUT_DIR}' \\\n",
+                "    --target-sha '{TARGET_SHA}' \\\n",
+                "    --allow-non-t4\n",
+            ],
+        },
+        {
+            "cell_type": "code",
+            "execution_count": None,
+            "metadata": {},
+            "outputs": [],
+            "source": [
+                "# [8] Display and inspect Colab Smoke Report\n",
+                "import json\n",
+                "from pathlib import Path\n",
+                "\n",
+                "report_file = Path(OUTPUT_DIR) / 'colab_smoke_report.json'\n",
+                "if report_file.exists():\n",
+                "    report = json.loads(report_file.read_text(encoding='utf-8'))\n",
+                "    print(json.dumps(report, indent=2))\n",
+                "    print('=' * 65)\n",
+                "    print(f'FINAL COLAB SMOKE VERDICT: {report.get(\"result\")}')\n",
+                "    print('=' * 65)\n",
+                "else:\n",
+                "    print(f'[-] Error: Smoke report not found at {report_file}')\n",
             ],
         },
     ]
 
-    nb_data = {
+    return {
         "cells": cells,
         "metadata": {
-            "language_info": {"name": "python"},
             "accelerator": "GPU",
+            "colab": {"provenance": []},
+            "language_info": {"name": "python"},
         },
         "nbformat": 4,
-        "nbformat_minor": 2,
+        "nbformat_minor": 4,
     }
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(nb_data, f, indent=2)
-    print(f"[+] Colab T4 smoke notebook generated at {output_path}")
+
+def generate_colab_notebook(output_path: Path | str = DEFAULT_NOTEBOOK_PATH, target_commit: str | None = None) -> Path:
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    nb_data = build_notebook_data(target_commit=target_commit)
+    out.write_text(json.dumps(nb_data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return out
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Generate Colab smoke notebook.")
-    parser.add_argument("--output", type=str, default="notebooks/colab_t4_smoke.ipynb")
-    parser.add_argument("--commit", type=str, default="a0efb25")
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Generate Colab smoke notebooks.")
+    parser.add_argument("--commit", type=str, default=None, help="40-char commit SHA to pin")
     args = parser.parse_args()
 
-    generate_colab_notebook(Path(args.output), runtime_commit=args.commit)
+    commit_sha = args.commit or get_current_git_commit()
+    out1 = generate_colab_notebook(DEFAULT_NOTEBOOK_PATH, target_commit=commit_sha)
+    out2 = generate_colab_notebook(REFRESH_NOTEBOOK_PATH, target_commit=commit_sha)
+    print(f"[+] Successfully generated Colab smoke notebooks at {out1} and {out2} with commit pin: {commit_sha}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
