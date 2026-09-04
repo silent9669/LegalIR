@@ -1,4 +1,4 @@
-"""Static retrieval candidate cache schema, streaming Parquet writer, and reader."""
+"""Static retrieval candidate cache schema, streaming Parquet writer, and memory-bounded reader."""
 
 from __future__ import annotations
 
@@ -6,8 +6,9 @@ import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
-import pandas as pd
 import pyarrow as pa
+import pyarrow.compute as pc
+import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 
 
@@ -46,6 +47,7 @@ class StaticCacheWriter:
     """
     Streams static retrieval candidates to normalized Parquet in bounded batches.
     Guaranteed label-free: takes no qrels, ground-truth, or fold labels.
+    Persists a companion query index (.index.json) to allow memory-bounded access.
     """
 
     def __init__(self, output_path: Union[str, Path], batch_size: int = 5000):
@@ -54,6 +56,7 @@ class StaticCacheWriter:
         self.buffer: List[StaticCandidateRecord] = []
         self.writer: Optional[pq.ParquetWriter] = None
         self.total_written = 0
+        self.query_index: Dict[str, Dict[str, int]] = {}  # query_id -> {start, count}
 
     def _init_writer(self) -> None:
         if self.writer is None:
@@ -61,6 +64,12 @@ class StaticCacheWriter:
             self.writer = pq.ParquetWriter(str(self.output_path), STATIC_CACHE_SCHEMA)
 
     def write_record(self, record: StaticCandidateRecord) -> None:
+        qid = record.query_id
+        if qid not in self.query_index:
+            self.query_index[qid] = {"start": self.total_written + len(self.buffer), "count": 1}
+        else:
+            self.query_index[qid]["count"] += 1
+
         self.buffer.append(record)
         if len(self.buffer) >= self.batch_size:
             self.flush()
@@ -97,50 +106,83 @@ class StaticCacheWriter:
             self.writer.close()
             self.writer = None
 
+        # Write companion query index
+        index_path = self.output_path.with_suffix(".index.json")
+        with open(index_path, "w", encoding="utf-8") as f:
+            json.dump(self.query_index, f)
+
 
 class StaticCacheReader:
-    """Reads static retrieval candidates efficiently without loading underlying models."""
+    """
+    Memory-bounded reader for static retrieval candidates.
+    Never materializes the entire cache table into Pandas memory.
+    Uses PyArrow Dataset predicate pushdown filtering.
+    """
 
     def __init__(self, cache_path: Union[str, Path]):
         self.cache_path = Path(cache_path)
         if not self.cache_path.is_file():
             raise FileNotFoundError(f"Static cache file not found: {self.cache_path}")
-        self._table: Optional[pa.Table] = None
-        self._df: Optional[pd.DataFrame] = None
 
-    def _ensure_df(self) -> pd.DataFrame:
-        if self._df is None:
-            self._df = pq.read_table(str(self.cache_path)).to_pandas()
-        return self._df
+        self.dataset = ds.dataset(str(self.cache_path), format="parquet")
+        self._query_ids: Optional[List[str]] = None
+
+        # Load companion index if present
+        index_p = self.cache_path.with_suffix(".index.json")
+        self.query_index: Optional[Dict[str, Dict[str, int]]] = None
+        if index_p.is_file():
+            try:
+                with open(index_p, "r", encoding="utf-8") as f:
+                    self.query_index = json.load(f)
+            except Exception:
+                self.query_index = None
 
     def get_query_ids(self) -> List[str]:
-        df = self._ensure_df()
-        return df["query_id"].drop_duplicates().tolist()
+        """Return list of distinct query IDs in cache without full table load."""
+        if self.query_index is not None:
+            return list(self.query_index.keys())
+
+        if self._query_ids is None:
+            # Read single column into Arrow table and extract unique values
+            q_col = pq.read_table(str(self.cache_path), columns=["query_id"])["query_id"]
+            unique_qids = pc.unique(q_col).to_pylist()
+            self._query_ids = unique_qids
+        return self._query_ids
 
     def get_query_candidates(
         self, query_id: str, branch: Optional[str] = None
     ) -> List[StaticCandidateRecord]:
-        df = self._ensure_df()
-        sub = df[df["query_id"] == query_id]
+        """
+        Fetch candidate records for a single query using PyArrow dataset filtering.
+        Memory bounded: reads ONLY matching row groups/rows.
+        """
+        filt = (pc.field("query_id") == str(query_id))
         if branch is not None:
-            sub = sub[sub["branch"] == branch]
+            filt = filt & (pc.field("branch") == str(branch))
 
+        # Read only filtered slice
+        table_slice = self.dataset.to_table(filter=filt)
+        if len(table_slice) == 0:
+            return []
+
+        # Convert the small slice to pydict
+        data = table_slice.to_pydict()
         records: List[StaticCandidateRecord] = []
-        for _, row in sub.iterrows():
+        num_rows = len(data["query_id"])
+
+        for i in range(num_rows):
             records.append(
                 StaticCandidateRecord(
-                    query_id=row["query_id"],
-                    branch=row["branch"],
-                    rank=int(row["rank"]),
-                    doc_id=row["doc_id"],
-                    score=float(row["score"]),
-                    best_chunk_id=row["best_chunk_id"] if pd.notna(row["best_chunk_id"]) else None,
-                    second_score=float(row["second_score"]) if pd.notna(row["second_score"]) else None,
-                    mean_score=float(row["mean_score"]) if pd.notna(row["mean_score"]) else None,
-                    extra_json=row["extra_json"] if pd.notna(row["extra_json"]) else None,
+                    query_id=data["query_id"][i],
+                    branch=data["branch"][i],
+                    rank=int(data["rank"][i]),
+                    doc_id=data["doc_id"][i],
+                    score=float(data["score"][i]),
+                    best_chunk_id=data["best_chunk_id"][i],
+                    second_score=float(data["second_score"][i]) if data["second_score"][i] is not None else None,
+                    mean_score=float(data["mean_score"][i]) if data["mean_score"][i] is not None else None,
+                    extra_json=data["extra_json"][i],
                 )
             )
-        return records
 
-    def get_dataframe(self) -> pd.DataFrame:
-        return self._ensure_df()
+        return records

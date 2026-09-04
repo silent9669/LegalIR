@@ -78,3 +78,23 @@ def test_read_parquet_metadata_fast(tmp_path):
     assert meta["num_rows"] == 2
     assert meta["num_columns"] == 2
     assert "doc_id" in meta["columns"]
+
+
+def test_duplicate_groups_repo_fallback(tmp_path):
+    from src.data.canonical import resolve_duplicate_groups_path
+    # Path without duplicate_groups.json should fallback to repo artifacts/task1/data
+    empty_dir = tmp_path / "empty_ds"
+    empty_dir.mkdir()
+    fallback = resolve_duplicate_groups_path(empty_dir)
+    assert fallback is not None
+    assert fallback.is_file()
+    assert "duplicate_groups.json" in fallback.name
+
+
+def test_real_canonical_fixture_uses_granularity_and_text_norm():
+    p = Path("artifacts/task1/data/chunks.parquet")
+    if p.is_file():
+        schema_names = pq.read_schema(str(p)).names
+        assert "granularity" in schema_names
+        assert "text_norm" in schema_names
+        assert "text_raw" in schema_names

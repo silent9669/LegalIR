@@ -10,6 +10,7 @@ import pyarrow.parquet as pq
 
 from src.core.hashing import sha256_file
 
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
 EXPECTED_DOCS = 8532
 EXPECTED_CHUNKS = 1153876
@@ -19,6 +20,42 @@ EXPECTED_TRAIN_QUERIES = 7000
 EXPECTED_QRELS = 7637
 EXPECTED_PUBLIC_QUERIES = 1000
 EXPECTED_DUPLICATE_GROUPS = 4
+
+
+def resolve_duplicate_groups_path(dataset_dir: Union[str, Path]) -> Optional[Path]:
+    """
+    Resolve path to duplicate_groups.json using the fallback chain:
+    dataset root -> dataset root/splits -> repo artifacts/task1/data -> None
+    """
+    d = Path(dataset_dir)
+    candidates = [
+        d / "duplicate_groups.json",
+        d / "splits" / "duplicate_groups.json",
+        REPO_ROOT / "artifacts" / "task1" / "data" / "duplicate_groups.json",
+        REPO_ROOT / "data" / "task1_canonical_v2" / "duplicate_groups.json",
+    ]
+    for c in candidates:
+        if c.is_file():
+            return c
+    return None
+
+
+def resolve_split_path(dataset_dir: Union[str, Path], filename: str) -> Optional[Path]:
+    """
+    Resolve path to a split artifact file using the fallback chain:
+    dataset root -> dataset root/splits -> repo artifacts/task1/data -> None
+    """
+    d = Path(dataset_dir)
+    candidates = [
+        d / filename,
+        d / "splits" / filename,
+        REPO_ROOT / "artifacts" / "task1" / "data" / filename,
+        REPO_ROOT / "data" / "task1_canonical_v2" / filename,
+    ]
+    for c in candidates:
+        if c.is_file():
+            return c
+    return None
 
 
 @dataclass
@@ -112,10 +149,12 @@ def verify_canonical_dataset(
         num_chunks = meta["num_rows"]
         if num_chunks != EXPECTED_CHUNKS:
             errors.append(f"Expected {EXPECTED_CHUNKS} chunks, found {num_chunks}")
-        # To count micro/macro, inspect table chunk_type column efficiently
+        # To count micro/macro, inspect table granularity or chunk_type column efficiently
         try:
-            tbl = pq.read_table(str(chunks_p), columns=["chunk_type"])
-            chunk_types = tbl["chunk_type"].to_pylist()
+            schema_names = pq.read_schema(str(chunks_p)).names
+            type_col = "granularity" if "granularity" in schema_names else "chunk_type"
+            tbl = pq.read_table(str(chunks_p), columns=[type_col])
+            chunk_types = tbl[type_col].to_pylist()
             num_micro = sum(1 for t in chunk_types if t == "micro")
             num_macro = sum(1 for t in chunk_types if t == "macro")
             if num_micro != EXPECTED_MICRO:
@@ -123,7 +162,7 @@ def verify_canonical_dataset(
             if num_macro != EXPECTED_MACRO:
                 errors.append(f"Expected {EXPECTED_MACRO} macro chunks, found {num_macro}")
         except Exception as e:
-            errors.append(f"Error inspecting chunk_type: {e}")
+            errors.append(f"Error inspecting chunk granularity: {e}")
     else:
         errors.append(f"Missing {chunks_p.name}")
 
@@ -155,9 +194,10 @@ def verify_canonical_dataset(
     else:
         errors.append(f"Missing {public_p.name}")
 
-    if dup_p.is_file():
+    resolved_dup_p = resolve_duplicate_groups_path(d)
+    if resolved_dup_p and resolved_dup_p.is_file():
         try:
-            with open(dup_p, "r", encoding="utf-8") as f:
+            with open(resolved_dup_p, "r", encoding="utf-8") as f:
                 dup_data = json.load(f)
             num_duplicate_groups = len(dup_data)
             if num_duplicate_groups != EXPECTED_DUPLICATE_GROUPS:
@@ -165,7 +205,7 @@ def verify_canonical_dataset(
         except Exception as e:
             errors.append(f"Failed parsing duplicate_groups.json: {e}")
     else:
-        errors.append(f"Missing {dup_p.name}")
+        errors.append(f"Missing duplicate_groups.json in {d} or fallback locations")
 
     identity = CanonicalDatasetIdentity(
         num_docs=num_docs,

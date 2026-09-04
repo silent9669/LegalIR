@@ -69,3 +69,59 @@ def test_static_cache_writer_no_qrels_accepted():
     # Verify no attribute or method accepts qrels
     assert not hasattr(writer, "qrels")
     assert not hasattr(writer, "gold_docs")
+
+
+def test_static_cache_reader_never_materializes_full_dataframe(tmp_path, monkeypatch):
+    out_file = tmp_path / "bounded_cache.parquet"
+    writer = StaticCacheWriter(str(out_file), batch_size=5)
+    for i in range(10):
+        writer.write_record(
+            StaticCandidateRecord(
+                query_id=f"q_{i}",
+                branch="bm25",
+                rank=1,
+                doc_id=f"doc_{i}",
+                score=1.0,
+            )
+        )
+    writer.close()
+
+    reader = StaticCacheReader(str(out_file))
+
+    # Assert that reader does not store or produce a full pandas dataframe
+    assert not hasattr(reader, "_df")
+    cands = reader.get_query_candidates("q_3")
+    assert len(cands) == 1
+    assert cands[0].doc_id == "doc_3"
+
+
+def test_static_cache_cli_writes_nonempty_train_and_public_cache(tmp_path):
+    import subprocess
+    import sys
+
+    out_dir = tmp_path / "cli_cache"
+    cmd = [
+        sys.executable,
+        "scripts/build_static_cache.py",
+        "--dataset-dir",
+        "data/task1_canonical_v2",
+        "--output-dir",
+        str(out_dir),
+        "--max-queries",
+        "3",
+        "--max-corpus-chunks",
+        "200",
+    ]
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    assert res.returncode == 0, f"STDOUT: {res.stdout}\nSTDERR: {res.stderr}"
+
+    train_p = out_dir / "static_candidates_train.parquet"
+    public_p = out_dir / "static_candidates_public.parquet"
+
+    assert train_p.is_file()
+    assert public_p.is_file()
+
+    reader_train = StaticCacheReader(train_p)
+    assert len(reader_train.get_query_ids()) == 3
+    reader_pub = StaticCacheReader(public_p)
+    assert len(reader_pub.get_query_ids()) == 3
