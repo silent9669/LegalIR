@@ -29,7 +29,8 @@ def test_lazy_positive_localizer(sample_macro_store):
     q = "Trường hợp nào được miễn trừ xử phạt theo Điều 16?"
     best_chunk = localizer.localize(q, "doc1")
     assert best_chunk is not None
-    assert best_chunk.chunk_id == "c2"
+    chunk_id = best_chunk["chunk_id"] if isinstance(best_chunk, dict) else best_chunk.chunk_id
+    assert chunk_id == "c2"
 
 
 def test_lazy_evidence_pack_builder(sample_macro_store):

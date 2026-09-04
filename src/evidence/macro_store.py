@@ -19,7 +19,33 @@ class MacroChunk:
     chunk_id: str
     chunk_index: int
     text: str
+    text_raw: str = ""
+    text_norm: str = ""
+    article: str = ""
+    clause: str = ""
+    point: str = ""
+    chapter: str = ""
+    section: str = ""
     approx_tokens: int = 0
+
+    def to_dict(self) -> Dict[str, Any]:
+        raw = self.text_raw or self.text
+        norm = self.text_norm or self.text
+        return {
+            "doc_id": self.doc_id,
+            "chunk_id": self.chunk_id,
+            "chunk_index": self.chunk_index,
+            "text": self.text,
+            "text_raw": raw,
+            "text_norm": norm,
+            "article": self.article,
+            "clause": self.clause,
+            "point": self.point,
+            "chapter": self.chapter,
+            "section": self.section,
+            "body": raw or norm or self.text,
+            "granularity": "macro",
+        }
 
 
 @dataclass
@@ -54,17 +80,27 @@ class MacroEvidenceStore:
         self._cache: collections.OrderedDict[str, PreprocessedDoc] = collections.OrderedDict()
         self._cache_bytes_total: int = 0
 
-        # Read only required columns from chunks table
-        columns = ["doc_id", "chunk_id", "chunk_type", "text"]
-        # Check if chunk_index exists
+        # Determine dynamic schema columns
         pq_meta = pq.read_metadata(str(self.chunks_path))
         existing_cols = pq_meta.schema.names
-        if "chunk_index" in existing_cols:
-            columns.append("chunk_index")
+
+        self.type_col = "granularity" if "granularity" in existing_cols else "chunk_type"
+        self.text_col = (
+            "text_raw"
+            if "text_raw" in existing_cols
+            else ("text_norm" if "text_norm" in existing_cols else "text")
+        )
+
+        possible_cols = [
+            "doc_id", "chunk_id", self.type_col,
+            "text_raw", "text_norm", "text",
+            "article", "clause", "point", "chapter", "section", "chunk_index"
+        ]
+        columns = [c for c in possible_cols if c in existing_cols]
 
         full_table = pq.read_table(str(self.chunks_path), columns=columns)
         # Filter strictly to macro chunks
-        macro_mask = pc.equal(full_table["chunk_type"], "macro")
+        macro_mask = pc.equal(full_table[self.type_col], "macro")
         self.macro_table = full_table.filter(macro_mask)
 
         # Build compact doc_id -> list of table row indices
@@ -105,7 +141,7 @@ class MacroEvidenceStore:
 
         for row_idx in row_indices:
             cid = self.macro_table["chunk_id"][row_idx].as_py()
-            c_text = self.macro_table["text"][row_idx].as_py() or ""
+            c_text = self.macro_table[self.text_col][row_idx].as_py() or ""
             c_idx = (
                 self.macro_table["chunk_index"][row_idx].as_py()
                 if "chunk_index" in self.macro_table.column_names
@@ -119,6 +155,13 @@ class MacroEvidenceStore:
                 chunk_id=cid,
                 chunk_index=c_idx,
                 text=c_text,
+                text_raw=str(self.macro_table["text_raw"][row_idx].as_py() or "") if "text_raw" in self.macro_table.column_names else "",
+                text_norm=str(self.macro_table["text_norm"][row_idx].as_py() or "") if "text_norm" in self.macro_table.column_names else "",
+                article=str(self.macro_table["article"][row_idx].as_py() or "") if "article" in self.macro_table.column_names else "",
+                clause=str(self.macro_table["clause"][row_idx].as_py() or "") if "clause" in self.macro_table.column_names else "",
+                point=str(self.macro_table["point"][row_idx].as_py() or "") if "point" in self.macro_table.column_names else "",
+                chapter=str(self.macro_table["chapter"][row_idx].as_py() or "") if "chapter" in self.macro_table.column_names else "",
+                section=str(self.macro_table["section"][row_idx].as_py() or "") if "section" in self.macro_table.column_names else "",
                 approx_tokens=approx_tokens,
             )
             chunks.append(chunk)

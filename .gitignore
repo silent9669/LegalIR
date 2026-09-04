@@ -62,7 +62,8 @@ artifacts/task1/checkpoints/
 artifacts/task1/smoke_run/
 artifacts/test_out/
 artifacts/test_out_fold/
-data/task1_canonical/
+artifacts/factory/
+/data/
 artifacts/data/
 artifacts/indexes/
 indexes/
