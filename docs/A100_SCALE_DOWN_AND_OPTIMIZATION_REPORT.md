@@ -1,6 +1,6 @@
 # Historical A100 Timing Evidence
 
-Reviewed 2026-09-17. This is a historical measurement record, **not approval of the current candidate**. Current blockers and proposed work are in [HISTORY_FIXES.md](HISTORY_FIXES.md); operational instructions are in the [launch guide](README_A100_LAUNCH.md).
+Reviewed 2026-09-17. This is a historical measurement record, **not approval of the current candidate**. Current status and run instructions are in [TEAMMATE.md](../TEAMMATE.md); operational launch mechanics are in the [launch guide](README_A100_LAUNCH.md).
 
 ## Source and limits
 
@@ -50,7 +50,7 @@ Do not describe sampler, sentinel, model-revision, or coverage changes as score-
 
 ## Five-hour feasibility remains open
 
-The planning budget is **270 minutes of work plus 30 minutes of contingency**, detailed in `fix.md`. It includes cold acquisition/setup/indexing, mining, all required training/evaluation jobs, final inference, validation, and durable delivery. It must not move precomputation outside the timer to manufacture a cold-run speedup.
+The historical planning budget was **270 minutes of work plus 30 minutes of contingency**. It includes cold acquisition/setup/indexing, mining, all required training/evaluation jobs, final inference, validation, and durable delivery. It must not move precomputation outside the timer to manufacture a cold-run speedup. (Current launch uses a 24h advisory timeout instead of the 5h gate — see [TEAMMATE.md](../TEAMMATE.md) §8.)
 
 For scale: 7,000 held-out queries in 55 minutes require about **2.12 queries/s**, approximately **4.70×** the old measured rate. Document-disjoint evaluation increases the workload further. Faster neural forward passes alone do not establish this whole-stage improvement.
 

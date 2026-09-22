@@ -1,12 +1,13 @@
 # Reproducible Training Workflow
 
-Reviewed 2026-09-17. **The current uncommitted repair candidate is not a qualified release.** Read [HISTORY_FIXES.md](HISTORY_FIXES.md) before starting this sequence. Operational commands and supervision belong in the [A100 launch guide](README_A100_LAUNCH.md).
+Reviewed 2026-09-22. Current HEAD `f867ab4` (evidence bundle for runtime `6b57ed7`, Kaggle dual-T4 PASS v73) plus approved surgical fixes on the working tree — see [TEAMMATE.md](../TEAMMATE.md) §3c. No release is required to launch; strict legacy gates are opt-in via `LEGALIR_STRICT_GATES=1`. Operational commands and supervision belong in the [A100 launch guide](README_A100_LAUNCH.md).
 
 ## 1. Finish and verify the candidate locally
 
-Resolve the blockers in `fix.md`, preserve the canonical data and evaluation boundaries, and run:
+Resolve any open blockers listed in [TEAMMATE.md](../TEAMMATE.md) §8, preserve the canonical data and evaluation boundaries, and run:
 
 ```bash
+.venv/bin/python scripts/validate_score_push.py
 .venv/bin/python scripts/verify_prepush.py
 .venv/bin/python scripts/generate_notebooks.py --check-drift
 .venv/bin/python scripts/check_notebook_parity.py
@@ -52,13 +53,12 @@ Verify CI on **S** as well. Record full SHAs and the exact CI URL. Any further r
 
 | Item | Reviewed identity |
 |---|---|
-| Committed runtime R | `373e8791917915da36864b7eb9b2f457493b4a0e` |
-| Committed release S | `d39792836482f29bd6d5e691235690c738cdde3d` |
+| Committed runtime R | `6b57ed7bfef94f8daaa823546c19d761b68b8755` |
+| Committed release S | `f867ab42b35cd60d1b0978f73c897f3506cae88a` (evidence bundle, runtime-to-release lineage validated) |
 | Freeze | `artifacts/task1/freeze/production_freeze.json` |
-| Smoke report | `artifacts/task1/gates/kaggle_t4x2_report.json` |
-| Exact-release CI | https://github.com/silent9669/LegalIR/actions/runs/35231283958 |
+| Smoke report | `artifacts/task1/gates/kaggle_t4x2_report.json` (Kaggle PASS v73) |
 
-The report records three optimizer steps in 27.05 seconds on dual T4s. This is the recorded short training interval, not total notebook runtime. These identities do **not** cover the uncommitted repairs reviewed in `fix.md`.
+The report records three optimizer steps in 24.23 seconds on dual T4s (weight delta 285.00). This is the recorded short training interval, not total notebook runtime. Uncommitted working-tree fixes on top of S are documented in [TEAMMATE.md](../TEAMMATE.md) §3c; re-run the evidence bundle step to bind them into a new release if strict qualification is needed.
 
 ## 5. Qualify A100 resources and completion forecast
 

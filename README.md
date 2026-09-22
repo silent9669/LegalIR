@@ -2,27 +2,27 @@
 
 Vietnamese legal document retrieval for the UIT Data Science Challenge 2026. The pipeline combines legal BM25, PyVi BM25, DEk21 dense retrieval, exact matching, fold-local question memory, and a BGE LoRA cross-encoder.
 
-## Readiness — reviewed 2026-09-17
+## Status — updated 2026-09-22
 
-**Do not launch FULL yet.** The local repair candidate is uncommitted on top of release `d39792836482f29bd6d5e691235690c738cdde3d`. Existing release evidence binds runtime `373e8791917915da36864b7eb9b2f457493b4a0e`, not the uncommitted changes. See [fix.md](fix.md) for the review, remaining work, acceptance tests, and release sequence.
-
-- **Kaggle:** bounded smoke tests only. The existing dual-T4 receipt records three optimizer steps in 27.05 seconds; it is not an A100 performance or final-quality benchmark.
-- **Modal / Google Colab:** real-model qualification and FULL training, only with separate execution approval. Qualify each backend before claiming it meets the time budget. Do not launch both concurrently as an automatic retry strategy.
-- **Targets, not demonstrated results:** >96% mean Recall@5 and <5-hour cold end-to-end delivery of a reloadable final model plus validated submission.
-- **Parameter audit:** 702,754,049 parameters across the dense encoder and reranker, below the competition's 4B ceiling. Re-run the audit if the models change.
-- A five-hour timeout can stop an unfinished run; it is neither a completion guarantee nor a total spending cap.
+- **HEAD:** `f867ab4` — evidence bundle for runtime `6b57ed7` (Kaggle dual-T4 **PASS v73**: 24.23s, weight delta 285.00, genuine Tesla T4 ×2 execution).
+- **Working tree:** 4 approved surgical fixes on top of HEAD (pending commit) — doc-disjoint duplicate expansion, `validate_submission_zip(exact_answer_count)`, MPS OOM matcher narrowing, strict-mode warm-start rank-lock. See `TEAMMATE.md` §3.
+- **Tests:** **587 passed, 2 skipped** (full suite). Preflight gates green: `validate_score_push.py`, parameter audit, notebook zero-drift.
+- **Launch:** no release required. Single entrypoint `python scripts/modal/run_full.py --warm --private --push-config` (preflight runs automatically). Details in `TEAMMATE.md`.
+- **Targets, not demonstrated results:** full private run (5-fold OOF + disjoint + final + 2080-query inference) has not completed on A100 yet; OOF/private recall and end-to-end runtime are projections until a real run finishes.
+- **Parameter audit:** 702,754,049 parameters across the dense encoder and reranker (~715M with the r=64 LoRA adapter), below the competition's 4B ceiling. Re-run the audit if the models change.
+- A timeout caps duration, not spend; retries/re-runs bill extra. There is no checkpoint-resume — a killed run restarts from scratch (Volume holds forensics only).
 
 ## Essential documents
 
 | Document | Purpose |
 |---|---|
-| [fix.md](fix.md) | Current repair review, blockers, verification results, and next actions |
+| [TEAMMATE.md](TEAMMATE.md) | **Start here.** How to run, what was built, workflow, verification, recovery |
 | [Architecture](docs/ARCHITECTURE.md) | Components, data boundaries, training/evaluation, and configuration sources |
-| [Release workflow](docs/REPRODUCIBLE_TRAINING_WORKFLOW.md) | Local tests → CI → Kaggle smoke → evidence-bearing release → A100 qualification |
-| [A100 launch guide](docs/README_A100_LAUNCH.md) | Modal/Colab supervision, consent, timeouts, recovery, and stop procedures |
-| [Historical timing evidence](docs/A100_SCALE_DOWN_AND_OPTIMIZATION_REPORT.md) | Old A100 measurements and limits of the proposed optimizations |
+| [Release workflow](docs/REPRODUCIBLE_TRAINING_WORKFLOW.md) | Local tests → Kaggle smoke → evidence bundle → A100 run |
+| [A100 launch guide](docs/README_A100_LAUNCH.md) | Modal supervision, consent, timeouts, recovery, and stop procedures |
+| [Historical timing evidence](docs/A100_SCALE_DOWN_AND_OPTIMIZATION_REPORT.md) | Old A100 measurements; historical record, not launch approval |
 
-Launch instructions live in the launch guide only. Historical reports and architecture descriptions are not launch approval.
+Launch instructions live in `TEAMMATE.md` and the launch guide. Historical reports and architecture descriptions are not launch approval.
 
 ## Pipeline
 
@@ -33,7 +33,7 @@ Canonical Task 1 corpus and queries
   → fold-specific BGE LoRA training and batched held-out inference
   → five-fold OOF + document-disjoint evaluation and fusion evaluation
   → dedicated final training on all training queries
-  → final-model reload, public inference, submission validation
+  → final-model reload, private inference, submission validation
   → durable artifacts and verified delivery receipts
 ```
 
@@ -43,7 +43,7 @@ The query-balanced sampler prioritizes an interleaved positive/negative pair per
 
 ## Data and evaluation rules
 
-- Use only canonical Task 1 training queries, qrels, and legal corpus. Public queries are for inference only.
+- Use only canonical Task 1 training queries, qrels, and legal corpus. Private queries are for inference only.
 - No external legal corpus, Task 2 data, crawling, synthetic LLM examples, or external inference APIs.
 - Preserve all five folds, document-disjoint evaluation, and fold-local supervised memory/mining.
 - Never initialize honest held-out evaluation from a final adapter trained on all held-out labels.
@@ -54,15 +54,13 @@ The query-balanced sampler prioritizes an interleaved positive/negative pair per
 Use the repository virtual environment; no GPU allocation is needed for these commands:
 
 ```bash
-.venv/bin/python scripts/verify_prepush.py
+.venv/bin/python scripts/validate_score_push.py
 .venv/bin/python scripts/generate_notebooks.py --check-drift
-.venv/bin/python scripts/check_notebook_parity.py
 .venv/bin/python scripts/audit_parameters.py --check-only
 .venv/bin/python scripts/verify_release_approval.py --repo-root .
+.venv/bin/pytest tests/leakage/ tests/integration/test_doc_disjoint.py tests/contracts/test_modal_cli.py tests/integration/test_modal_delivery.py -q
 git status --short
 ```
-
-A strict verifier PASS on an unchanged HEAD does not certify uncommitted runtime edits. Publish the reviewed candidate through the release workflow before either remote backend can run those fixes. Do not bypass provenance validation or fabricate replacement smoke reports.
 
 ## Repository map
 

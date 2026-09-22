@@ -1,6 +1,6 @@
 # LegalIR System Architecture
 
-This describes the pipeline, not release readiness. See [HISTORY_FIXES.md](HISTORY_FIXES.md) for the historical candidate review and [release workflow](REPRODUCIBLE_TRAINING_WORKFLOW.md) for qualification.
+This describes the pipeline, not release readiness. See [TEAMMATE.md](../TEAMMATE.md) for current status and run instructions, and [release workflow](REPRODUCIBLE_TRAINING_WORKFLOW.md) for qualification.
 
 ## Data and evaluation boundaries
 
@@ -48,9 +48,9 @@ RRF combines retrieved branch ranks as `sum(weight / (k + rank))`. A missing bra
 - Dense model: `CODE4LIFEOFFICIAL/huydang-dek21-embedding-v2`.
 - Reranker: `BAAI/bge-reranker-v2-m3`; registry pin `953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e`.
 - Configuration sources: `configs/algorithm/legalir_v2.yaml`, `configs/experiments/reranker_lora.yaml`, and backend profiles under `configs/runtime/`.
-- Current reranker experiment: LoRA rank 8, alpha 16, maximum length 512, rerank_k 100, batch size 8, inference_batch_size 64, BF16, pos_weight 4.0, fail-closed warm-start isolation (final model only). Runtime overrides and coverage-enforced steps must be recorded rather than inferred from this document.
+- Current reranker experiments (`configs/experiments/`): listwise loss, LoRA r=32/alpha=64 (base) or r=64/alpha=128 (v3 push), cold start (`pretrained_lora_path: null`), maximum length 512, rerank_k 200 (= candidate_k), training batch size 8, inference_batch_size 128, BF16, 2 coverage epochs, 12 negatives per listwise group. Fail-closed warm-start isolation (folds never warm-start; final only). Runtime overrides and coverage-enforced steps must be recorded rather than inferred from this document.
 - Parameter audit totals: dense 134,998,272 + reranker 567,755,777 = **702,754,049**. This is the audited combined model total, not the number of trainable LoRA adapter parameters. Re-audit model changes against the 4B ceiling.
-- The repair candidate records base-model revision and propagates it into adapter reload. Dense cache provenance and completed-stage identity still have gaps described in `fix.md`; a registry pin alone does not validate every reused artifact.
+- The pipeline records base-model revision and propagates it into adapter reload. A registry pin alone does not validate every reused artifact; see `TEAMMATE.md` for the current verification gates.
 
 ## Performance mechanisms and their limits
 
