@@ -478,9 +478,10 @@ def test_remote_dependency_contract():
 def test_modal_forwards_explicit_consent(launcher, monkeypatch):
     forwarded = {}
 
-    def fake_remote(sha, hf_allow_public_repo=False):
+    def fake_remote(sha, hf_allow_public_repo=False, **kwargs):
         forwarded["sha"] = sha
         forwarded["consent"] = hf_allow_public_repo
+        forwarded.update(kwargs)
         return {"ok": True}
 
     monkeypatch.setattr(launcher.run_production_training, "remote", fake_remote)
@@ -494,3 +495,9 @@ def test_modal_forwards_explicit_consent(launcher, monkeypatch):
     assert forwarded["sha"] == VALID_SHA
     launcher.main(hf_allow_public_repo=False)
     assert forwarded["consent"] is False
+
+    # Verify forwarding of private phase and push_config
+    launcher.main(hf_allow_public_repo=True, private=True, push_config=True)
+    assert forwarded["consent"] is True
+    assert forwarded["private"] is True
+    assert forwarded["reranker_config"] == "configs/experiments/reranker_lora_v3_push.yaml"
