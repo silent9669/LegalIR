@@ -139,7 +139,7 @@ def validate_submission(
     }
 
 
-def validate_submission_zip(zip_path: str | Path) -> dict[str, Any]:
+def validate_submission_zip(zip_path: str | Path, exact_answer_count: int | None = None) -> dict[str, Any]:
     """Validate that submission.zip contains strictly only submission.json at archive root,
     and that the payload satisfies the scorer schema ({qid: {"answer": [1-5 str]}})."""
     zip_path = Path(zip_path)
@@ -160,7 +160,7 @@ def validate_submission_zip(zip_path: str | Path) -> dict[str, Any]:
                     errors.append("submission.json inside zip is empty or invalid JSON")
                 else:
                     # Schema check (no expected_qids/corpus here; structural only).
-                    schema = validate_submission(loaded, raise_on_error=False)
+                    schema = validate_submission(loaded, raise_on_error=False, exact_answer_count=exact_answer_count)
                     if not schema.get("is_valid"):
                         errors.extend(schema.get("errors", []))
             except Exception as e:

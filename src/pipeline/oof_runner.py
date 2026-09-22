@@ -1343,15 +1343,36 @@ class OOFRunner:
             if self.duplicate_groups_path and self.duplicate_groups_path.exists():
                 try:
                     dup_data = json.loads(self.duplicate_groups_path.read_text(encoding="utf-8"))
-                    dup_groups = dup_data.get("duplicate_groups", [])
+                except json.JSONDecodeError as exc:
+                    print(f"[!] Warning: failed parsing duplicate_groups.json ({exc}); skipping expansion.")
+                    dup_data = None
+                if dup_data:
+                    raw_groups: list[Any] = []
+                    if isinstance(dup_data, dict):
+                        if "duplicate_groups" in dup_data and isinstance(dup_data["duplicate_groups"], list):
+                            raw_groups = dup_data["duplicate_groups"]
+                        else:
+                            raw_groups = list(dup_data.values())
+                    elif isinstance(dup_data, list):
+                        raw_groups = dup_data
+
                     expanded_val_docs = set(val_gold_docs)
-                    for grp in dup_groups:
-                        grp_set = {str(x) for x in grp}
+                    for grp in raw_groups:
+                        if isinstance(grp, dict) and "doc_ids" in grp:
+                            grp_set = {str(x) for x in grp["doc_ids"]}
+                        elif isinstance(grp, (list, tuple, set)):
+                            grp_set = {str(x) for x in grp}
+                        else:
+                            continue
                         if grp_set & val_gold_docs:
                             expanded_val_docs.update(grp_set)
+
+                    num_groups = len(raw_groups)
+                    print(
+                        f"[*] Doc-disjoint duplicate expansion: {len(val_gold_docs)} val docs -> "
+                        f"{len(expanded_val_docs)} after closure ({num_groups} groups)."
+                    )
                     val_gold_docs = expanded_val_docs
-                except Exception:
-                    pass
 
             if not pairs_df.empty and "doc_id" in pairs_df.columns and val_gold_docs:
                 leaked_doc_mask = pairs_df["doc_id"].astype(str).isin(val_gold_docs)

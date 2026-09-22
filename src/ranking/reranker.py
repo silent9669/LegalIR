@@ -457,7 +457,12 @@ class CrossEncoderReranker:
                 idx += len(batch)
             except RuntimeError as exc:
                 message = str(exc).lower()
-                if ("out of memory" in message or "cuda error: out of memory" in message or "mps" in message):
+                if (
+                    "out of memory" in message
+                    or "cuda error: out of memory" in message
+                    or "mps out of memory" in message
+                    or "mps backend out of memory" in message
+                ):
                     self.oom_events += 1
                     if current_batch == 1:
                         raise

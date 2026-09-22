@@ -8,7 +8,7 @@ from transformers import BertConfig, BertForSequenceClassification, BertTokenize
 
 from src.training.trainer import setup_peft_model
 from src.training.train_reranker import train_reranker
-from src.evaluation.submission import validate_submission
+from src.evaluation.submission import validate_submission, validate_submission_zip
 
 
 @pytest.fixture
@@ -134,3 +134,46 @@ def test_train_reranker_forces_cold_start_for_folds(tmp_path: Path, monkeypatch)
         allow_warm_start=True,
     )
     assert captured_cfg.get("allow_warm_start") is False, "train_reranker must force allow_warm_start=False when fold is provided!"
+
+
+def test_validate_submission_zip_exact_answer_count(tmp_path: Path):
+    import zipfile
+    preds_4 = {"q1": {"answer": ["d1", "d2", "d3", "d4"]}}
+    zip_p = tmp_path / "submission.zip"
+    with zipfile.ZipFile(zip_p, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("submission.json", json.dumps(preds_4))
+
+    # Without exact_answer_count, passes structural schema
+    res = validate_submission_zip(zip_p)
+    assert res["is_valid"] is True
+
+    # With exact_answer_count=5, must fail validation
+    res_strict = validate_submission_zip(zip_p, exact_answer_count=5)
+    assert res_strict["is_valid"] is False
+    assert any("answer length must be exactly 5" in err for err in res_strict["errors"])
+
+
+def test_setup_peft_model_strict_gates_raises_on_rank_mismatch(mock_model_fixture, monkeypatch):
+    import os
+    model, _, adapter_dir = mock_model_fixture
+    # adapter_dir has r=4 (from fixture). Request r=16 with allow_warm_start=True.
+    # Strict off -> warning, uses r=4
+    monkeypatch.delenv("LEGALIR_STRICT_GATES", raising=False)
+    peft_model, meta = setup_peft_model(
+        model=model,
+        pretrained_adapter=str(adapter_dir),
+        allow_warm_start=True,
+        lora_r=16,
+    )
+    assert meta["lora_r"] == 4
+
+    # Strict on -> raises RuntimeError
+    monkeypatch.setenv("LEGALIR_STRICT_GATES", "1")
+    with pytest.raises(RuntimeError, match="Warm-start rank lock"):
+        setup_peft_model(
+            model=model,
+            pretrained_adapter=str(adapter_dir),
+            allow_warm_start=True,
+            lora_r=16,
+        )
+

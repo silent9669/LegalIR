@@ -503,12 +503,14 @@ def setup_peft_model(
                 active_cfg = getattr(peft_model, "peft_config", {}).get("default", None)
                 active_r = getattr(active_cfg, "r", lora_r)
                 if int(active_r) != int(lora_r):
-                    print(
-                        f"[!] Warm-start rank lock: loaded adapter uses r={active_r}, "
+                    msg = (
+                        f"Warm-start rank lock: loaded adapter uses r={active_r}, "
                         f"but config requests r={lora_r}. The loaded rank wins; "
-                        f"set pretrained_lora_path to null (cold start) to use r={lora_r}.",
-                        flush=True,
+                        f"set pretrained_lora_path to null (cold start) to use r={lora_r}."
                     )
+                    if str(os.environ.get("LEGALIR_STRICT_GATES", "")).strip() == "1":
+                        raise RuntimeError(f"[!] {msg}")
+                    print(f"[!] {msg}", flush=True)
                 meta = {
                     "lora_r": getattr(active_cfg, "r", lora_r),
                     "lora_alpha": getattr(active_cfg, "lora_alpha", lora_alpha),
@@ -522,6 +524,8 @@ def setup_peft_model(
                 }
                 return peft_model, meta
             except Exception as e:
+                if str(os.environ.get("LEGALIR_STRICT_GATES", "")).strip() == "1" and isinstance(e, RuntimeError) and "Warm-start rank lock" in str(e):
+                    raise
                 print(f"[!] Warning: Failed loading warm-start adapter '{pretrained_adapter}': {e}. Falling back to clean LoRA initialization.")
 
     matched_targets = find_target_modules(model, target_modules)
