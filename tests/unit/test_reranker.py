@@ -195,3 +195,27 @@ def test_reranker_batch_exact_parity_with_individual_rerank():
     assert [c["doc_id"] for c in batched[1]] == [c["doc_id"] for c in single2]
     assert [c["reranker_best_score"] for c in batched[1]] == [c["reranker_best_score"] for c in single2]
 
+
+def test_length_grouped_batching_invariance():
+    reranker = CrossEncoderReranker(model_name="mock")
+    pairs = [
+        ("short q", "short pass"),
+        ("long query with extensive wording that goes on and on", "another very extensive passage that has many characters and words"),
+        ("medium q", "medium passage here"),
+        ("tiny", "t"),
+        ("medium q 2", "second medium passage here"),
+    ]
+    # Score all pairs at batch size 2 (which forces multiple batches of different lengths)
+    scores_b2 = reranker.score_pairs(pairs, batch_size=2)
+    # Score all pairs at batch size 1
+    scores_b1 = reranker.score_pairs(pairs, batch_size=1)
+    # Score all pairs at batch size 10 (single batch)
+    scores_b10 = reranker.score_pairs(pairs, batch_size=10)
+
+    assert len(scores_b2) == len(pairs)
+    assert len(scores_b1) == len(pairs)
+    assert len(scores_b10) == len(pairs)
+    for s1, s2, s10 in zip(scores_b1, scores_b2, scores_b10):
+        assert abs(s1 - s2) < 1e-4
+        assert abs(s1 - s10) < 1e-4
+

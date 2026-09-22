@@ -237,7 +237,12 @@ def attach_warmed_cache(volume_root: str | Path, repo_dir: str | Path) -> dict:
         modal.Secret.from_name("huggingface-secret")
     ]
 )
-def run_production_training(expected_sha: str, hf_allow_public_repo: bool = False):
+def run_production_training(
+    expected_sha: str,
+    hf_allow_public_repo: bool = False,
+    private: bool = False,
+    reranker_config: str | None = None,
+):
     """
     Executes the A100 production training pipeline within a Modal container.
     Pre-A100 hardware gate: Kaggle dual-T4 report (B1.1), strictly enforced.
@@ -251,6 +256,12 @@ def run_production_training(expected_sha: str, hf_allow_public_repo: bool = Fals
     training loop may still be lost on a hard kill. No resume is implied.
     """
     import sys
+
+    if private:
+        os.environ["LEGALIR_TEST_PHASE"] = "private"
+    if reranker_config:
+        os.environ["LEGALIR_RERANKER_CONFIG"] = str(reranker_config)
+        print(f"[+] Remote container initialized with LEGALIR_RERANKER_CONFIG={reranker_config}", flush=True)
 
     # Run label for paths (advisory unless LEGALIR_STRICT_GATES=1).
     sha = _normalize_sha_label(expected_sha)
@@ -448,7 +459,12 @@ def run_production_training(expected_sha: str, hf_allow_public_repo: bool = Fals
     return _attempt_report
 
 @app.local_entrypoint()
-def main(hf_allow_public_repo: bool = False, private: bool = False):
+def main(
+    hf_allow_public_repo: bool = False,
+    private: bool = False,
+    push_config: bool = False,
+    reranker_config: str = "",
+):
     import sys
     # Try to grab the SHA from local git if we are in the repo, or from env.
     # Any label works by default; strict mode still requires an exact SHA.
@@ -462,6 +478,14 @@ def main(hf_allow_public_repo: bool = False, private: bool = False):
 
     # Determine test phase
     test_phase = "private" if (private or os.environ.get("LEGALIR_TEST_PHASE", "").strip().lower() == "private") else "public"
+
+    cfg_to_send = None
+    if push_config:
+        cfg_to_send = "configs/experiments/reranker_lora_v3_push.yaml"
+    elif reranker_config:
+        cfg_to_send = reranker_config
+    elif os.environ.get("LEGALIR_RERANKER_CONFIG"):
+        cfg_to_send = os.environ.get("LEGALIR_RERANKER_CONFIG")
 
     # Advisory local preflight (fail-closed only with LEGALIR_STRICT_GATES=1).
     try:
@@ -482,6 +506,8 @@ def main(hf_allow_public_repo: bool = False, private: bool = False):
 
     print(f"[*] Dispatching A100 training job to Modal for: {expected_sha}")
     print(f"[*] Evaluation Phase: {test_phase.upper()} ({'2,080 queries' if test_phase == 'private' else '1,000 queries'})")
+    if cfg_to_send:
+        print(f"[*] Reranker Config: {cfg_to_send}")
     print(f"[*] Remote timeout: {TIMEOUT_SECONDS}s (no quality/time gate; set MODAL_TIMEOUT_SECONDS only to cap spend).")
     print("[*] Durable outputs use /root/legalir_volume/<label>/attempts/<id>/ on the 'legalir-production' Volume.")
     print("[*] Supervision: default `modal run` is ATTACHED — client disconnect terminates")
@@ -495,5 +521,10 @@ def main(hf_allow_public_repo: bool = False, private: bool = False):
     if hf_allow_public_repo:
         print("[!] OPERATOR OVERRIDE: public HF repos permitted for this launch.", flush=True)
 
-    result = run_production_training.remote(expected_sha, hf_allow_public_repo=hf_allow_public_repo)
+    result = run_production_training.remote(
+        expected_sha,
+        hf_allow_public_repo=hf_allow_public_repo,
+        private=(test_phase == "private"),
+        reranker_config=cfg_to_send,
+    )
     print(f"[*] Remote job finished with result: {result}")

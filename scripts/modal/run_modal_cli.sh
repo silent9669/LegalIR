@@ -214,6 +214,9 @@ fi
 if [ -n "$PRIVATE_FLAG" ]; then
   MODAL_ARGS+=("$PRIVATE_FLAG")
 fi
+if [ -n "$PUSH_CONFIG" ]; then
+  MODAL_ARGS+=("--push-config")
+fi
 
 DETACH_OPT=""
 if [ "$DETACH_MODE" -eq 1 ]; then
