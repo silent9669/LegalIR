@@ -9,7 +9,12 @@
 
 ```bash
 # 0. Chuẩn bị 1 lần duy nhất (xem §2)
-cp .env.example .env   # rồi điền HF_TOKEN_WRITE + KAGGLE_USERNAME/KAGGLE_KEY
+cat > .env <<'EOF'
+HF_TOKEN_WRITE=hf_token_write_cua_ban
+KAGGLE_USERNAME=username_cua_ban
+KAGGLE_KEY=kaggle_key_cua_ban
+HF_REPO_ID=username_cua_ban/legalir-task1-reranker
+EOF
 .venv/bin/modal setup  # authenticate Modal CLI (đã có .venv sẵn trong repo)
 
 # 1. Dry-run kiểm tra trước khi tốn tiền (CPU local, ~1 phút)
@@ -44,6 +49,7 @@ LEGALIR_ENSEMBLE=0 .venv/bin/python scripts/modal/run_full.py --warm --private -
 - [ ] `.venv/bin/modal setup` thành công (CLI trong repo: `.venv/bin/modal`).
 - [ ] Chạy `--warm-only` 1 lần: nạp sẵn 2 pinned models + dataset 616MB + manifest vào Volume `legalir-production:shared/`. Mọi run sau tái dùng, A100 không tốn giây nào để download.
 - [ ] Chạy `--dry-run` xanh (preflight §4) trước mỗi lần dispatch.
+- [ ] Tài khoản riêng: `HF_REPO_ID` trong `.env` trỏ repo của bạn (chi tiết §8).
 
 ---
 
@@ -98,6 +104,7 @@ Muốn chạy tay từng cái (CPU local, không GPU):
 
 | Biến | Tác dụng |
 |---|---|
+| `HF_REPO_ID` | Repo HF nhận artifacts (mặc định `dangphuc2109/legalir-task1-reranker`). **Tài khoản riêng bắt buộc đổi** thành repo của bạn — tự tạo private lúc preflight |
 | `LEGALIR_RERANKER_CONFIG` | Override config reranker (`--push-config` = v3 push) |
 | `LEGALIR_ENSEMBLE=0` | Tắt ensemble 6-adapter, chỉ dùng final adapter (nhanh, điểm thấp hơn) |
 | `LEGALIR_WARM_START_ADAPTER` | Hedge warm-start từ adapter cũ — **lưu ý rank-lock r=8** (§3c-fix 4) |
@@ -141,7 +148,25 @@ Nếu run train xong nhưng chết ở inference (từng xảy ra — Run05): ad
 
 Kết quả chuẩn: `submission.json`/`submission.zip` (2080×5, unique, 100% IDs trong corpus) + adapter đẩy lên HF `dangphuc2109/legalir-task1-reranker` + `RUN_SUMMARY.md`/`LOGS.md`/`MODELS.md` trong `runs/`.
 
-## 8. Rủi ro nói thẳng
+## 8. Chạy trên tài khoản riêng (teammate không dùng chung account)
+
+Repo GitHub là **PUBLIC** → clone nặc danh được, không cần cấp quyền:
+
+```bash
+git clone https://github.com/silent9669/LegalIR.git
+cd LegalIR
+```
+
+Mỗi tài khoản Modal/HF/Kaggle là không gian riêng — không chia sẻ gì ngoài code:
+
+1. **Modal (tài khoản của bạn):** `modal setup` bằng account bạn → tự tạo secrets `kaggle-secret`, `huggingface-secret` trong dashboard của bạn. Volume `legalir-production` tự tạo mới (rỗng) trong workspace của bạn → **bắt buộc chạy `--warm-only` 1 lần** trước run đầu tiên để nạp cache.
+2. **Hugging Face (token của bạn):** token WRITE của bạn không có quyền đẩy vào repo owner → đặt trong `.env`: `HF_REPO_ID=<username-của-bạn>/legalir-task1-reranker`. Preflight tự `create_repo(private=True)` nên không cần tạo tay; fail-closed nếu không verify được write access.
+3. **Kaggle (key của bạn):** dataset canonical public — down bằng key của bạn, không cần share.
+4. Còn lại chạy **y hệt** §1 (`--dry-run` trước, rồi `--warm --private --push-config --detach`). Attempt path/Volume/app ID của bạn độc lập hoàn toàn với owner.
+
+Checklist teammate sẵn sàng: clone được + `--dry-run` xanh + `--warm-only` xong + `HF_REPO_ID` trỏ repo của mình + hiểu §7 (lấy kết quả) và cách stop app.
+
+## 9. Rủi ro nói thẳng
 
 - OOF/private recall và tổng thời gian là **ước tính** (train ~2–3h + inference ensemble ~5–6h) — chỉ run GPU thật mới biết.
 - Ensemble ×6 tốn ~5–6h inference nhưng nằm trong trần 24h; tắt bằng `LEGALIR_ENSEMBLE=0` nếu cần nhanh.
