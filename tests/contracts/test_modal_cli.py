@@ -67,17 +67,31 @@ def _run(repo: Path, bin_dir: Path, args=(), extra_env=None):
         env["LEGALIR_COMMIT_SHA"] = extra_env["LEGALIR_COMMIT_SHA"]
     else:
         env.pop("LEGALIR_COMMIT_SHA", None)
+    if extra_env and "LEGALIR_STRICT_GATES" in extra_env:
+        env["LEGALIR_STRICT_GATES"] = extra_env["LEGALIR_STRICT_GATES"]
+    else:
+        env.pop("LEGALIR_STRICT_GATES", None)
     # Ensure possiblereal LEGALIR_COMMIT_SHA from outer env doesn't leak.
     script = repo / "scripts/modal/run_modal_cli.sh"
     res = subprocess.run([str(script), *args], cwd=str(repo), env=env, capture_output=True, text=True, timeout=20)
     return res, log
 
 
+STRICT = {"LEGALIR_STRICT_GATES": "1"}
+
+
+def _with(env_extra: dict | None, **kw) -> dict:
+    merged = dict(STRICT)
+    merged.update(env_extra or {})
+    merged.update(kw)
+    return merged
+
+
 def test_preflight_failure_never_invokes_modal(tmp_path):
     repo = _make_repo(tmp_path)
     _init_git_repo(repo)
     bin_dir = tmp_path / "bin"
-    res, log = _run(repo, bin_dir, extra_env={"PRE_RC": "9"})
+    res, log = _run(repo, bin_dir, extra_env=_with({"PRE_RC": "9"}))
     assert res.returncode != 0
     assert not log.is_file() or "run" not in log.read_text(encoding="utf-8")
 
@@ -87,16 +101,26 @@ def test_dirty_tree_fails_before_dispatch(tmp_path):
     _init_git_repo(repo)
     (repo / "dirty.txt").write_text("untracked\n", encoding="utf-8")
     bin_dir = tmp_path / "bin"
-    res, log = _run(repo, bin_dir)
+    res, log = _run(repo, bin_dir, extra_env=dict(STRICT))
     assert res.returncode == 2
     assert not log.is_file() or "run" not in log.read_text(encoding="utf-8")
+
+
+def test_dirty_tree_advisory_continues_by_default(tmp_path):
+    repo = _make_repo(tmp_path)
+    _init_git_repo(repo)
+    (repo / "dirty.txt").write_text("untracked\n", encoding="utf-8")
+    bin_dir = tmp_path / "bin"
+    res, log = _run(repo, bin_dir)
+    assert res.returncode == 0
+    assert "run" in log.read_text(encoding="utf-8")
 
 
 def test_invalid_sha_fails_before_dispatch(tmp_path):
     repo = _make_repo(tmp_path)
     _init_git_repo(repo)
     bin_dir = tmp_path / "bin"
-    res, log = _run(repo, bin_dir, extra_env={"PRE_RC": "0", "LEGALIR_COMMIT_SHA": "not-a-sha"})
+    res, log = _run(repo, bin_dir, extra_env=_with({"PRE_RC": "0", "LEGALIR_COMMIT_SHA": "not-a-sha"}))
     # Wrapper validates SHA before cloud; env plumbing passes explicit bad SHA.
     # _run maps LEGALIR_COMMIT_SHA via extra_env; ensure wrapper rejects.
     assert res.returncode == 2
@@ -110,7 +134,7 @@ def test_sha_mismatch_rejected(tmp_path):
     other = "0" * 40
     assert other != head
     bin_dir = tmp_path / "bin"
-    res, log = _run(repo, bin_dir, extra_env={"LEGALIR_COMMIT_SHA": other})
+    res, log = _run(repo, bin_dir, extra_env=_with({"LEGALIR_COMMIT_SHA": other}))
     assert res.returncode == 2
     assert "does not match local HEAD" in (res.stderr or "")
 
@@ -139,3 +163,34 @@ def test_explicit_consent_forwarded_once(tmp_path):
     # Explicit flag appears once, not duplicated, and no --no- variant.
     assert "--no-hf-allow-public-repo" not in text
     assert text.count("--hf-allow-public-repo") == 1
+
+
+def test_warm_only_runs_warm_without_a100(tmp_path):
+    repo = _make_repo(tmp_path)
+    _init_git_repo(repo)
+    bin_dir = tmp_path / "bin"
+    res, log = _run(repo, bin_dir, args=("--warm-only",))
+    assert res.returncode == 0
+    text = log.read_text(encoding="utf-8")
+    assert "warm_volume.py" in text
+    assert "run_modal_a100.py" not in text
+
+
+def test_warm_runs_before_a100_dispatch(tmp_path):
+    repo = _make_repo(tmp_path)
+    _init_git_repo(repo)
+    bin_dir = tmp_path / "bin"
+    res, log = _run(repo, bin_dir, args=("--warm",))
+    assert res.returncode == 0
+    text = log.read_text(encoding="utf-8")
+    assert "warm_volume.py" in text and "run_modal_a100.py" in text
+    assert text.index("warm_volume.py") < text.index("run_modal_a100.py")
+
+
+def test_no_warm_by_default(tmp_path):
+    repo = _make_repo(tmp_path)
+    _init_git_repo(repo)
+    bin_dir = tmp_path / "bin"
+    res, log = _run(repo, bin_dir)
+    assert res.returncode == 0
+    assert "warm_volume.py" not in log.read_text(encoding="utf-8")

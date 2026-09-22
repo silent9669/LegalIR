@@ -77,7 +77,8 @@ def test_current_accepts_runtime_and_evidence_only_child(tmp_path):
     assert verify_launch(child, k_path, f_path, repo_root=repo)["git_sha"] == runtime
 
 
-def test_current_rejects_disallowed_runtime_change(tmp_path):
+def test_current_rejects_disallowed_runtime_change(tmp_path, monkeypatch):
+    monkeypatch.setenv("LEGALIR_STRICT_GATES", "1")
     repo = _init_repo(tmp_path)
     runtime = _git(repo, "rev-parse", "HEAD")
     _, _, k_path, f_path = _make_freeze_report(repo, runtime)
@@ -91,9 +92,10 @@ def test_current_rejects_disallowed_runtime_change(tmp_path):
         verify_launch(child, k_path, f_path, repo_root=repo)
 
 
-def test_mutations_fail_closed(tmp_path):
+def test_mutations_fail_closed(tmp_path, monkeypatch):
     import copy
 
+    monkeypatch.setenv("LEGALIR_STRICT_GATES", "1")
     repo = _init_repo(tmp_path)
     runtime = _git(repo, "rev-parse", "HEAD")
     report, freeze, k_path, f_path = _make_freeze_report(repo, runtime)
@@ -179,8 +181,9 @@ def test_mutations_fail_closed(tmp_path):
         verify_launch(runtime, k_path, f_path, repo_root=repo)
 
 
-def test_two_stage_flow_stale_then_evidence(tmp_path):
+def test_two_stage_flow_stale_then_evidence(tmp_path, monkeypatch):
     """New runtime CI may pass while strict rejects stale freeze; new evidence accepts."""
+    monkeypatch.setenv("LEGALIR_STRICT_GATES", "1")
     repo = _init_repo(tmp_path)
     runtime = _git(repo, "rev-parse", "HEAD")
     _, _, k_path, f_path = _make_freeze_report(repo, runtime)
@@ -212,7 +215,11 @@ def test_cli_default_never_reads_legacy_approval(tmp_path, monkeypatch):
     assert rc == 0
 
 
-def test_cli_production_rejects_bypass():
+def test_cli_production_rejects_bypass(monkeypatch):
     import scripts.verify_release_approval as vra
 
+    # Strict mode keeps the old rejection; default advisory passes.
+    monkeypatch.setenv("LEGALIR_STRICT_GATES", "1")
     assert vra.main(["--repo-root", ".", "--allow-runtime-changes"]) == 2
+    monkeypatch.delenv("LEGALIR_STRICT_GATES", raising=False)
+    assert vra.main(["--repo-root", ".", "--allow-runtime-changes"]) == 0

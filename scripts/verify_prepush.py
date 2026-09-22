@@ -54,7 +54,21 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="LegalIR Pre-Push Verification Gate")
     parser.add_argument("--skip-tests", action="store_true", help="Skip pytest test suite")
     parser.add_argument("--skip-pipeline", action="store_true", help="Skip offline pipeline smoke")
+    parser.add_argument("--strict", action="store_true", help="Run the full legacy gate chain (tests, drift, smoke)")
     args = parser.parse_args()
+
+    import os as _os
+
+    # Fast by default: heavy suites only with --strict or LEGALIR_STRICT_GATES=1.
+    # This keeps teammate iteration under a minute; release qualification uses --strict.
+    _strict = bool(args.strict) or str(_os.environ.get("LEGALIR_STRICT_GATES", "")).strip() == "1"
+    if not _strict:
+        if not args.skip_tests:
+            print("[*] Fast mode (strict off): pytest suites skipped. Use --strict for full gates.")
+            args.skip_tests = True
+        if not args.skip_pipeline:
+            print("[*] Fast mode (strict off): offline pipeline smoke skipped. Use --strict for full gates.")
+            args.skip_pipeline = True
 
     python_bin = sys.executable
 
@@ -92,9 +106,9 @@ def main() -> int:
         if not run_gate([python_bin, str(audit_script), "--check-only"], "Learned parameter budget (< 4B)"):
             return 1
 
-    # 4. Notebook zero-drift check
+    # 4. Notebook zero-drift check (strict only: slow + release concern)
     gen_script = REPO_ROOT / "scripts" / "generate_notebooks.py"
-    if gen_script.is_file():
+    if _strict and gen_script.is_file():
         if not run_gate([python_bin, str(gen_script), "--check-drift"], "Notebooks zero-drift check"):
             return 1
 

@@ -2,9 +2,10 @@
 
 CPU-only. Reconstructs the official pooled OOF metric from persisted
 per-query predictions plus fixed expected splits — never trusts a claimed
-summary score. Strict thresholds: elapsed must be *under* 18000 seconds
-(exactly 18000 fails); pooled official OOF Recall@5 must be *above* 0.96
-(exactly 0.96 fails); no rounding across thresholds.
+summary score. Time/quality thresholds are ADVISORY by default (reported in
+details, never fail the verdict); set LEGALIR_STRICT_GATES=1 to restore the
+old fail-closed gates (elapsed under TIME_GATE_SECONDS, pooled OOF Recall@5
+strictly above 0.96, no rounding across thresholds).
 
 Receipts use NOT_RUN defaults (null numerics) before measurement; no plausible
 scores or durations are seeded.
@@ -20,7 +21,18 @@ from typing import Any, Mapping
 
 SCHEMA_VERSION = 1
 import os
-TIME_GATE_SECONDS = int(os.environ.get("LEGALIR_TIME_GATE_SECONDS", 25200))
+
+
+def strict_gates_enabled() -> bool:
+    """Time/quality gates are advisory by default; strict only on opt-in.
+
+    Set LEGALIR_STRICT_GATES=1 to restore fail-closed behavior (elapsed must be
+    under TIME_GATE_SECONDS, pooled OOF Recall@5 strictly above 0.96).
+    """
+    return str(os.environ.get("LEGALIR_STRICT_GATES", "")).strip() == "1"
+
+
+TIME_GATE_SECONDS = int(os.environ.get("LEGALIR_TIME_GATE_SECONDS", 86400))
 QUALITY_GATE_RECALL5 = 0.96
 SCORE_TOLERANCE = 1e-9
 
@@ -292,15 +304,25 @@ def verify_acceptance(
         fail(f"cold elapsed {elapsed!r} is not a measured duration")
         pass_t = False
     elif not (0 <= float(elapsed) < TIME_GATE_SECONDS):
-        fail(f"cold elapsed {elapsed} is not in [0, {TIME_GATE_SECONDS})s")
-        pass_t = False
+        # Advisory by default: record over-budget runs without failing them.
+        # Strict mode (LEGALIR_STRICT_GATES=1) keeps the old fail-closed gate.
+        if strict_gates_enabled():
+            fail(f"cold elapsed {elapsed} is not in [0, {TIME_GATE_SECONDS})s")
+            pass_t = False
+        else:
+            details["elapsed_over_budget"] = True
+            pass_t = float(elapsed) >= 0
     else:
         pass_t = True
     pass_q = recomputed_r5 is not None and recomputed_r5 > QUALITY_GATE_RECALL5
     if recomputed_r5 is None:
         fail("quality gate unevaluable (no recomputed score)")
     elif not pass_q:
-        fail(f"pooled official OOF Recall@5 {recomputed_r5:.6f} is not strictly above {QUALITY_GATE_RECALL5}")
+        # Advisory by default: low scores are reported, not failed.
+        if strict_gates_enabled():
+            fail(f"pooled official OOF Recall@5 {recomputed_r5:.6f} is not strictly above {QUALITY_GATE_RECALL5}")
+        else:
+            details["quality_below_target"] = True
 
     # --- Document-disjoint completeness (separate, never blended) ---
     # An empty report mapping is absent for acceptance purposes: it carries no

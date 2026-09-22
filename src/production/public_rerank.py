@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import collections
 import json
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
 import numpy as np
@@ -64,13 +65,14 @@ def _load_fusion_ranker(
 
     cfg = lock_data.get("config", {})
     fusion_cfg = cfg.get("fusion", {})
+
     default_weights = {
         "bm25": 1.0,
         "bm25_pyvi": 1.0,
         "dense": 1.2,
         "memory": 2.0,
         "exact": 2.5,
-        "rerank": 1.8,
+        "rerank": float(os.environ.get("LEGALIR_FUSION_W_RERANK", "2.5")),
     }
 
     desc_p: Optional[Path] = None
@@ -239,7 +241,7 @@ def rerank_and_fuse_public_predictions(
             "dense": 1.2,
             "memory": 2.0,
             "exact": 2.5,
-            "rerank": 1.8,
+            "rerank": float(os.environ.get("LEGALIR_FUSION_W_RERANK", "2.5")),
         })
         k_val = float(getattr(ranker, "k", 60))
 

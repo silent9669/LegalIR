@@ -249,6 +249,7 @@ class PairMaterializer:
                 })
 
         candidates_by_source["hybrid"] = hybrid_cands[:30]
+        candidates_by_source["near_miss"] = hybrid_cands[2:15] if len(hybrid_cands) > 2 else []
         candidates_by_source["medium_neg"] = hybrid_cands[20:80] if len(hybrid_cands) > 20 else []
 
         return dict(candidates_by_source), hybrid_cands
@@ -259,7 +260,7 @@ class PairMaterializer:
         queries_dict: Dict[str, str],
         static_cache_reader: Optional[StaticCacheReader] = None,
         query_embeddings: Optional[Mapping[str, Any]] = None,
-        negatives_per_positive: int = 10,
+        negatives_per_positive: int = 12,
         max_evidence_chunks: int = 3,
         batch_size: int = 5000,
     ) -> int:
@@ -276,12 +277,13 @@ class PairMaterializer:
 
         per_source_limits = {
             "exact": 2,
-            "bm25": 4,
-            "bm25_pyvi": 3,
-            "dense": 3,
-            "memory": 2,
-            "hybrid": 4,
-            "medium_neg": 3,
+            "hybrid": 3,
+            "near_miss": 3,
+            "dense": 1,
+            "memory": 1,
+            "medium_neg": 2,
+            "bm25": 2,
+            "bm25_pyvi": 1,
         }
 
         buffer: List[Dict[str, Any]] = []

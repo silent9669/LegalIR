@@ -1,0 +1,39 @@
+experiment: "reranker_lora_v3_push"
+base_model_name: "BAAI/bge-reranker-v2-m3"
+output_dir: "artifacts/local/training/checkpoints"
+# Score-push config for the A100-80GB private run (target OOF 93%+).
+# Listwise softmax over 1 positive + 12 negatives, LoRA r=64 cold start,
+# 2 full coverage epochs. ~18M trainable params, still <4B budget.
+loss_type: "listwise"
+temperature: 1.0
+pos_weight: null
+use_lora: true
+# Cold start by default (see base config): warm-starting from the HF r=8
+# adapter would lock the rank at 8 and silently ignore r=64 below.
+pretrained_lora_path: null
+lora:
+  r: 64
+  lora_alpha: 128
+  lora_dropout: 0.05
+  target_modules: ["query", "value", "key", "dense"]
+lora_r: 64
+lora_alpha: 128
+gradient_checkpointing: true
+learning_rate: 2.0e-5
+batch_size: 8
+# Negatives per listwise group (must be <= negatives_per_positive=12 in mining).
+max_negatives_per_group: 12
+# Full passes over every eligible query (final ~875 steps/epoch -> ~1750).
+coverage_epochs: 2
+# Inference-only micro-batch for GPU forward passes (training batch above is
+# untouched). 128 is sized for A100-80GB; OOM fallback still halves automatically.
+inference_batch_size: 128
+# Must equal candidate_k (200) in FULL so no retrieved doc is truncated to -999.
+rerank_k: 200
+gradient_accumulation_steps: 2
+max_steps: 250
+warmup_ratio: 0.1
+max_length: 512
+precision: "bf16"
+fp16: false
+device: "auto"

@@ -27,13 +27,17 @@ from src.ranking.oof_features import (
 class ReciprocalRankFusion:
     """Weighted Reciprocal Rank Fusion over arbitrary retrieval branch ranks and scores."""
 
+    # The cross-encoder is the trained discriminator; lexical branches already
+    # contributed via candidate generation. Rerank dominates so fold-local
+    # lexical memorization (exact/memory) cannot overrule it on unseen queries.
+    # Override with LEGALIR_FUSION_W_RERANK env if a run needs the legacy mix.
     DEFAULT_BRANCH_WEIGHTS = {
         "bm25": 1.0,
         "bm25_pyvi": 1.0,
         "dense": 1.2,
         "memory": 2.0,
         "exact": 2.5,
-        "rerank": 1.8,
+        "rerank": float(os.environ.get("LEGALIR_FUSION_W_RERANK", "2.5")),
     }
 
     def __init__(
@@ -44,10 +48,12 @@ class ReciprocalRankFusion:
         w_exact: float = 2.5,
         w_memory: float = 2.0,
         w_dense: float = 1.2,
-        w_rerank: float = 1.8,
+        w_rerank: float | None = None,
         weights: Mapping[str, float] | None = None,
     ):
         self.k = int(k)
+        if w_rerank is None:
+            w_rerank = float(os.environ.get("LEGALIR_FUSION_W_RERANK", "2.5"))
         if weights is not None:
             self.weights = dict(self.DEFAULT_BRANCH_WEIGHTS)
             for key, val in weights.items():
@@ -68,7 +74,7 @@ class ReciprocalRankFusion:
         self.w_exact = self.weights.get("exact", 2.5)
         self.w_memory = self.weights.get("memory", 2.0)
         self.w_dense = self.weights.get("dense", 1.2)
-        self.w_rerank = self.weights.get("rerank", 1.8)
+        self.w_rerank = self.weights.get("rerank", float(os.environ.get("LEGALIR_FUSION_W_RERANK", "2.5")))
 
     def rank_candidates(self, candidate_records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Compute final fused score combining retrieval ranks + exact matches + reranker scores."""

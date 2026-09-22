@@ -1,27 +1,38 @@
 experiment: "reranker_lora"
 base_model_name: "BAAI/bge-reranker-v2-m3"
 output_dir: "artifacts/local/training/checkpoints"
-loss_type: "bce"
-pos_weight: 4.0
+# Listwise softmax over 1 positive + N negatives directly optimizes the top-5
+# ranking boundary that pointwise BCE cannot see.
+loss_type: "listwise"
+temperature: 1.0
+pos_weight: null
 use_lora: true
-# Warm-start continuation training: set to Hugging Face repo ID or local path.
-# Set to "dangphuc2109/legalir-task1-reranker" to always pull and continue from the latest trained weights.
-pretrained_lora_path: "dangphuc2109/legalir-task1-reranker"
+# Cold start by default: warm-starting from the HF r=8 adapter would lock the
+# rank at 8 and silently ignore lora.r below. Set LEGALIR_WARM_START_ADAPTER
+# env (or this path) to hedge with continual fine-tuning instead.
+pretrained_lora_path: null
 lora:
-  r: 8
-  lora_alpha: 16
+  r: 32
+  lora_alpha: 64
   lora_dropout: 0.05
   target_modules: ["query", "value", "key", "dense"]
-lora_r: 8
-lora_alpha: 16
+lora_r: 32
+lora_alpha: 64
 gradient_checkpointing: true
 learning_rate: 2.0e-5
 batch_size: 8
+# Negatives per listwise group (must be <= negatives_per_positive=12 in mining).
+max_negatives_per_group: 12
+# Full passes over every eligible query per job (fold ~700 steps/epoch,
+# final ~875 steps/epoch). Smoke overrides with max_steps + coverage off.
+coverage_epochs: 2
 # Inference-only micro-batch for GPU forward passes (training batch above is
 # untouched). Pairs are scored independently; larger values only reduce
 # per-forward overhead. OOM fallback still halves automatically.
-inference_batch_size: 64
-rerank_k: 100
+# 128 is sized for A100-80GB (Run05 rescue profile); T4 smoke overrides down.
+inference_batch_size: 128
+# Must equal candidate_k (200) in FULL so no retrieved doc is truncated to -999.
+rerank_k: 200
 gradient_accumulation_steps: 2
 max_steps: 250
 warmup_ratio: 0.1

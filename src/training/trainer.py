@@ -474,9 +474,26 @@ def setup_peft_model(
         model_hidden = getattr(getattr(model, "config", None), "hidden_size", 0)
         # Only attach real HF adapter if model is full-sized (not a tiny mock BERT)
         if model_hidden >= 256:
-            print(f"[+] Warm-start: loading existing LoRA adapter from '{pretrained_adapter}' with is_trainable=True...")
+            adapter_target = str(pretrained_adapter).strip()
+            subfolder = None
+            if "::" in adapter_target:
+                adapter_target, subfolder = adapter_target.split("::", 1)
+            target_path = Path(adapter_target)
+            if target_path.is_dir():
+                if not (target_path / "adapter_config.json").exists():
+                    sub_cand = target_path / "runs/run-04-oof89.6/final_adapter"
+                    if (sub_cand / "adapter_config.json").exists():
+                        adapter_target = str(sub_cand)
+            elif adapter_target == "dangphuc2109/legalir-task1-reranker" and subfolder is None:
+                subfolder = "runs/run-04-oof89.6/final_adapter"
+
+            log_sub = f" (subfolder={subfolder})" if subfolder else ""
+            print(f"[+] Warm-start: loading existing LoRA adapter from '{adapter_target}'{log_sub} with is_trainable=True...")
             try:
-                peft_model = PeftModel.from_pretrained(model, pretrained_adapter, is_trainable=True)
+                load_kwargs: dict[str, Any] = {"is_trainable": True}
+                if subfolder:
+                    load_kwargs["subfolder"] = subfolder
+                peft_model = PeftModel.from_pretrained(model, adapter_target, **load_kwargs)
                 for name, param in peft_model.named_parameters():
                     if "lora_" in name:
                         param.requires_grad = True
@@ -484,6 +501,14 @@ def setup_peft_model(
                 total_params = sum(p.numel() for p in peft_model.parameters())
                 trainable_pct = (trainable_params / total_params * 100.0) if total_params > 0 else 0.0
                 active_cfg = getattr(peft_model, "peft_config", {}).get("default", None)
+                active_r = getattr(active_cfg, "r", lora_r)
+                if int(active_r) != int(lora_r):
+                    print(
+                        f"[!] Warm-start rank lock: loaded adapter uses r={active_r}, "
+                        f"but config requests r={lora_r}. The loaded rank wins; "
+                        f"set pretrained_lora_path to null (cold start) to use r={lora_r}.",
+                        flush=True,
+                    )
                 meta = {
                     "lora_r": getattr(active_cfg, "r", lora_r),
                     "lora_alpha": getattr(active_cfg, "lora_alpha", lora_alpha),
@@ -664,7 +689,10 @@ class RerankerTrainer:
 
         # Build datasets and loaders with QueryBalancedSampler
         if self.loss_type in ("listwise", "listwise_ce", "pairwise_logistic", "pairwise_margin"):
-            self.train_dataset = RerankerGroupDataset(train_data)
+            self.train_dataset = RerankerGroupDataset(
+                train_data,
+                max_negatives_per_group=int(self.config.get("max_negatives_per_group", 12)),
+            )
             self.train_collator = RerankerGroupCollator(self.tokenizer, max_length=self.max_length)
             self.train_sampler = QueryBalancedGroupSampler(self.train_dataset, seed=42)
             self.train_loader = DataLoader(

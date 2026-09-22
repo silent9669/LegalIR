@@ -224,7 +224,9 @@ def test_two_distinct_attempts(launcher, offline_stubs):
     assert first.is_dir() and second.is_dir()
 
 
-def test_invalid_sha_rejected_before_cloud_work(launcher, offline_stubs):
+def test_invalid_sha_rejected_before_cloud_work(launcher, offline_stubs, monkeypatch):
+    # Strict mode keeps fail-closed SHA validation; default advisory accepts labels.
+    monkeypatch.setenv("LEGALIR_STRICT_GATES", "1")
     calls, _ = offline_stubs
     with pytest.raises(ValueError, match="40-character"):
         launcher.run_production_training("not-a-sha")
@@ -233,6 +235,15 @@ def test_invalid_sha_rejected_before_cloud_work(launcher, offline_stubs):
     assert calls["verify"] == []
     assert calls["pipeline"] == []
     assert calls["commits"] == []
+
+
+def test_invalid_sha_advisory_continues_by_default(launcher, offline_stubs, monkeypatch):
+    monkeypatch.delenv("LEGALIR_STRICT_GATES", raising=False)
+    calls, received = offline_stubs
+    report = launcher.run_production_training("not-a-sha")
+    assert report["status"] == "COMPLETED"
+    assert "pipeline" in calls["order"]
+    assert received.get("run_mode") == "full"
 
 
 def test_preflight_failure_before_training(launcher, offline_stubs, monkeypatch):
@@ -397,10 +408,12 @@ def test_dataset_failure_gets_final_commit(launcher, offline_stubs, monkeypatch)
     assert state["exception_class"] == "RuntimeError"
 
 
-def test_create_attempt_dir_validates_sha(tmp_path):
+def test_create_attempt_dir_validates_sha(tmp_path, monkeypatch):
     mod = _load_launcher()
     root = tmp_path / "v"
     root.mkdir()
+    # Strict mode keeps fail-closed validation.
+    monkeypatch.setenv("LEGALIR_STRICT_GATES", "1")
     with pytest.raises(ValueError):
         mod.create_attempt_dir(root, "short")
     with pytest.raises(ValueError):
@@ -409,6 +422,10 @@ def test_create_attempt_dir_validates_sha(tmp_path):
     p2 = mod.create_attempt_dir(root, VALID_SHA)
     assert p1 != p2
     assert p1.parent.parent.name == VALID_SHA
+    # Default advisory mode accepts run labels.
+    monkeypatch.delenv("LEGALIR_STRICT_GATES", raising=False)
+    p3 = mod.create_attempt_dir(root, "dev-label")
+    assert p3.parent.parent.name == "dev-label"
 
 
 def test_default_consent_is_false():

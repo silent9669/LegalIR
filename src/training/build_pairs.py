@@ -41,7 +41,7 @@ def build_training_pairs(
     train_query_ids: list[str] | None = None,
     use_all_queries: bool = False,
     limit: int | None = None,
-    negatives_per_positive: int = 10,
+    negatives_per_positive: int = 12,
     max_evidence_chunks: int = 3,
     include_dense_negatives: bool = True,
     include_pyvi_negatives: bool = True,
@@ -269,22 +269,27 @@ def build_training_pairs(
 
         # Medium negatives from lower-ranked hybrid candidates (ranks 20-80)
         medium_cands = hybrid_cands[20:] if len(hybrid_cands) > 20 else []
+        # Near-miss negatives from the fused top-5 boundary (ranks 3-15):
+        # these distractors decide top-5 placement, so the listwise objective
+        # must see them every epoch.
+        near_miss_cands = hybrid_cands[2:15] if len(hybrid_cands) > 2 else []
 
         candidates_by_source = {
             "exact": [{"doc_id": c["doc_id"], "score": c.get("exact_score", 1.0), "rank": i + 1} for i, c in enumerate(exact_cands)],
             "bm25": [{"doc_id": c["doc_id"], "score": c.get("bm25_score", 0.0), "rank": i + 1} for i, c in enumerate(bm25_cands[:30])],
             "memory": [{"doc_id": c["doc_id"], "score": c.get("similarity", 0.0), "rank": i + 1} for i, c in enumerate(mem_cands)],
             "hybrid": [{"doc_id": c["doc_id"], "score": c.get("rrf_score", 0.0), "rank": i + 1} for i, c in enumerate(hybrid_cands[:30])],
+            "near_miss": [{"doc_id": c["doc_id"], "score": c.get("rrf_score", 0.0), "rank": i + 3} for i, c in enumerate(near_miss_cands)],
             "medium_neg": [{"doc_id": c["doc_id"], "score": c.get("rrf_score", 0.0), "rank": i + 21} for i, c in enumerate(medium_cands)],
         }
-        per_source_limits = {"exact": 2, "bm25": 4, "memory": 2, "hybrid": 4, "medium_neg": 3}
+        per_source_limits = {"exact": 2, "hybrid": 3, "near_miss": 3, "dense": 1, "memory": 1, "medium_neg": 2, "bm25": 2}
 
         if bm25_pyvi and include_pyvi_negatives:
             candidates_by_source["bm25_pyvi"] = [{"doc_id": c["doc_id"], "score": c.get("bm25_score", 0.0), "rank": i + 1} for i, c in enumerate(pyvi_cands[:30])]
-            per_source_limits["bm25_pyvi"] = 3
+            per_source_limits["bm25_pyvi"] = 1
         if dense and include_dense_negatives:
             candidates_by_source["dense"] = [{"doc_id": c["doc_id"], "score": c.get("dense_score", 0.0), "rank": i + 1} for i, c in enumerate(dense_cands[:30])]
-            per_source_limits["dense"] = 3
+            per_source_limits["dense"] = 1
 
         mined_neg_records = miner.mine_multi_band_negatives(
             query_id=qid,

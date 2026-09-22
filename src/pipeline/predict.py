@@ -420,8 +420,14 @@ class LegalIRPipeline:
         reranker_max_length: int = 384,
         precision: str | None = None,
         reranker_revision: str | None = None,
+        reranker_ensemble_adapter_paths: list[str | Path] | None = None,
     ) -> "LegalIRPipeline":
-        """Load fully instantiated pipeline from index and data artifacts."""
+        """Load fully instantiated pipeline from index and data artifacts.
+
+        ``reranker_ensemble_adapter_paths`` (optional): when 2+ valid adapter
+        dirs are given, private inference scores average all members
+        (final + fold adapters). Single-adapter behavior is unchanged.
+        """
         import json
         import pandas as pd
         from src.ranking.evidence_pack import EvidencePackBuilder
@@ -637,15 +643,32 @@ class LegalIRPipeline:
                 adapter_path = Path(reranker_adapter_path)
                 if not adapter_path.exists():
                     raise FileNotFoundError(f"Reranker adapter path not found: {reranker_adapter_path}")
-            reranker = CrossEncoderReranker(
-                model_name=reranker_model_name,
-                adapter_path=reranker_adapter_path,
-                device=resolved_reranker_device,
-                batch_size=reranker_batch_size,
-                max_length=reranker_max_length,
-                precision=precision,
-                revision=reranker_revision,
-            )
+            ensemble_paths = [p for p in (reranker_ensemble_adapter_paths or []) if p and Path(p).is_dir()]
+            if len(ensemble_paths) >= 2 and reranker_model_name != "mock":
+                from src.ranking.ensemble import build_ensemble_reranker
+
+                print(f"[*] Ensemble inference over {len(ensemble_paths)} adapters: "
+                      + ", ".join(Path(p).parent.name + "/" + Path(p).name for p in ensemble_paths), flush=True)
+                reranker = build_ensemble_reranker(
+                    CrossEncoderReranker,
+                    model_name=reranker_model_name,
+                    adapter_paths=ensemble_paths,
+                    device=resolved_reranker_device,
+                    batch_size=reranker_batch_size,
+                    max_length=reranker_max_length,
+                    precision=precision,
+                    revision=reranker_revision,
+                )
+            else:
+                reranker = CrossEncoderReranker(
+                    model_name=reranker_model_name,
+                    adapter_path=reranker_adapter_path,
+                    device=resolved_reranker_device,
+                    batch_size=reranker_batch_size,
+                    max_length=reranker_max_length,
+                    precision=precision,
+                    revision=reranker_revision,
+                )
         else:
             reranker = None
 

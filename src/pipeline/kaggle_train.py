@@ -122,8 +122,76 @@ class StageTimingTelemetry:
         }
 
 
-NOMINAL_BUDGET_SECONDS = 270 * 60  # 270-minute nominal work allocation
-STRICT_GATE_SECONDS = int(os.environ.get("LEGALIR_TIME_GATE_SECONDS", 25200))  # 7-hour strict execution gate
+NOMINAL_BUDGET_SECONDS = 270 * 60  # 270-minute nominal work allocation (forecast info only)
+STRICT_GATE_SECONDS = int(os.environ.get("LEGALIR_TIME_GATE_SECONDS", 86400))  # advisory forecast bound; never aborts (24h default)
+
+
+def _shared_index_cache_dir() -> Path | None:
+    """Shared index cache across attempts (default: <volume>/shared/indexes).
+
+    Each Modal attempt uses a fresh UUID dir, so cold index rebuilds (BM25x2 +
+    DEk21 + query embeddings, ~2.5k s) repeat every run. Pointing
+    LEGALIR_INDEX_CACHE_DIR at a persistent Volume path lets a new attempt
+    warm-start from the previous run's validated indexes. Set to empty/off to
+    disable.
+    """
+    raw = str(os.environ.get("LEGALIR_INDEX_CACHE_DIR", "")).strip()
+    if raw.lower() in ("", "off", "none", "0"):
+        return None
+    return Path(raw)
+
+
+def warm_index_cache(index_dir: Path) -> bool:
+    """Copy validated shared indexes into a fresh attempt dir. Never raises."""
+    src = _shared_index_cache_dir()
+    if src is None or not src.is_dir():
+        return False
+    try:
+        index_dir.mkdir(parents=True, exist_ok=True)
+        copied = 0
+        for name in ("bm25", "bm25_pyvi", "dense_dek21", "train_query_embeddings.npy",
+                     "train_query_embeddings.meta.json"):
+            s = src / name
+            d = index_dir / name
+            if d.exists():
+                continue
+            if s.is_dir():
+                import shutil as _sh
+                _sh.copytree(s, d, dirs_exist_ok=True)
+                copied += 1
+            elif s.is_file():
+                import shutil as _sh
+                _sh.copy2(s, d)
+                copied += 1
+        if copied:
+            print(f"[*] Warmed {copied} index entries from shared cache {src}...", flush=True)
+        return copied > 0
+    except Exception as exc:
+        print(f"[!] Shared index warm-up skipped: {type(exc).__name__}", flush=True)
+        return False
+
+
+def persist_index_cache(index_dir: Path) -> None:
+    """Best-effort write-back of fresh indexes to the shared cache. Never raises."""
+    dst = _shared_index_cache_dir()
+    if dst is None:
+        return
+    try:
+        dst.mkdir(parents=True, exist_ok=True)
+        import shutil as _sh
+        for name in ("bm25", "bm25_pyvi", "dense_dek21", "train_query_embeddings.npy",
+                     "train_query_embeddings.meta.json"):
+            s = index_dir / name
+            d = dst / name
+            if not s.exists() or d.exists():
+                continue
+            if s.is_dir():
+                _sh.copytree(s, d, dirs_exist_ok=True)
+            else:
+                _sh.copy2(s, d)
+        print(f"[*] Persisted indexes to shared cache {dst} (best-effort).", flush=True)
+    except Exception as exc:
+        print(f"[!] Shared index persist skipped: {type(exc).__name__}", flush=True)
 
 
 def forecast_cold_total(
@@ -1405,6 +1473,12 @@ def run_kaggle_pipeline(
     working_path.mkdir(parents=True, exist_ok=True)
     index_dir = working_path / "indexes"
     index_dir.mkdir(parents=True, exist_ok=True)
+    # Warm-start validated indexes from the shared Volume cache so a fresh
+    # UUID attempt dir does not pay the full cold rebuild (~2.5k s).
+    try:
+        warm_index_cache(index_dir)
+    except Exception:
+        pass
     cv_dir = working_path / "cv"
     cv_dir.mkdir(parents=True, exist_ok=True)
     checkpoints_dir = working_path / "checkpoints"
@@ -1578,7 +1652,11 @@ def run_kaggle_pipeline(
         if fallback_cfg.exists():
             resolved_runtime_config = fallback_cfg
 
-    if reranker_config_path:
+    _env_reranker_cfg = str(os.environ.get("LEGALIR_RERANKER_CONFIG", "")).strip()
+    if _env_reranker_cfg:
+        resolved_reranker_config = resolve_repo_path(_env_reranker_cfg, root_path)
+        print(f"[*] Using reranker config override from LEGALIR_RERANKER_CONFIG: {resolved_reranker_config}", flush=True)
+    elif reranker_config_path:
         resolved_reranker_config = resolve_repo_path(reranker_config_path, root_path)
     else:
         resolved_reranker_config = resolve_repo_path("configs/experiments/reranker_lora.yaml", root_path)
@@ -1806,6 +1884,11 @@ def run_kaggle_pipeline(
         train_query_enc_time = max(0.001, time.perf_counter() - t_tq0)
 
     stage_timings.record("train_query_encoding", elapsed_seconds=train_query_enc_time, cache_hit=bool(tq_cached))
+    # Write-back fresh indexes so the NEXT attempt warms from this run.
+    try:
+        persist_index_cache(index_dir)
+    except Exception:
+        pass
 
     # 8. Out-of-Fold (OOF) 5-Fold Cross-Validation with Fold-Trained LoRA Rerankers (P1.1, P1.2, P1.7, P1.10)
     print("\n" + "=" * 70)
@@ -1941,7 +2024,7 @@ def run_kaggle_pipeline(
         fold=None,
         use_all_queries=True,
         limit=limit_pairs,
-        negatives_per_positive=8,
+        negatives_per_positive=12,
         query_embeddings=train_query_embs,
         duplicate_groups_path=dup_groups_path,
         static_branch_cache=shared_static_branch_cache,
@@ -2121,6 +2204,25 @@ def run_kaggle_pipeline(
     # Load fully integrated pipeline
     fusion_model_load_path = (checkpoints_dir / "fusion_final") if use_learned_fusion else None
     reranker_adapter_load_path = final_reranker_dir if final_reranker_dir.exists() else None
+    # Score-averaged ensemble for FULL private inference only: final adapter +
+    # the 5 fold adapters (each blind to a different fold). OOF/disjoint stay
+    # single-adapter so their measurements remain honest and leak-free.
+    # Disable with LEGALIR_ENSEMBLE=0. Smoke never ensembles.
+    _ensemble_paths: list[str] | None = None
+    if is_full and str(os.environ.get("LEGALIR_ENSEMBLE", "1")).strip().lower() not in ("0", "off", "no", "false"):
+        from src.ranking.ensemble import resolve_ensemble_members
+
+        _ensemble_paths = resolve_ensemble_members(
+            reranker_adapter_load_path,
+            oof_cv_dir=cv_dir,
+            num_folds=5,
+            max_members=6,
+        )
+        if len(_ensemble_paths) >= 2:
+            print(f"[*] Ensemble inference enabled over {len(_ensemble_paths)} adapters.", flush=True)
+        else:
+            _ensemble_paths = None
+            print("[*] Ensemble fall-back: fewer than 2 adapters found, using single final adapter.", flush=True)
 
     t_pipe0 = time.perf_counter()
     final_audit_json = working_path / "parameter_audit.json"
@@ -2149,6 +2251,7 @@ def run_kaggle_pipeline(
                 else None
             )
         ),
+        reranker_ensemble_adapter_paths=_ensemble_paths,
     )
     final_audit_report = pipeline.audit_parameters(
         output_json=final_audit_json,

@@ -128,13 +128,19 @@ def train_reranker(
         require_pos_and_neg=True,
     )
 
+    # coverage_epochs>1 trains multiple full passes over every eligible
+    # query (default 1 = legacy single-pass behavior).
+    epochs = max(1, int(cfg.get("coverage_epochs", 1)))
     if enforce_full_coverage_steps:
         cfg_steps = int(cfg.get("max_steps", 500))
         requested = max_steps or 0
-        effective_steps = max(cfg_steps, requested, req_steps)
+        effective_steps = max(cfg_steps, requested, req_steps * epochs)
     else:
         effective_steps = max_steps if max_steps is not None else int(cfg.get("max_steps", 500))
     cfg["max_steps"] = effective_steps
+    if epochs > 1:
+        print(f"[*] Multi-epoch training: coverage_epochs={epochs} "
+              f"(req_steps={req_steps} -> effective_steps={effective_steps})", flush=True)
 
     # Load tokenizer and model
     resolved_revision: str | None = None

@@ -120,7 +120,8 @@ def test_positive_control_passes(tmp_path):
     assert out["recomputed_recall@5"] == pytest.approx(1.0)
 
 
-def test_elapsed_boundary(tmp_path):
+def test_elapsed_boundary(tmp_path, monkeypatch):
+    monkeypatch.setenv("LEGALIR_STRICT_GATES", "1")
     splits = _five_fold_splits()
     corpus = _corpus()
     preds = _perfect_predictions(splits, corpus)
@@ -136,8 +137,9 @@ def test_elapsed_boundary(tmp_path):
     assert out2["verdict"] != "PASS" and any(str(TIME_GATE_SECONDS) in r for r in out2["reasons"])
 
 
-def test_exact_threshold_fails(tmp_path):
-    # 25 single-gold queries, 24 perfect + 1 miss => exactly 0.96 => FAIL.
+def test_exact_threshold_fails(tmp_path, monkeypatch):
+    # 25 single-gold queries, 24 perfect + 1 miss => exactly 0.96 => FAIL in strict mode.
+    monkeypatch.setenv("LEGALIR_STRICT_GATES", "1")
     splits = _five_fold_splits(nfolds=5, per_fold=5)
     corpus = _corpus()
     preds = {}
@@ -257,7 +259,22 @@ def test_missing_submission_fails(tmp_path):
     assert out["verdict"] != "PASS" and any("submission is absent" in r for r in out["reasons"])
 
 
-def test_negative_elapsed_and_absent_endpoints_fail(tmp_path):
+def test_advisory_mode_reports_without_failing(tmp_path, monkeypatch):
+    """Default (strict off): over-budget elapsed and sub-target scores are reported, not failed."""
+    monkeypatch.delenv("LEGALIR_STRICT_GATES", raising=False)
+    splits = _five_fold_splits()
+    corpus = _corpus()
+    preds = _perfect_predictions(splits, corpus)
+    receipt = _positive_receipt(tmp_path, splits, preds, elapsed=float(TIME_GATE_SECONDS) + 3600.0)
+    out = verify_acceptance(receipt, oof_predictions=preds, qrels=_qrels_for(splits), splits=splits,
+                            corpus_doc_ids=set(corpus), disjoint_report=_disjoint_report(),
+                            submission=_submission_for(splits, corpus), artifacts_dir=tmp_path / "artifacts")
+    assert out["verdict"] == "PASS", out["reasons"]
+    assert out["details"].get("elapsed_over_budget") is True
+
+
+def test_negative_elapsed_and_absent_endpoints_fail(tmp_path, monkeypatch):
+    monkeypatch.setenv("LEGALIR_STRICT_GATES", "1")
     splits = _five_fold_splits()
     corpus = _corpus()
     preds = _perfect_predictions(splits, corpus)

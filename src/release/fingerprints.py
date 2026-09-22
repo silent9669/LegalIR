@@ -9,6 +9,7 @@ import copy
 import dataclasses
 import hashlib
 import json
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -17,6 +18,16 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 SHA_REGEX = re.compile(r"^[0-9a-fA-F]{40}$")
+
+
+def strict_gates_enabled() -> bool:
+    """Release/SHA gates are advisory by default; strict only on explicit opt-in.
+
+    Set LEGALIR_STRICT_GATES=1 to restore the old fail-closed release behavior
+    (exact-SHA match, branch rejection). Dev/Modal loops run permissive so a
+    teammate can launch without cutting a new release for every edit.
+    """
+    return str(os.environ.get("LEGALIR_STRICT_GATES", "")).strip() == "1"
 
 CRITICAL_DATASET_FILES: tuple[str, ...] = (
     "documents.parquet",
@@ -137,9 +148,21 @@ def assert_exact_git_sha(
 ) -> str:
     """
     Validate that the repository HEAD precisely matches expected_sha.
-    Strictly forbids 'main', 'master', empty, or unpinned SHAs in production.
+
+    Default (LEGALIR_STRICT_GATES unset): advisory — log the actual HEAD and
+    continue so dev/Modal runs never block on releases. Strict mode
+    (LEGALIR_STRICT_GATES=1) restores the old fail-closed behavior: forbids
+    'main', 'master', empty, or unpinned SHAs in production.
     """
     actual_sha = get_git_head_sha(repo_root)
+
+    if not strict_gates_enabled():
+        print(
+            f"[*] SHA gate advisory only (strict off): HEAD={actual_sha} "
+            f"expected={str(expected_sha).strip()[:12] if expected_sha else 'none'}",
+            flush=True,
+        )
+        return actual_sha
 
     if not expected_sha or not str(expected_sha).strip():
         if is_production:

@@ -59,14 +59,14 @@ retrieval:
 
 ranking:
   evidence:
-    max_chunks_per_doc: 2
-    max_chars: 1200
+    max_chunks_per_doc: 3
+    max_chars: 1600
   reranker:
     enabled: true
     model_name: "BAAI/bge-reranker-v2-m3"
     revision: "953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e"
     batch_size: 16
-    max_length: 384
+    max_length: 512
   fusion:
     method: "rrf"  # rrf | lightgbm
     rrf_k: 60

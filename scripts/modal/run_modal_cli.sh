@@ -53,6 +53,9 @@ HF_PUBLIC_FLAG=""
 PRIVATE_FLAG=""
 DETACH_MODE=0
 SHOW_HELP=0
+PUSH_CONFIG=""
+WARM_MODE=0
+WARM_ONLY=0
 
 for arg in "$@"; do
   case "$arg" in
@@ -78,6 +81,14 @@ for arg in "$@"; do
       PRIVATE_FLAG="--private"
       export LEGALIR_TEST_PHASE="private"
       ;;
+    --push-config)
+      if [ -n "$PUSH_CONFIG" ]; then
+        echo "[!] Duplicate --push-config flag." >&2
+        exit 2
+      fi
+      PUSH_CONFIG="configs/experiments/reranker_lora_v3_push.yaml"
+      export LEGALIR_RERANKER_CONFIG="$PUSH_CONFIG"
+      ;;
     --detach)
       if [ "$DETACH_MODE" -ne 0 ]; then
         echo "[!] Duplicate --detach flag." >&2
@@ -85,11 +96,25 @@ for arg in "$@"; do
       fi
       DETACH_MODE=1
       ;;
+    --warm)
+      if [ "$WARM_MODE" -ne 0 ] || [ "$WARM_ONLY" -ne 0 ]; then
+        echo "[!] Duplicate warm flag." >&2
+        exit 2
+      fi
+      WARM_MODE=1
+      ;;
+    --warm-only)
+      if [ "$WARM_MODE" -ne 0 ] || [ "$WARM_ONLY" -ne 0 ]; then
+        echo "[!] Duplicate warm flag." >&2
+        exit 2
+      fi
+      WARM_ONLY=1
+      ;;
     -h|--help)
       SHOW_HELP=1
       ;;
     *)
-      echo "[!] Unknown argument: $arg (expected --hf-allow-public-repo, --detach, --private)" >&2
+      echo "[!] Unknown argument: $arg (expected --hf-allow-public-repo, --detach, --private, --push-config, --warm, --warm-only)" >&2
       exit 2
       ;;
   esac
@@ -97,14 +122,24 @@ done
 
 if [ "$SHOW_HELP" -eq 1 ]; then
   cat <<'EOF'
-Usage: scripts/modal/run_modal_cli.sh [--hf-allow-public-repo] [--detach] [--private]
+Usage: scripts/modal/run_modal_cli.sh [--hf-allow-public-repo] [--detach] [--private] [--push-config] [--warm] [--warm-only]
 
-Recommended Modal entrypoint. Validates CPU provenance before dispatch.
+Recommended Modal entrypoint (no release required; SHA/tree checks advisory
+unless LEGALIR_STRICT_GATES=1).
   --hf-allow-public-repo   Explicit opt-in to push to an existing PUBLIC HF
                            repo (recorded in manifest). Absent means
                            private-only (fail closed).
   --private                Explicit opt-in to evaluate Private test queries
                            (2,080 queries) instead of default public (1,000 queries).
+  --push-config            Use the score-push reranker config
+                           (configs/experiments/reranker_lora_v3_push.yaml:
+                           listwise, LoRA r=64 cold start, 2 epochs). Default
+                           uses configs/experiments/reranker_lora.yaml.
+                           LEGALIR_RERANKER_CONFIG env overrides both.
+  --warm                   Warm the shared Volume first (CPU-cheap:
+                           models + dataset), then dispatch A100. Recommended:
+                           A100 bills zero download seconds.
+  --warm-only              Only warm the shared Volume (no A100 dispatch).
   --detach                 Explicit opt-in to `modal run --detach` (app survives
                            client disconnect). Default is attached: client
                            disconnect terminates remote tasks even with a
@@ -127,39 +162,46 @@ if [ ! -x "$MODAL_BIN" ] && [ ! -f "$MODAL_BIN" ]; then
   exit 2
 fi
 
-# Selected SHA from env or exact local HEAD.
+# Run label from env or exact local HEAD (advisory unless LEGALIR_STRICT_GATES=1).
 if [ -n "${LEGALIR_COMMIT_SHA:-}" ]; then
   EXPECTED_SHA="$LEGALIR_COMMIT_SHA"
 else
   if ! EXPECTED_SHA="$(git rev-parse HEAD 2>/dev/null)"; then
-    echo "[!] Could not determine local HEAD; set LEGALIR_COMMIT_SHA." >&2
-    exit 2
+    EXPECTED_SHA="dev"
+    echo "[*] No git SHA found; using run label 'dev' (strict off)."
   fi
 fi
-if ! echo "$EXPECTED_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
-  echo "[!] LEGALIR_COMMIT_SHA must be an exact 40-char lowercase SHA, got '$EXPECTED_SHA'." >&2
-  exit 2
+if [ "${LEGALIR_STRICT_GATES:-}" = "1" ]; then
+  if ! echo "$EXPECTED_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+    echo "[!] Strict mode: LEGALIR_COMMIT_SHA must be an exact 40-char lowercase SHA, got '$EXPECTED_SHA'." >&2
+    exit 2
+  fi
+  # Reject mismatch between selected SHA and local HEAD.
+  LOCAL_HEAD="$(git rev-parse HEAD 2>/dev/null || true)"
+  if [ -n "$LOCAL_HEAD" ] && [ "$LOCAL_HEAD" != "$EXPECTED_SHA" ]; then
+    echo "[!] Selected SHA $EXPECTED_SHA does not match local HEAD $LOCAL_HEAD; refusing to dispatch." >&2
+    exit 2
+  fi
+  # Require clean tracked/untracked tree (ignored files excluded by porcelain).
+  if [ -n "$(git status --porcelain=v1 2>/dev/null)" ]; then
+    echo "[!] Working tree is dirty; commit or stash before Modal dispatch." >&2
+    git status --porcelain=v1 >&2 || true
+    exit 2
+  fi
+else
+  if [ -n "$(git status --porcelain=v1 2>/dev/null)" ]; then
+    echo "[*] Working tree dirty — continuing (strict off). Uncommitted edits ride along only if committed/pushed; remote clones origin, not local files."
+  fi
 fi
 
-# Reject mismatch between selected SHA and local HEAD.
-LOCAL_HEAD="$(git rev-parse HEAD 2>/dev/null || true)"
-if [ -n "$LOCAL_HEAD" ] && [ "$LOCAL_HEAD" != "$EXPECTED_SHA" ]; then
-  echo "[!] Selected SHA $EXPECTED_SHA does not match local HEAD $LOCAL_HEAD; refusing to dispatch." >&2
-  exit 2
-fi
-
-# Require clean tracked/untracked tree (ignored files excluded by porcelain).
-if [ -n "$(git status --porcelain=v1 2>/dev/null)" ]; then
-  echo "[!] Working tree is dirty; commit or stash before Modal dispatch." >&2
-  git status --porcelain=v1 >&2 || true
-  exit 2
-fi
-
-# CPU provenance gate before any cloud command (image build/dispatch).
+# CPU provenance preflight before any cloud command (advisory unless strict).
 echo "[*] Local CPU provenance preflight for $EXPECTED_SHA..."
 if ! "$PYTHON_BIN" scripts/colab/bootstrap.py --expected-sha "$EXPECTED_SHA"; then
-  echo "[!] Local CPU provenance failed; aborting before Modal dispatch." >&2
-  exit 1
+  if [ "${LEGALIR_STRICT_GATES:-}" = "1" ]; then
+    echo "[!] Local CPU provenance failed; aborting before Modal dispatch." >&2
+    exit 1
+  fi
+  echo "[*] Preflight advisory (strict off), continuing to dispatch."
 fi
 
 # Forward explicit consent once; absent stays private-only.
@@ -176,6 +218,20 @@ fi
 DETACH_OPT=""
 if [ "$DETACH_MODE" -eq 1 ]; then
   DETACH_OPT="--detach"
+fi
+
+# CPU-cheap Volume warm (models + dataset) before any A100 billing.
+if [ "$WARM_MODE" -eq 1 ] || [ "$WARM_ONLY" -eq 1 ]; then
+  echo "[*] Warming shared Volume cache on CPU (no GPU billed)..."
+  if ! LEGALIR_COMMIT_SHA="$EXPECTED_SHA" "$MODAL_BIN" run scripts/modal/warm_volume.py; then
+    echo "[!] Volume warm failed; aborting before A100 dispatch." >&2
+    exit 1
+  fi
+  echo "[+] Shared Volume cache ready."
+fi
+if [ "$WARM_ONLY" -eq 1 ]; then
+  echo "[*] --warm-only: warm complete, no A100 dispatch."
+  exit 0
 fi
 
 echo "[*] Dispatching to Modal for $EXPECTED_SHA ${MODAL_ARGS[*]}..."

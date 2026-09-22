@@ -147,12 +147,13 @@ class HardNegativeMiner:
         """
         default_limits = {
             "exact": 2,
-            "bm25": 4,
-            "bm25_pyvi": 3,
-            "dense": 4,
-            "memory": 2,
-            "hybrid": 4,
-            "medium_neg": 3,
+            "hybrid": 3,
+            "near_miss": 3,
+            "dense": 1,
+            "memory": 1,
+            "medium_neg": 2,
+            "bm25": 2,
+            "bm25_pyvi": 1,
         }
         limits = per_source_limits or default_limits
 
@@ -162,8 +163,11 @@ class HardNegativeMiner:
         mined: list[dict[str, Any]] = []
         seen_dids: set[str] = set()
 
-        # Iterate over sources in priority order
-        source_order = ["exact", "bm25", "bm25_pyvi", "dense", "memory", "hybrid", "medium_neg"]
+        # Iterate over sources in priority order: fused-ranking boundary first
+        # (hybrid top + near-miss ranks 3-15 decide top-5), then one dense and
+        # one memory negative for error-mode diversity, then medium + branches.
+        # Single-gold budget (12): exact2+hybrid3+near3+dense1+memory1+medium2.
+        source_order = ["exact", "hybrid", "near_miss", "dense", "memory", "medium_neg", "bm25", "bm25_pyvi"]
         all_sources = [s for s in source_order if s in candidates_by_source] + [
             s for s in candidates_by_source if s not in source_order
         ]

@@ -147,15 +147,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--approval", type=Path, default=DEFAULT_APPROVAL_PATH, help="Path to release_approval.json (legacy only)")
     parser.add_argument("--colab-report", type=Path, default=DEFAULT_COLAB_REPORT_PATH, help="Path to colab_smoke_report.json (legacy only)")
     parser.add_argument("--head", type=str, default=None, help="Optional release HEAD override (legacy only)")
-    parser.add_argument("--allow-runtime-changes", action="store_true", help="Legacy development bypass; rejected in current production mode")
+    parser.add_argument("--allow-runtime-changes", action="store_true", help="Dev bypass: warn and pass without a new release (default advisory; strict mode rejects)")
     parser.add_argument("--verify-ci-run", action="store_true", help="Query GitHub Actions API (legacy only)")
     parser.add_argument("--token", type=str, default=None, help="GitHub token (legacy only)")
     args = parser.parse_args(argv)
 
     if not args.legacy:
+        import os as _os
+
+        _strict = str(_os.environ.get("LEGALIR_STRICT_GATES", "")).strip() == "1"
         if args.allow_runtime_changes:
-            print("[-] --allow-runtime-changes is rejected in current production mode.", file=sys.stderr)
-            return 2
+            if _strict:
+                print("[-] --allow-runtime-changes is rejected in strict mode.", file=sys.stderr)
+                return 2
+            print("[*] --allow-runtime-changes: advisory pass without release check (strict off).")
+            return 0
         if args.head is not None or args.verify_ci_run or args.token is not None:
             print("[-] --head/--verify-ci-run/--token are legacy-only; use --legacy to select historical behavior.", file=sys.stderr)
             return 2

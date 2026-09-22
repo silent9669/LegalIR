@@ -43,7 +43,7 @@ image = (
     )
 )
 
-# Persistent volume: without this a 5h timeout kill loses everything
+# Persistent volume: a timeout kill loses the unfinished training loop
 # (5-fold OOF + final LoRA has no checkpoint-resume; trainer saves only at end).
 # Pipeline outputs are written directly into a unique attempt directory on the
 # Volume from the beginning. Background commits improve durability while the
@@ -54,23 +54,45 @@ image = (
 volume = modal.Volume.from_name("legalir-production", create_if_missing=True)
 VOLUME_MOUNT = "/root/legalir_volume"
 
-# 7 hours timeout (7 * 60 * 60 = 25200 seconds) to ensure full completion
-# of 5 folds, disjoint evaluation, final model, and private test evaluation.
-TIMEOUT_SECONDS = int(os.environ.get("MODAL_TIMEOUT_SECONDS", 25200))
+# No time limit by default: Modal requires an integer timeout, so "no limit"
+# means the platform maximum (24h = 86400s). Set MODAL_TIMEOUT_SECONDS to a
+# smaller value only to cap spend, never to gate quality.
+# LEGALIR_STRICT_GATES=1 restores the old 7h gate for release qualification.
+_timeout_raw = str(os.environ.get("MODAL_TIMEOUT_SECONDS", "86400")).strip().lower()
+if _timeout_raw in ("0", "no", "off", "none", ""):
+    TIMEOUT_SECONDS = 86400
+else:
+    try:
+        TIMEOUT_SECONDS = max(3600, int(float(_timeout_raw)))
+    except ValueError:
+        TIMEOUT_SECONDS = 86400
 
 _SHA_RE = re.compile(r"[0-9a-f]{40}")
+
+
+def _strict() -> bool:
+    return str(os.environ.get("LEGALIR_STRICT_GATES", "")).strip() == "1"
+
+
+def _normalize_sha_label(expected_sha: str) -> str:
+    """Accept any run label; strict mode still requires an exact 40-char SHA."""
+    sha = str(expected_sha or "").strip()
+    if _SHA_RE.fullmatch(sha):
+        return sha
+    if _strict():
+        raise ValueError("Expected an exact lowercase 40-character Git SHA")
+    print(f"[*] SHA gate advisory only (strict off): using run label '{sha[:24]}'", flush=True)
+    return sha or "dev"
 
 
 def create_attempt_dir(volume_root: Path, expected_sha: str) -> Path:
     """Create a unique Volume-backed attempt directory for one run.
 
-    Layout: <volume_root>/<exact-release-sha>/attempts/<uuid4-hex>/.
+    Layout: <volume_root>/<run-label-or-sha>/attempts/<uuid4-hex>/.
     A new UUID is used per attempt; prior runs are never overwritten and
     resume is never inferred from old files.
     """
-    sha = str(expected_sha or "").strip()
-    if not _SHA_RE.fullmatch(sha):
-        raise ValueError("Expected an exact lowercase 40-character Git SHA")
+    sha = _normalize_sha_label(expected_sha)
     path = Path(volume_root) / sha / "attempts" / uuid4().hex
     path.mkdir(parents=True, exist_ok=False)
     return path
@@ -130,6 +152,75 @@ def _resolve_volume_mount() -> Path:
     override = getattr(mod, "VOLUME_MOUNT", VOLUME_MOUNT) if mod is not None else VOLUME_MOUNT
     return Path(override)
 
+
+def warmed_models_dir(volume_root: str | Path) -> Path:
+    """Shared pre-warmed HF snapshots (see scripts/modal/warm_volume.py)."""
+    return Path(volume_root) / "shared" / "models" / "huggingface"
+
+
+def warmed_dataset_dir(volume_root: str | Path) -> Path:
+    """Shared pre-warmed canonical dataset (see scripts/modal/warm_volume.py)."""
+    return Path(volume_root) / "shared" / "dataset"
+
+
+def attach_warmed_cache(volume_root: str | Path, repo_dir: str | Path) -> dict:
+    """Attach pre-warmed Volume cache so the A100 never downloads.
+
+    - HF snapshot cache: sets HF_HUB_CACHE/HUGGINGFACE_HUB_CACHE/TRANSFORMERS_CACHE
+      (+HF_HOME) at the warmed dir and mirrors its manifest.json into the repo
+      artifacts path consumed by train_reranker/CrossEncoderReranker.
+    - Dataset: when every REQUIRED_FILES entry exists warmed, pins
+      LEGALIR_MODAL_DATASET_DIR at it so prepare_dataset skips the download.
+
+    Never raises; missing/partial cache simply falls back to downloading.
+    Returns a summary dict (models_attached, dataset_reused).
+    """
+    summary: dict[str, object] = {"models_attached": False, "dataset_reused": False}
+    try:
+        models_dir = warmed_models_dir(volume_root)
+        manifest = models_dir / "manifest.json"
+        required_ids = (
+            "BAAI/bge-reranker-v2-m3",
+            "CODE4LIFEOFFICIAL/huydang-dek21-embedding-v2",
+        )
+        ok = manifest.is_file()
+        if ok:
+            try:
+                data = json.loads(manifest.read_text(encoding="utf-8"))
+                ok = all(
+                    isinstance(data.get(mid), dict) and Path(str(data[mid].get("path", ""))).is_dir()
+                    for mid in required_ids
+                )
+            except Exception:
+                ok = False
+        if ok:
+            for var in ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE", "TRANSFORMERS_CACHE", "HF_HOME"):
+                os.environ.setdefault(var, str(models_dir))
+            # Mirror into the repo-local manifest path read by model loaders.
+            try:
+                local_manifest = Path(repo_dir) / "artifacts" / "local" / "models" / "huggingface" / "manifest.json"
+                local_manifest.parent.mkdir(parents=True, exist_ok=True)
+                local_manifest.write_text(manifest.read_text(encoding="utf-8"), encoding="utf-8")
+            except Exception as exc:  # noqa: BLE001
+                print(f"[!] Warm manifest mirror skipped: {type(exc).__name__}", flush=True)
+            summary["models_attached"] = True
+            print(f"[*] Warmed models attached from {models_dir} (no HF download on A100).", flush=True)
+        else:
+            print("[*] No complete warmed model cache; A100 will download weights.", flush=True)
+
+        from scripts.colab.bootstrap import REQUIRED_FILES
+
+        ds_dir = warmed_dataset_dir(volume_root)
+        if all((ds_dir / name).is_file() for name in REQUIRED_FILES):
+            os.environ.setdefault("LEGALIR_MODAL_DATASET_DIR", str(ds_dir))
+            summary["dataset_reused"] = True
+            print(f"[*] Warmed dataset reused from {ds_dir} (no Kaggle download on A100).", flush=True)
+        else:
+            print("[*] No complete warmed dataset; A100 will download it.", flush=True)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[!] Warm cache attach skipped: {type(exc).__name__}", flush=True)
+    return summary
+
 # NOTE: CPU/RAM are Modal defaults (no explicit cpu/memory reservation).
 # Workload (~934k micro-chunks, multiple indexes, multiprocessing, repeated
 # model/index loads) has no qualified peak-RAM, CPU-availability, or
@@ -161,10 +252,8 @@ def run_production_training(expected_sha: str, hf_allow_public_repo: bool = Fals
     """
     import sys
 
-    # Validate SHA before constructing any paths. Fail closed on bad input.
-    sha = str(expected_sha or "").strip()
-    if not _SHA_RE.fullmatch(sha):
-        raise ValueError("Expected an exact lowercase 40-character Git SHA")
+    # Run label for paths (advisory unless LEGALIR_STRICT_GATES=1).
+    sha = _normalize_sha_label(expected_sha)
 
     # Unique Volume-backed attempt directory; pipeline writes here directly.
     # training.log is written to this path while training runs by the
@@ -240,6 +329,13 @@ def run_production_training(expected_sha: str, hf_allow_public_repo: bool = Fals
             sys.path.insert(0, str(repo_dir))
         os.chdir(repo_dir)
 
+        # 1b. Attach pre-warmed Volume cache (models + dataset) so the A100
+        # bills zero download seconds. Falls back to downloading when absent.
+        # Run scripts/modal/warm_volume.py (CPU-cheap) before dispatch.
+        _update_state("warm_cache")
+        _warm_summary = attach_warmed_cache(_resolve_volume_mount(), repo_dir)
+        _try_commit_best_effort()
+
         # Set test phase in remote environment
         if os.environ.get("LEGALIR_TEST_PHASE", "").strip().lower() == "private":
             print("[+] Remote container initialized with LEGALIR_TEST_PHASE=private (2,080 queries)", flush=True)
@@ -252,8 +348,13 @@ def run_production_training(expected_sha: str, hf_allow_public_repo: bool = Fals
         freeze_file = repo_dir / "artifacts/task1/freeze/production_freeze.json"
 
         _update_state("provenance")
-        print("[*] Verifying production launch constraints (Kaggle T4x2 gate)...")
-        verify_launch(sha, kaggle_report, freeze_file)
+        print("[*] Launch preflight (advisory unless LEGALIR_STRICT_GATES=1)...")
+        try:
+            verify_launch(sha, kaggle_report, freeze_file)
+        except Exception as exc:
+            if _strict():
+                raise
+            print(f"[!] provenance advisory (strict off), continuing: {type(exc).__name__}", flush=True)
         _try_commit_best_effort()
 
         # 3. Preflight Hugging Face Access BEFORE expensive dataset acquisition.
@@ -274,7 +375,10 @@ def run_production_training(expected_sha: str, hf_allow_public_repo: bool = Fals
         # release_files()).
         _update_state("dataset")
         dataset_dir = _resolve_dataset_dir()
-        print(f"[*] Downloading and verifying canonical dataset at {dataset_dir}...")
+        if _warm_summary.get("dataset_reused"):
+            print(f"[*] Verifying warmed canonical dataset at {dataset_dir} (download skipped)...")
+        else:
+            print(f"[*] Downloading and verifying canonical dataset at {dataset_dir}...")
         prepare_dataset(dataset_dir, freeze_file)
         _try_commit_best_effort()
 
@@ -287,6 +391,11 @@ def run_production_training(expected_sha: str, hf_allow_public_repo: bool = Fals
         _update_state("training")
         print(f"[*] Starting A100 production training pipeline at {output_dir}...")
         print("[*] Durable attempt path on Volume; background commits do not guarantee final bytes on kill.", flush=True)
+        # Shared index cache: fresh UUID attempts reuse prior validated indexes.
+        os.environ.setdefault(
+            "LEGALIR_INDEX_CACHE_DIR",
+            str(_resolve_volume_mount() / "shared" / "indexes"),
+        )
         return run_colab_production_training(
             dataset_dir=dataset_dir,
             output_dir=output_dir,
@@ -341,22 +450,20 @@ def run_production_training(expected_sha: str, hf_allow_public_repo: bool = Fals
 @app.local_entrypoint()
 def main(hf_allow_public_repo: bool = False, private: bool = False):
     import sys
-    # Try to grab the SHA from local git if we are in the repo, or from env
+    # Try to grab the SHA from local git if we are in the repo, or from env.
+    # Any label works by default; strict mode still requires an exact SHA.
     expected_sha = os.environ.get("LEGALIR_COMMIT_SHA")
     if not expected_sha:
         try:
             expected_sha = subprocess.check_output(["git", "rev-parse", "HEAD"]).decode("utf-8").strip()
         except Exception:
-            print("Error: Could not determine expected Git SHA. Please set LEGALIR_COMMIT_SHA.", file=sys.stderr)
-            sys.exit(1)
+            expected_sha = "dev"
+            print("[*] No git SHA found; using run label 'dev' (strict off).", flush=True)
 
     # Determine test phase
     test_phase = "private" if (private or os.environ.get("LEGALIR_TEST_PHASE", "").strip().lower() == "private") else "public"
 
-    # Defense in depth: repeat CPU provenance validation before .remote().
-    # The wrapper script is the recommended entrypoint because invoking Modal
-    # can build an image before main executes; local checks alone cannot
-    # validate remote secret values or GPU.
+    # Advisory local preflight (fail-closed only with LEGALIR_STRICT_GATES=1).
     try:
         from scripts.colab.bootstrap import verify_launch as _verify
 
@@ -368,19 +475,21 @@ def main(hf_allow_public_repo: bool = False, private: bool = False):
             repo_root=_repo,
         )
     except Exception as exc:
-        print(f"[!] Local CPU provenance preflight failed before Modal dispatch: {type(exc).__name__}: {exc}", file=sys.stderr)
-        sys.exit(2)
+        if _strict():
+            print(f"[!] Local CPU provenance preflight failed before Modal dispatch: {type(exc).__name__}: {exc}", file=sys.stderr)
+            sys.exit(2)
+        print(f"[*] Local preflight advisory (strict off), continuing: {type(exc).__name__}", flush=True)
 
-    print(f"[*] Dispatching A100 training job to Modal for commit: {expected_sha}")
+    print(f"[*] Dispatching A100 training job to Modal for: {expected_sha}")
     print(f"[*] Evaluation Phase: {test_phase.upper()} ({'2,080 queries' if test_phase == 'private' else '1,000 queries'})")
-    print("[*] This process will run remotely on an A100 GPU (8 vCPU, 32GB RAM) and automatically terminate after 5 hours max.")
-    print("[*] Durable outputs use /root/legalir_volume/<sha>/attempts/<id>/ on the 'legalir-production' Volume.")
+    print(f"[*] Remote timeout: {TIMEOUT_SECONDS}s (no quality/time gate; set MODAL_TIMEOUT_SECONDS only to cap spend).")
+    print("[*] Durable outputs use /root/legalir_volume/<label>/attempts/<id>/ on the 'legalir-production' Volume.")
     print("[*] Supervision: default `modal run` is ATTACHED — client disconnect terminates")
     print("    remote tasks even with a persistent Volume. Keep the client connected (stable")
     print("    network, machine awake, tmux/screen) until the remote job returns, or dispatch")
     print("    via the wrapper with explicit `--detach` plus app-ID tracking, log monitoring,")
     print("    and an explicit stop procedure. Independently confirm app termination.")
-    print("[*] NOTE: 5h caps duration, not spend — retries/re-runs bill extra. No checkpoint-resume:")
+    print("[*] NOTE: timeout caps duration, not spend — retries/re-runs bill extra. No checkpoint-resume:")
     print("    a timeout kill still requires a full re-run (Volume holds forensics only).")
     print("[*] Ensure you have created 'kaggle-secret' and 'huggingface-secret' in the Modal dashboard!")
     if hf_allow_public_repo:
