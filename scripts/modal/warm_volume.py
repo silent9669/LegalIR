@@ -31,11 +31,12 @@ import modal
 
 app = modal.App("legalir-warm-cache")
 
-# Slim CPU image: snapshot_download + kaggle + repo helpers only (no torch).
+# CPU image: snapshot_download + kaggle + repo helpers + torch.
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("git")
     .pip_install(
+        "torch>=2.2.0",
         "huggingface-hub==1.28.0",
         "kaggle>=1.8,<3",
         "pyyaml>=6,<7",
