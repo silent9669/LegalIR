@@ -270,46 +270,41 @@ fi
 export HF_REPO_ID="$HF_REPO_FLAG"
 echo "[*] HF repo: $HF_REPO_FLAG (source=$HF_REPO_SOURCE)"
 
-# Run label from env or exact local HEAD (advisory unless LEGALIR_STRICT_GATES=1).
+# Run label from env or exact local HEAD.
 if [ -n "${LEGALIR_COMMIT_SHA:-}" ]; then
   EXPECTED_SHA="$LEGALIR_COMMIT_SHA"
 else
   if ! EXPECTED_SHA="$(git rev-parse HEAD 2>/dev/null)"; then
-    EXPECTED_SHA="dev"
-    echo "[*] No git SHA found; using run label 'dev' (strict off)."
-  fi
-fi
-if [ "${LEGALIR_STRICT_GATES:-}" = "1" ]; then
-  if ! echo "$EXPECTED_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
-    echo "[!] Strict mode: LEGALIR_COMMIT_SHA must be an exact 40-char lowercase SHA, got '$EXPECTED_SHA'." >&2
+    echo "[!] Unable to resolve local git HEAD. Set LEGALIR_COMMIT_SHA explicitly." >&2
     exit 2
-  fi
-  # Reject mismatch between selected SHA and local HEAD.
-  LOCAL_HEAD="$(git rev-parse HEAD 2>/dev/null || true)"
-  if [ -n "$LOCAL_HEAD" ] && [ "$LOCAL_HEAD" != "$EXPECTED_SHA" ]; then
-    echo "[!] Selected SHA $EXPECTED_SHA does not match local HEAD $LOCAL_HEAD; refusing to dispatch." >&2
-    exit 2
-  fi
-  # Require clean tracked/untracked tree (ignored files excluded by porcelain).
-  if [ -n "$(git status --porcelain=v1 2>/dev/null)" ]; then
-    echo "[!] Working tree is dirty; commit or stash before Modal dispatch." >&2
-    git status --porcelain=v1 >&2 || true
-    exit 2
-  fi
-else
-  if [ -n "$(git status --porcelain=v1 2>/dev/null)" ]; then
-    echo "[*] Working tree dirty — continuing (strict off). Uncommitted edits ride along only if committed/pushed; remote clones origin, not local files."
   fi
 fi
 
-# CPU provenance preflight before any cloud command (advisory unless strict).
+if ! echo "$EXPECTED_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+  echo "[!] LEGALIR_COMMIT_SHA must be an exact 40-char lowercase SHA, got '$EXPECTED_SHA'." >&2
+  exit 2
+fi
+
+# Reject mismatch between selected SHA and local HEAD.
+LOCAL_HEAD="$(git rev-parse HEAD 2>/dev/null || true)"
+if [ -n "$LOCAL_HEAD" ] && [ "$LOCAL_HEAD" != "$EXPECTED_SHA" ]; then
+  echo "[!] Selected SHA $EXPECTED_SHA does not match local HEAD $LOCAL_HEAD; refusing to dispatch." >&2
+  exit 2
+fi
+
+# Require clean tracked/untracked tree (ignored files excluded by porcelain; .env is credentials).
+DIRTY_FILES="$(git status --porcelain=v1 2>/dev/null | grep -v '^[?][?] \.env$' || true)"
+if [ -n "$DIRTY_FILES" ]; then
+  echo "[!] Working tree is dirty; commit or stash before Modal dispatch." >&2
+  echo "$DIRTY_FILES" >&2
+  exit 2
+fi
+
+# CPU provenance preflight before any cloud command.
 echo "[*] Local CPU provenance preflight for $EXPECTED_SHA..."
 if ! "$PYTHON_BIN" scripts/colab/bootstrap.py --expected-sha "$EXPECTED_SHA"; then
-  if [ "${LEGALIR_STRICT_GATES:-}" = "1" ]; then
-    echo "[!] Local CPU provenance failed; aborting before Modal dispatch." >&2
-    exit 1
-  fi
-  echo "[*] Preflight advisory (strict off), continuing to dispatch."
+  echo "[!] Local CPU provenance failed; aborting before Modal dispatch." >&2
+  exit 1
 fi
 
 # Forward explicit consent once; absent stays private-only.

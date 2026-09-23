@@ -148,21 +148,10 @@ def assert_exact_git_sha(
 ) -> str:
     """
     Validate that the repository HEAD precisely matches expected_sha.
-
-    Default (LEGALIR_STRICT_GATES unset): advisory — log the actual HEAD and
-    continue so dev/Modal runs never block on releases. Strict mode
-    (LEGALIR_STRICT_GATES=1) restores the old fail-closed behavior: forbids
-    'main', 'master', empty, or unpinned SHAs in production.
+    Enforces exact 40-character lowercase hexadecimal SHA independently of
+    LEGALIR_STRICT_GATES (Policy A requirement).
     """
     actual_sha = get_git_head_sha(repo_root)
-
-    if not strict_gates_enabled():
-        print(
-            f"[*] SHA gate advisory only (strict off): HEAD={actual_sha} "
-            f"expected={str(expected_sha).strip()[:12] if expected_sha else 'none'}",
-            flush=True,
-        )
-        return actual_sha
 
     if not expected_sha or not str(expected_sha).strip():
         if is_production:
@@ -173,7 +162,7 @@ def assert_exact_git_sha(
 
     expected_clean = str(expected_sha).strip().lower()
 
-    if expected_clean in ("main", "master"):
+    if expected_clean in ("main", "master", "dev"):
         raise ShaMismatchError(
             f"Literal branch name '{expected_clean}' is forbidden for authoritative execution. "
             f"Pass a detached 40-character commit SHA."
@@ -232,13 +221,19 @@ def verify_dataset_fingerprint(
     data_dir = Path(dataset_dir)
     manifest_path = data_dir / "dataset_manifest.json"
 
-    if manifest_path.is_file():
-        try:
-            stored_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except Exception as exc:
-            raise DatasetFingerprintMismatchError(f"Corrupt dataset_manifest.json: {exc}") from exc
-    else:
-        stored_manifest = None
+    if not manifest_path.is_file():
+        raise DatasetFingerprintMismatchError(f"Canonical dataset manifest missing: {manifest_path}")
+    try:
+        stored_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(stored_manifest, dict):
+            raise ValueError("Manifest content must be a JSON object")
+    except Exception as exc:
+        raise DatasetFingerprintMismatchError(f"Corrupt dataset_manifest.json: {exc}") from exc
+
+    if "critical_files" not in stored_manifest or not isinstance(stored_manifest["critical_files"], dict):
+        raise DatasetFingerprintMismatchError("dataset_manifest.json missing required 'critical_files' mapping")
+    if "manifest_sha256" not in stored_manifest:
+        raise DatasetFingerprintMismatchError("dataset_manifest.json missing required 'manifest_sha256'")
 
     actual_files: dict[str, str] = {}
     for filename in CRITICAL_DATASET_FILES:
@@ -249,31 +244,33 @@ def verify_dataset_fingerprint(
         actual_files[filename] = actual_hash
 
         # Verify against stored manifest
-        if stored_manifest and "critical_files" in stored_manifest:
-            expected_hash = stored_manifest["critical_files"].get(filename)
-            if expected_hash and expected_hash != actual_hash:
-                raise DatasetFingerprintMismatchError(
-                    f"Dataset file '{filename}' failed checksum verification! "
-                    f"Stored: {expected_hash}, Actual: {actual_hash}"
-                )
+        expected_hash = stored_manifest["critical_files"].get(filename)
+        if not expected_hash:
+            raise DatasetFingerprintMismatchError(
+                f"Dataset manifest missing checksum entry for critical file '{filename}'"
+            )
+        if expected_hash != actual_hash:
+            raise DatasetFingerprintMismatchError(
+                f"Dataset file '{filename}' failed checksum verification! "
+                f"Stored: {expected_hash}, Actual: {actual_hash}"
+            )
 
         # Verify against explicit expected files dictionary
         if critical_files_expected:
-            expected_hash = critical_files_expected.get(filename)
-            if expected_hash and expected_hash != actual_hash:
+            exp_hash = critical_files_expected.get(filename)
+            if exp_hash and exp_hash != actual_hash:
                 raise DatasetFingerprintMismatchError(
                     f"Dataset file '{filename}' failed explicit checksum verification! "
-                    f"Expected: {expected_hash}, Actual: {actual_hash}"
+                    f"Expected: {exp_hash}, Actual: {actual_hash}"
                 )
 
     actual_manifest_hash = compute_canonical_json_hash(actual_files)
 
-    if stored_manifest:
-        stored_hash = stored_manifest.get("manifest_sha256")
-        if stored_hash and stored_hash != actual_manifest_hash:
-            raise DatasetFingerprintMismatchError(
-                f"Manifest checksum mismatch! Stored: {stored_hash}, Computed: {actual_manifest_hash}"
-            )
+    stored_hash = stored_manifest.get("manifest_sha256")
+    if stored_hash != actual_manifest_hash:
+        raise DatasetFingerprintMismatchError(
+            f"Manifest checksum mismatch! Stored: {stored_hash}, Computed: {actual_manifest_hash}"
+        )
 
     if expected_manifest_hash and expected_manifest_hash != actual_manifest_hash:
         raise DatasetFingerprintMismatchError(

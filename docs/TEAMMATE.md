@@ -152,7 +152,7 @@ modal volume get legalir-production <label>/attempts/<id>/ ./local_artifacts/
 # cv/fold_*/reranker_adapter/, manifests, training.log
 ```
 
-Nếu run train xong nhưng chết ở inference (từng xảy ra — Run05): adapter + indexes còn nguyên trên Volume. Không cần dispatch lại — chạy inference-only từ attempt dir đó với `LEGALIR_RESCUE_ADAPTER_DIR` (xem docstring `run_full.py`).
+Nếu run train xong nhưng chết ở inference (từng xảy ra — Run05): adapter + indexes còn nguyên trên Volume attempt dir (`/root/legalir_volume/<label>/attempts/<id>/`: `checkpoints/reranker_final/`, `cv/fold_*/reranker_adapter/`, `training.log`, manifests). Không có đường inference-only tự động: dùng artifacts đó để chẩn đoán và dispatch lại từ đầu (không resume), hoặc chạy phân tích thủ công. Không hứa cứu run tự động.
 
 Kết quả chuẩn: `submission.json`/`submission.zip` (2080×5, unique, 100% IDs trong corpus) + adapter đẩy lên HF `dangphuc2109/legalir-task1-reranker` + `RUN_SUMMARY.md`/`LOGS.md`/`MODELS.md` trong `runs/`.
 
@@ -168,7 +168,7 @@ cd LegalIR
 Mỗi tài khoản Modal/HF/Kaggle là không gian riêng — không chia sẻ gì ngoài code:
 
 1. **Modal (tài khoản của bạn):** `modal setup` bằng account bạn → tự tạo secrets `kaggle-secret`, `huggingface-secret` trong dashboard của bạn. Volume `legalir-production` tự tạo mới (rỗng) trong workspace của bạn → **khuyến nghị chạy `--warm-only` 1 lần** trước run đầu tiên để nạp cache (không bắt buộc: thiếu cache thì A100 tự download + ghi nhận fallback, nhưng tốn GPU idle).
-2. **Hugging Face (repo PUBLIC có chủ ý):** đích là repo public của LegalIR để ban giám khảo xác minh — KHÔNG đổi sang private, tạo repo khác, hay để preflight tạo repo mới nếu chưa được phép riêng. Mọi lệnh dispatch **bắt buộc** `--hf-repo dangphuc2109/legalir-task1-reranker` (hoặc `HF_REPO_ID` env/`.env`); thiếu đích tường minh là dry-run exit 2 BLOCKED. Production đi kèm `--hf-allow-public-repo` tường minh, và token của bạn phải có quyền WRITE trên đúng repo đó (kiểm tra read-only, không tạo repo: `scripts/check_hf_repo.py --repo dangphuc2109/legalir-task1-reranker --allow-public-repo` phải exit 0). Preflight thật có thể `create_repo` — là thao tác ghi ra ngoài, cần chấp thuận trước khi chạy.
+2. **Hugging Face (repo PUBLIC có chủ ý):** đích là repo public của LegalIR để ban giám khảo xác minh — KHÔNG đổi sang private, tạo repo khác, hay để preflight tạo repo mới nếu chưa được phép riêng. Mọi lệnh dispatch **bắt buộc** `--hf-repo dangphuc2109/legalir-task1-reranker` (hoặc `HF_REPO_ID` env/`.env`); thiếu đích tường minh là dry-run exit 2 BLOCKED. Production đi kèm `--hf-allow-public-repo` tường minh, và token của bạn phải có quyền WRITE trên đúng repo đó (kiểm tra read-only, không tạo repo: `scripts/check_hf_repo.py --repo dangphuc2109/legalir-task1-reranker --allow-public-repo` phải exit 0). Preflight và upload đều là read-only đối với cấu trúc repo (không bao giờ gọi `create_repo` hay đổi visibility); repo đích phải tồn tại sẵn và token phải có quyền WRITE.
 3. **Kaggle (key của bạn):** dataset canonical dùng credential của bạn; không chia sẻ secret trong log.
 4. **Chưa chạy y hệt §1** trên account mới: trước hết giải quyết blocker repo đích, xác minh Modal profile, Volume/secrets riêng và kiểm định SHA trên GitHub. Attempt path/Volume/app ID độc lập hoàn toàn với owner.
 

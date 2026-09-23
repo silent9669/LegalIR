@@ -28,11 +28,11 @@ Preflight (fast, local, CPU-only):
     - reranker config file exists, parameter budget < 4B
     - prints run label, config, timeout (default: no limit = 24h platform max)
 
-Rescue path (if a full run trains but dies in inference, like HF Run05):
-    re-dispatch is unnecessary — the finished adapter + indexes persist on the
-    'legalir-production' Volume under <label>/attempts/<id>/. Re-run with
-    LEGALIR_RESCUE_ADAPTER_DIR set (consumed by run_modal_rescue.py) or ask
-    the run owner for the attempt path, then run inference-only from it.
+Rescue note (no automatic rescue path): if a full run trains but dies in
+inference, the finished adapter + indexes persist on the
+'legalir-production' Volume under <label>/attempts/<id>/ for forensics.
+Re-dispatch from scratch (no resume); there is no tested inference-only
+rescue entrypoint (run_modal_rescue.py does not exist).
 """
 
 from __future__ import annotations

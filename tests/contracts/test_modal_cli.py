@@ -111,14 +111,14 @@ def test_dirty_tree_fails_before_dispatch(tmp_path):
     assert not log.is_file() or "run" not in log.read_text(encoding="utf-8")
 
 
-def test_dirty_tree_advisory_continues_by_default(tmp_path):
+def test_dirty_tree_fails_by_default(tmp_path):
     repo = _make_repo(tmp_path)
     _init_git_repo(repo)
     (repo / "dirty.txt").write_text("untracked\n", encoding="utf-8")
     bin_dir = tmp_path / "bin"
     res, log = _run(repo, bin_dir)
-    assert res.returncode == 0
-    assert "run" in log.read_text(encoding="utf-8")
+    assert res.returncode == 2
+    assert not log.is_file() or "run" not in log.read_text(encoding="utf-8")
 
 
 def test_invalid_sha_fails_before_dispatch(tmp_path):

@@ -120,20 +120,26 @@ def test_attach_warmed_cache_attaches_and_reuses(tmp_path, monkeypatch):
     for mid in _REG:
         d = models / ("snap-" + mid.split("/")[-1].replace("-", "_"))
         d.mkdir()
+        (d / "config.json").write_text("{}", encoding="utf-8")
+        (d / "model.safetensors").write_bytes(b"w")
         snaps[mid] = d
     (models / "manifest.json").write_text(json.dumps({
         mid: {"path": str(snaps[mid]), "revision": _REG[mid]["revision"]}
         for mid in _REG
     }), encoding="utf-8")
-    (vol / "shared" / "warm_manifest.json").write_text(json.dumps({
-        "requested_label": "a" * 40, "source_sha": "a" * 40, "hf_repo": "someone/repo",
-    }), encoding="utf-8")
     ds = vol / "shared" / "dataset"
     ds.mkdir(parents=True)
     from scripts.colab.bootstrap import REQUIRED_FILES
+    from src.release.fingerprints import generate_dataset_manifest
 
     for name in REQUIRED_FILES:
-        (ds / name).write_bytes(b"")
+        (ds / name).write_bytes(b"data")
+    ds_manifest = generate_dataset_manifest(ds)
+    (ds / "dataset_manifest.json").write_text(json.dumps(ds_manifest), encoding="utf-8")
+    (vol / "shared" / "warm_manifest.json").write_text(json.dumps({
+        "requested_label": "a" * 40, "source_sha": "a" * 40, "hf_repo": "someone/repo",
+        "dataset_manifest_sha256": ds_manifest["manifest_sha256"],
+    }), encoding="utf-8")
     repo = tmp_path / "repo"
     repo.mkdir()
 
@@ -199,6 +205,8 @@ def _write_valid_model_cache(vol: Path) -> Path:
     for mid in _REG:
         d = models / ("snap-" + mid.split("/")[-1].replace("-", "_"))
         d.mkdir(exist_ok=True)
+        (d / "config.json").write_text("{}", encoding="utf-8")
+        (d / "model.safetensors").write_bytes(b"w")
     (models / "manifest.json").write_text(json.dumps({
         mid: {"path": str(models / ("snap-" + mid.split("/")[-1].replace("-", "_"))),
               "revision": _REG[mid]["revision"]}
@@ -209,11 +217,14 @@ def _write_valid_model_cache(vol: Path) -> Path:
 
 def _write_dataset_files(vol: Path) -> Path:
     from scripts.colab.bootstrap import REQUIRED_FILES
+    from src.release.fingerprints import generate_dataset_manifest
 
     ds = vol / "shared" / "dataset"
     ds.mkdir(parents=True, exist_ok=True)
     for name in REQUIRED_FILES:
-        (ds / name).write_bytes(b"")
+        (ds / name).write_bytes(b"data")
+    manifest = generate_dataset_manifest(ds)
+    (ds / "dataset_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     return ds
 
 
@@ -401,3 +412,36 @@ def test_attach_warns_on_preset_cache_env_and_leaves_it(tmp_path, monkeypatch, c
     # Preset values are left untouched (downloaders resolve them explicitly).
     assert os.environ["HF_HUB_CACHE"] == str(other_models)
     assert os.environ["LEGALIR_MODAL_DATASET_DIR"] == str(other_ds)
+
+
+def test_warm_completeness_issues_flags_everything_missing():
+    w = _load_warm()
+    from src.models.bootstrap import MODEL_REGISTRY as _REG
+    from scripts.colab.bootstrap import REQUIRED_FILES
+
+    issues = w.warm_completeness_issues({}, [], list(REQUIRED_FILES), dict(_REG))
+    assert any(i.startswith("model:") for i in issues)
+    assert any(i.startswith("dataset:") for i in issues)
+
+
+def test_warm_completeness_issues_passes_on_complete_manifest():
+    w = _load_warm()
+    from src.models.bootstrap import MODEL_REGISTRY as _REG
+    from scripts.colab.bootstrap import REQUIRED_FILES
+
+    models = {mid: {"path": f"/snap/{mid}", "revision": meta["revision"]}
+              for mid, meta in _REG.items()}
+    assert w.warm_completeness_issues(models, list(REQUIRED_FILES),
+                                      list(REQUIRED_FILES), dict(_REG)) == []
+
+
+def test_warm_completeness_issues_catches_revision_mismatch():
+    w = _load_warm()
+    from src.models.bootstrap import MODEL_REGISTRY as _REG
+    from scripts.colab.bootstrap import REQUIRED_FILES
+
+    first = next(iter(_REG))
+    models = {mid: {"path": "/snap/x", "revision": "STALE"} for mid in _REG}
+    issues = w.warm_completeness_issues(models, list(REQUIRED_FILES),
+                                        list(REQUIRED_FILES), dict(_REG))
+    assert f"model:{first}:revision-mismatch" in issues

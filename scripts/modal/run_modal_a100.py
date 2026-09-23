@@ -347,6 +347,16 @@ def attach_warmed_cache(
                         problems.append(f"{mid}:revision-mismatch")
                     elif not pinned and not recorded:
                         problems.append(f"{mid}:revision-empty")
+                    else:
+                        snap_p = Path(snap)
+                        has_cfg = (snap_p / "config.json").is_file()
+                        has_weights = (
+                            any((snap_p / w).is_file() for w in ("pytorch_model.bin", "model.safetensors", "adapter_model.safetensors"))
+                            or any(snap_p.glob("*.safetensors"))
+                            or any(snap_p.glob("*.bin"))
+                        )
+                        if not has_cfg and not has_weights:
+                            problems.append(f"{mid}:incomplete-files")
                 if problems:
                     detail = "stale:" + ",".join(problems)
                     ok = False
@@ -387,18 +397,36 @@ def attach_warmed_cache(
             print(f"[*] No complete warmed model cache ({detail}); A100 will download weights.", flush=True)
 
         from scripts.colab.bootstrap import REQUIRED_FILES
+        from src.release.fingerprints import verify_dataset_fingerprint
 
         ds_dir = warmed_dataset_dir(volume_root)
         missing_ds = [n for n in REQUIRED_FILES if not (ds_dir / n).is_file()]
-        reuse_dataset = bool(not missing_ds and sha_ok)
-        if not missing_ds and not sha_ok:
+        ds_verified = False
+        ds_detail = "unverified"
+        if not missing_ds and sha_ok:
+            try:
+                ds_res = verify_dataset_fingerprint(ds_dir)
+                warm_ds_hash = warm_data.get("dataset_manifest_sha256") if warm_manifest_present and isinstance(warm_data, dict) else None
+                if warm_ds_hash and ds_res.manifest_sha256 != warm_ds_hash:
+                    ds_detail = f"manifest-hash-mismatch:warm={warm_ds_hash[:12]} disk={ds_res.manifest_sha256[:12]}"
+                else:
+                    ds_verified = True
+                    ds_detail = f"fingerprint-verified:{ds_res.manifest_sha256[:12]}"
+            except Exception as exc:
+                ds_detail = f"fingerprint-failed:{type(exc).__name__}"
+
+        reuse_dataset = bool(ds_verified and sha_ok)
+        if reuse_dataset:
+            os.environ.setdefault("LEGALIR_MODAL_DATASET_DIR", str(ds_dir))
+            summary["dataset_reused"] = True
+            summary["dataset_detail"] = ds_detail
+            print(f"[*] Warmed dataset reused from {ds_dir} ({ds_detail}; no Kaggle download on A100).", flush=True)
+        elif not missing_ds and not sha_ok:
             summary["dataset_detail"] = f"source-gate:{sha_reason}"
             print(f"[*] Warm dataset not reused ({sha_reason}); A100 will download it.", flush=True)
         elif not missing_ds:
-            os.environ.setdefault("LEGALIR_MODAL_DATASET_DIR", str(ds_dir))
-            summary["dataset_reused"] = True
-            summary["dataset_detail"] = f"all-{len(REQUIRED_FILES)}-files-present"
-            print(f"[*] Warmed dataset reused from {ds_dir} (no Kaggle download on A100).", flush=True)
+            summary["dataset_detail"] = ds_detail
+            print(f"[*] Warm dataset not reused ({ds_detail}); A100 will download it.", flush=True)
         else:
             summary["dataset_detail"] = f"missing:{','.join(missing_ds[:5])}"
             print(f"[*] No complete warmed dataset (missing {len(missing_ds)} files); A100 will download it.", flush=True)
@@ -566,7 +594,13 @@ def run_production_training(
         if os.environ.get("LEGALIR_TEST_PHASE", "").strip().lower() == "private":
             print("[+] Remote container initialized with LEGALIR_TEST_PHASE=private (2,080 queries)", flush=True)
 
-        # 2. CPU provenance gate before any expensive work (Kaggle T4x2 gate).
+        # 2. Early validation: resolve and validate destination HF repository ID
+        try:
+            resolved_hf_repo, hf_source = _resolve_hf_repo(hf_repo)
+        except ValueError as exc:
+            raise RuntimeError(f"Hugging Face repo ID rejected: {exc}") from None
+
+        # 3. CPU provenance gate before any expensive work (Kaggle T4x2 gate).
         from scripts.colab.bootstrap import prepare_dataset, verify_launch
 
         # We must point to the verified artifact paths in the repo
@@ -574,25 +608,16 @@ def run_production_training(
         freeze_file = repo_dir / "artifacts/task1/freeze/production_freeze.json"
 
         _update_state("provenance")
-        print("[*] Launch preflight (advisory unless LEGALIR_STRICT_GATES=1)...")
-        try:
-            verify_launch(sha, kaggle_report, freeze_file)
-        except Exception as exc:
-            if _strict():
-                raise
-            print(f"[!] provenance advisory (strict off), continuing: {type(exc).__name__}", flush=True)
+        print("[*] Launch preflight...")
+        verify_launch(sha, kaggle_report, freeze_file)
         _try_commit_best_effort()
 
-        # 3. Preflight Hugging Face Access BEFORE expensive dataset acquisition.
+        # 4. Preflight Hugging Face Access BEFORE expensive dataset acquisition.
         # Explicit --hf-repo (local flag) wins over the container HF_REPO_ID env;
         # both beat the owner default. The resolved ID is echoed (not a secret)
         # so `modal app logs` confirms the destination account. New repos stay
         # private; public requires the explicit operator override.
         from scripts.gates.run_a100 import preflight_huggingface_access
-        try:
-            resolved_hf_repo, hf_source = _resolve_hf_repo(hf_repo)
-        except ValueError as exc:
-            raise RuntimeError(f"Hugging Face repo ID rejected: {exc}") from None
         _update_state("hf_preflight")
         print(f"[*] HF repo: {resolved_hf_repo} (source={hf_source}); verifying write access...")
         if hf_source == "default":
@@ -691,16 +716,18 @@ def main(
     hf_repo: str = "",
     allow_default_hf_repo: bool = False,
 ):
+    import re
     import sys
-    # Try to grab the SHA from local git if we are in the repo, or from env.
-    # Any label works by default; strict mode still requires an exact SHA.
+    # Require exact 40-character commit SHA from env or local HEAD
     expected_sha = os.environ.get("LEGALIR_COMMIT_SHA")
     if not expected_sha:
         try:
             expected_sha = subprocess.check_output(["git", "rev-parse", "HEAD"]).decode("utf-8").strip()
         except Exception:
-            expected_sha = "dev"
-            print("[*] No git SHA found; using run label 'dev' (strict off).", flush=True)
+            expected_sha = ""
+    if not expected_sha or not re.fullmatch(r"[0-9a-f]{40}", expected_sha):
+        print(f"[!] LEGALIR_COMMIT_SHA must be an exact 40-character hexadecimal SHA, got '{expected_sha}'.", file=sys.stderr)
+        sys.exit(2)
 
     # Determine test phase
     test_phase = "private" if (private or os.environ.get("LEGALIR_TEST_PHASE", "").strip().lower() == "private") else "public"
@@ -713,7 +740,7 @@ def main(
     elif os.environ.get("LEGALIR_RERANKER_CONFIG"):
         cfg_to_send = os.environ.get("LEGALIR_RERANKER_CONFIG")
 
-    # Advisory local preflight (fail-closed only with LEGALIR_STRICT_GATES=1).
+    # Local provenance preflight before Modal dispatch.
     try:
         from scripts.colab.bootstrap import verify_launch as _verify
 
@@ -725,10 +752,8 @@ def main(
             repo_root=_repo,
         )
     except Exception as exc:
-        if _strict():
-            print(f"[!] Local CPU provenance preflight failed before Modal dispatch: {type(exc).__name__}: {exc}", file=sys.stderr)
-            sys.exit(2)
-        print(f"[*] Local preflight advisory (strict off), continuing: {type(exc).__name__}", flush=True)
+        print(f"[!] Local CPU provenance preflight failed before Modal dispatch: {type(exc).__name__}: {exc}", file=sys.stderr)
+        sys.exit(2)
 
     print(f"[*] Dispatching A100 training job to Modal for: {expected_sha}")
     print(f"[*] Evaluation Phase: {test_phase.upper()} ({'2,080 queries' if test_phase == 'private' else '1,000 queries'})")

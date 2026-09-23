@@ -141,19 +141,111 @@ def _shared_index_cache_dir() -> Path | None:
     return Path(raw)
 
 
-def warm_index_cache(index_dir: Path) -> bool:
-    """Copy validated shared indexes into a fresh attempt dir. Never raises."""
+INDEX_CACHE_SCHEMA = "v1"
+INDEX_CACHE_IDENTITY_FILE = "index_identity.json"
+INDEX_CACHE_IDENTITY_KEYS = ("schema", "dataset_manifest_sha256", "dense_model",
+                             "dense_revision", "reranker_revision",
+                             "bm25s_version", "faiss_version")
+
+
+def _package_version(dist_name: str) -> str | None:
+    try:
+        from importlib.metadata import version as _dist_version
+        return str(_dist_version(dist_name))
+    except Exception:
+        return None
+
+
+def build_index_cache_identity(canonical_data_dir: str | Path | None = None) -> dict:
+    """Identity inputs for shared index reuse (best-effort; unknowns are None).
+
+    A shared cache entry is reusable only when every key matches the current
+    run: dataset manifest hash, pinned dense/reranker revisions, retrieval
+    package versions and the index schema. Reranker *training* config is
+    intentionally excluded (indexes do not depend on it).
+    """
+    manifest_sha = None
+    try:
+        if canonical_data_dir is not None:
+            data_p = Path(canonical_data_dir)
+            mp = data_p / "dataset_manifest.json"
+            if mp.is_file():
+                try:
+                    from src.release.fingerprints import verify_dataset_fingerprint
+                    res = verify_dataset_fingerprint(data_p)
+                    manifest_sha = res.manifest_sha256
+                except Exception:
+                    manifest_sha = json.loads(mp.read_text(encoding="utf-8")).get("manifest_sha256")
+    except Exception:
+        manifest_sha = None
+    dense_model = "CODE4LIFEOFFICIAL/huydang-dek21-embedding-v2"
+    dense_rev = reranker_rev = None
+    try:
+        from src.models.bootstrap import MODEL_REGISTRY as _REG
+
+        dense_rev = (_REG.get(dense_model) or {}).get("revision")
+        reranker_rev = (_REG.get("BAAI/bge-reranker-v2-m3") or {}).get("revision")
+    except Exception:
+        pass
+    return {
+        "schema": INDEX_CACHE_SCHEMA,
+        "dataset_manifest_sha256": manifest_sha,
+        "dense_model": dense_model,
+        "dense_revision": dense_rev,
+        "reranker_revision": reranker_rev,
+        "bm25s_version": _package_version("bm25s"),
+        "faiss_version": _package_version("faiss-cpu"),
+    }
+
+
+def _read_index_cache_identity(cache_dir: str | Path) -> dict | None:
+    try:
+        p = Path(cache_dir) / INDEX_CACHE_IDENTITY_FILE
+        if not p.is_file():
+            return None
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _index_identity_mismatch(stored: dict, expected: dict) -> list[str]:
+    return [k for k in INDEX_CACHE_IDENTITY_KEYS if stored.get(k) != expected.get(k)]
+
+
+def warm_index_cache(index_dir: Path, expected_identity: dict | None = None) -> bool:
+    """Copy validated shared indexes into a fresh attempt dir. Never raises.
+
+    Always enforces identity matching on dataset/model/package/schema keys;
+    a mismatch, unreadable identity, or missing identity file skips the copy
+    so the caller rebuilds instead of silently reusing stale indexes.
+    """
     src = _shared_index_cache_dir()
     if src is None or not src.is_dir():
         return False
     try:
         index_dir.mkdir(parents=True, exist_ok=True)
+        expected = expected_identity if isinstance(expected_identity, dict) else build_index_cache_identity()
+        stored = _read_index_cache_identity(src)
+        if stored is None:
+            print(f"[!] Shared index cache at {src} has no identity file; "
+                  "skipping reuse, indexes will rebuild.", flush=True)
+            return False
+        drift = _index_identity_mismatch(stored, expected)
+        if drift:
+            print(f"[!] Shared index identity drift on {','.join(drift)}; "
+                  "skipping reuse, indexes will rebuild.", flush=True)
+            return False
+        valid_entries = stored.get("persisted_entries")
+        entries_to_copy = tuple(valid_entries) if isinstance(valid_entries, list) else (
+            "bm25", "bm25_pyvi", "dense_dek21", "train_query_embeddings.npy",
+            "train_query_embeddings.meta.json", INDEX_CACHE_IDENTITY_FILE
+        )
         copied = 0
-        for name in ("bm25", "bm25_pyvi", "dense_dek21", "train_query_embeddings.npy",
-                     "train_query_embeddings.meta.json"):
+        for name in entries_to_copy:
             s = src / name
             d = index_dir / name
-            if d.exists():
+            if d.exists() or not s.exists():
                 continue
             if s.is_dir():
                 import shutil as _sh
@@ -163,6 +255,9 @@ def warm_index_cache(index_dir: Path) -> bool:
                 import shutil as _sh
                 _sh.copy2(s, d)
                 copied += 1
+        if (src / INDEX_CACHE_IDENTITY_FILE).is_file() and not (index_dir / INDEX_CACHE_IDENTITY_FILE).exists():
+            import shutil as _sh
+            _sh.copy2(src / INDEX_CACHE_IDENTITY_FILE, index_dir / INDEX_CACHE_IDENTITY_FILE)
         if copied:
             print(f"[*] Warmed {copied} index entries from shared cache {src}...", flush=True)
         return copied > 0
@@ -171,7 +266,7 @@ def warm_index_cache(index_dir: Path) -> bool:
         return False
 
 
-def persist_index_cache(index_dir: Path) -> None:
+def persist_index_cache(index_dir: Path, identity: dict | None = None) -> None:
     """Best-effort write-back of fresh indexes to the shared cache. Never raises."""
     dst = _shared_index_cache_dir()
     if dst is None:
@@ -179,16 +274,33 @@ def persist_index_cache(index_dir: Path) -> None:
     try:
         dst.mkdir(parents=True, exist_ok=True)
         import shutil as _sh
+        persisted = []
         for name in ("bm25", "bm25_pyvi", "dense_dek21", "train_query_embeddings.npy",
                      "train_query_embeddings.meta.json"):
             s = index_dir / name
             d = dst / name
-            if not s.exists() or d.exists():
+            if not s.exists():
+                if d.exists():
+                    if d.is_dir():
+                        _sh.rmtree(d)
+                    else:
+                        d.unlink()
                 continue
+            if d.exists():
+                if d.is_dir():
+                    _sh.rmtree(d)
+                else:
+                    d.unlink()
             if s.is_dir():
-                _sh.copytree(s, d, dirs_exist_ok=True)
+                _sh.copytree(s, d)
             else:
                 _sh.copy2(s, d)
+            persisted.append(name)
+        ident = dict(identity) if isinstance(identity, dict) else build_index_cache_identity()
+        ident["created_utc"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        ident["persisted_entries"] = persisted
+        (dst / INDEX_CACHE_IDENTITY_FILE).write_text(
+            json.dumps(ident, indent=2, sort_keys=True), encoding="utf-8")
         print(f"[*] Persisted indexes to shared cache {dst} (best-effort).", flush=True)
     except Exception as exc:
         print(f"[!] Shared index persist skipped: {type(exc).__name__}", flush=True)
@@ -1473,12 +1585,6 @@ def run_kaggle_pipeline(
     working_path.mkdir(parents=True, exist_ok=True)
     index_dir = working_path / "indexes"
     index_dir.mkdir(parents=True, exist_ok=True)
-    # Warm-start validated indexes from the shared Volume cache so a fresh
-    # UUID attempt dir does not pay the full cold rebuild (~2.5k s).
-    try:
-        warm_index_cache(index_dir)
-    except Exception:
-        pass
     cv_dir = working_path / "cv"
     cv_dir.mkdir(parents=True, exist_ok=True)
     checkpoints_dir = working_path / "checkpoints"
@@ -1499,6 +1605,15 @@ def run_kaggle_pipeline(
         raise FileNotFoundError(
             f"Canonical dataset parquet files missing in {canonical_data_dir}"
         )
+
+    # Warm-start validated indexes from the shared Volume cache so a fresh
+    # UUID attempt dir does not pay the full cold rebuild (~2.5k s). Runs
+    # AFTER dataset discovery so the identity check (dataset/model/schema)
+    # can reject stale caches instead of silently reusing them.
+    try:
+        warm_index_cache(index_dir, build_index_cache_identity(canonical_data_dir))
+    except Exception:
+        pass
 
     # 2. Public / Private Test Discovery (Fail-Fast)
     public_test_file = discover_public_test_file(public_json_path, data_dir=canonical_data_dir, repo_root=root_path)
@@ -1886,7 +2001,7 @@ def run_kaggle_pipeline(
     stage_timings.record("train_query_encoding", elapsed_seconds=train_query_enc_time, cache_hit=bool(tq_cached))
     # Write-back fresh indexes so the NEXT attempt warms from this run.
     try:
-        persist_index_cache(index_dir)
+        persist_index_cache(index_dir, build_index_cache_identity(canonical_data_dir))
     except Exception:
         pass
 

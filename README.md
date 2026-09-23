@@ -2,13 +2,12 @@
 
 Vietnamese legal document retrieval for the UIT Data Science Challenge 2026. The pipeline combines legal BM25, PyVi BM25, DEk21 dense retrieval, exact matching, fold-local question memory, and a BGE LoRA cross-encoder.
 
-## Status — updated 2026-09-22
+## Status — updated 2026-09-23
 
-- **HEAD:** `f867ab4` — evidence bundle for runtime `6b57ed7` (Kaggle dual-T4 **PASS v73**: 24.23s, weight delta 285.00, genuine Tesla T4 ×2 execution).
-- **Working tree:** 4 approved surgical fixes on top of HEAD (pending commit) — doc-disjoint duplicate expansion, `validate_submission_zip(exact_answer_count)`, MPS OOM matcher narrowing, strict-mode warm-start rank-lock. See `TEAMMATE.md` §3.
-- **Tests:** **587 passed, 2 skipped** (full suite). Preflight gates green: `validate_score_push.py`, parameter audit, notebook zero-drift.
-- **Launch:** no release required. Single entrypoint `python scripts/modal/run_full.py --warm --private --push-config` (preflight runs automatically). Details in `TEAMMATE.md`.
-- **Targets, not demonstrated results:** full private run (5-fold OOF + disjoint + final + 2080-query inference) has not completed on A100 yet; OOF/private recall and end-to-end runtime are projections until a real run finishes.
+- **Policy A:** Basic GitHub CI green on the exact checked-out Git SHA is the authoritative release policy. Upstream Kaggle dual-T4 report and production freeze tuples are optional historical attachments; set `LEGALIR_STRICT_GATES=1` to opt into legacy fail-closed lineage requirements.
+- **Working tree:** Teammate readiness implementation in progress; verified read-only HF preflight (no `create_repo`), exact-5 ZIP gate enforcement, hardened volume cache identity, and zero-drift notebooks.
+- **Launch:** Single entrypoint `python scripts/modal/run_full.py --warm --private --push-config --hf-repo <repo> --hf-allow-public-repo` (preflight runs automatically). Details in `docs/TEAMMATE.md`.
+- **Targets, not demonstrated results:** Full private run (5-fold OOF + disjoint + final + 2080-query inference) has not completed on A100 yet; OOF/private recall and end-to-end runtime are projections until a real run finishes.
 - **Parameter audit:** 702,754,049 parameters across the dense encoder and reranker (~715M with the r=64 LoRA adapter), below the competition's 4B ceiling. Re-run the audit if the models change.
 - A timeout caps duration, not spend; retries/re-runs bill extra. There is no checkpoint-resume — a killed run restarts from scratch (Volume holds forensics only).
 
@@ -16,11 +15,8 @@ Vietnamese legal document retrieval for the UIT Data Science Challenge 2026. The
 
 | Document | Purpose |
 |---|---|
-| [TEAMMATE.md](TEAMMATE.md) | **Start here.** How to run, what was built, workflow, verification, recovery |
-| [Architecture](docs/ARCHITECTURE.md) | Components, data boundaries, training/evaluation, and configuration sources |
-| [Release workflow](docs/REPRODUCIBLE_TRAINING_WORKFLOW.md) | Local tests → Kaggle smoke → evidence bundle → A100 run |
-| [A100 launch guide](docs/README_A100_LAUNCH.md) | Modal supervision, consent, timeouts, recovery, and stop procedures |
-| [Historical timing evidence](docs/A100_SCALE_DOWN_AND_OPTIMIZATION_REPORT.md) | Old A100 measurements; historical record, not launch approval |
+| [TEAMMATE.md](docs/TEAMMATE.md) | **Start here.** How to run, what was built, workflow, verification, recovery |
+| [Task 1 Plan](docs/TASK1_MAX_SCORE_MIN_TIME_PLAN.md) | Quality and efficiency plan, benchmarks, and M0-M4 milestones |
 
 Launch instructions live in `TEAMMATE.md` and the launch guide. Historical reports and architecture descriptions are not launch approval.
 

@@ -76,12 +76,35 @@ def a100_test_fixtures(tmp_path: Path) -> dict[str, Path]:
     }
 
 
-def test_a100_runner_fails_without_kaggle_report(a100_test_fixtures, tmp_path: Path):
-    """A100 runner fails closed if Kaggle dual-T4 report is missing."""
+def test_a100_runner_policy_a_proceeds_without_kaggle_report(a100_test_fixtures, tmp_path: Path):
+    """Policy A: mock gate proceeds without a legacy Kaggle report and records the skip."""
     out_dir = tmp_path / "a100_out"
     missing_k = tmp_path / "missing_kaggle.json"
 
-    with pytest.raises(RuntimeError, match="Kaggle T4x2 report missing"):
+    report = run_a100_production_gate(
+        dataset_dir=a100_test_fixtures["dataset_dir"],
+        output_dir=out_dir,
+        kaggle_report_path=missing_k,
+        expected_sha=a100_test_fixtures["valid_sha"],
+        mock=True,
+    )
+    assert report["verdict"] == "DEBUG_ONLY"
+    assert (out_dir / "submission.zip").is_file()
+    saved = json.loads((out_dir / "run_manifest.json").read_text(encoding="utf-8"))
+    assert saved["gates"]["kaggle_t4x2"]["verdict"] == "DEBUG_ONLY"
+    assert saved["provenance_policy"] == "A-ci-only"
+
+
+def test_a100_runner_strict_still_requires_kaggle_report(a100_test_fixtures, tmp_path: Path,
+                                                         monkeypatch):
+    """LEGALIR_STRICT_GATES=1 keeps the old fail-closed evidence requirement."""
+    import os
+
+    monkeypatch.setenv("LEGALIR_STRICT_GATES", "1")
+    out_dir = tmp_path / "a100_out"
+    missing_k = tmp_path / "missing_kaggle.json"
+
+    with pytest.raises(RuntimeError, match="Strict mode requires upstream evidence"):
         run_a100_production_gate(
             dataset_dir=a100_test_fixtures["dataset_dir"],
             output_dir=out_dir,
@@ -89,6 +112,7 @@ def test_a100_runner_fails_without_kaggle_report(a100_test_fixtures, tmp_path: P
             expected_sha=a100_test_fixtures["valid_sha"],
             mock=True,
         )
+    assert os.environ["LEGALIR_STRICT_GATES"] == "1"
 
 
 def test_a100_runner_mock_produces_manifest_and_submission(a100_test_fixtures, tmp_path: Path):

@@ -95,6 +95,37 @@ def dir_size_bytes(path: Path) -> int:
         return 0
 
 
+def warm_completeness_issues(
+    models: dict,
+    dataset_files: list[str],
+    required_files: list[str] | tuple[str, ...],
+    model_registry: dict,
+) -> list[str]:
+    """Pure completeness check over a warm manifest (test hook).
+
+    Returns human-readable issue strings; empty means complete. Every
+    registry model needs a non-empty path + revision; every required
+    dataset file must be listed.
+    """
+    issues: list[str] = []
+    for mid, meta in (model_registry or {}).items():
+        entry = (models or {}).get(mid)
+        if not isinstance(entry, dict):
+            issues.append(f"model:{mid}:absent")
+            continue
+        if not str(entry.get("path", "") or "").strip():
+            issues.append(f"model:{mid}:path-empty")
+        if not str(entry.get("revision", "") or "").strip():
+            issues.append(f"model:{mid}:revision-empty")
+        elif meta and str(entry.get("revision", "")).strip() != str((meta or {}).get("revision", "")).strip():
+            issues.append(f"model:{mid}:revision-mismatch")
+    have = set(dataset_files or [])
+    for name in required_files or []:
+        if name not in have:
+            issues.append(f"dataset:{name}:missing")
+    return issues
+
+
 def write_warm_manifest(path: Path, payload: dict) -> Path:
     """Atomically write the warm summary manifest."""
     path = Path(path)
@@ -296,6 +327,14 @@ def warm_shared_cache(label: str = "dev", warm_adapter: bool = False, hf_repo: s
     # 5. Summary manifest for operators + the A100 function.
     from scripts.colab.bootstrap import REQUIRED_FILES
 
+    dataset_manifest_sha = None
+    try:
+        ds_m_path = dataset_dir / "dataset_manifest.json"
+        if ds_m_path.is_file():
+            dataset_manifest_sha = json.loads(ds_m_path.read_text(encoding="utf-8")).get("manifest_sha256")
+    except Exception:
+        dataset_manifest_sha = None
+
     manifest = {
         "label": label,
         "requested_label": label,
@@ -315,15 +354,31 @@ def warm_shared_cache(label: str = "dev", warm_adapter: bool = False, hf_repo: s
         "models_bytes": dir_size_bytes(models_root),
         "dataset_dir": str(dataset_dir),
         "dataset_files": [n for n in REQUIRED_FILES if (dataset_dir / n).is_file()],
+        "dataset_manifest_sha256": dataset_manifest_sha,
         "dataset_bytes": dir_size_bytes(dataset_dir),
     }
     write_warm_manifest(shared_warm_manifest(volume_root), manifest)
 
+    # Completeness is fail-closed: any missing model/dataset entry fails the
+    # job (nonzero) instead of printing success over a partial cache.
+    incomplete = warm_completeness_issues(
+        manifest.get("models", {}), manifest.get("dataset_files", []),
+        list(REQUIRED_FILES), MODEL_REGISTRY,
+    )
+    if incomplete:
+        raise RuntimeError(
+            f"Warm cache incomplete ({len(incomplete)} issues: "
+            f"{','.join(incomplete[:8])}); refusing success."
+        )
+
+    # Durability is part of correctness: a failed commit fails the job.
     try:
         volume.commit()
         print(f"[*] Committed warm cache: {volume_root}/shared", flush=True)
     except Exception as exc:  # noqa: BLE001
-        print(f"[!] Volume commit failed: {type(exc).__name__}", flush=True)
+        raise RuntimeError(
+            f"Warm Volume commit failed ({type(exc).__name__}); cache not durable."
+        ) from None
 
     print(f"[+] Warm complete: models {manifest['models_bytes'] / 1e9:.2f}GB, "
           f"dataset {manifest['dataset_bytes'] / 1e9:.2f}GB", flush=True)
@@ -368,6 +423,11 @@ def main(warm_adapter: bool = False, hf_repo: str = "", allow_default_hf_repo: b
                                       allow_default_hf_repo=_main_allow)
     print(f"[+] Warm result: {len(result.get('models', {}))} models, "
           f"dataset files: {len(result.get('dataset_files', []))}")
-    if not result.get("dataset_files"):
-        print("[!] Dataset files missing after warm — check kaggle-secret.", file=sys.stderr)
+    # Completeness requires EVERY required file, not merely a non-empty list.
+    from scripts.colab.bootstrap import REQUIRED_FILES as _WARM_REQ
+
+    _missing = [n for n in _WARM_REQ if n not in set(result.get("dataset_files", []))]
+    if _missing:
+        print(f"[!] Warm dataset incomplete after warm (missing: {','.join(_missing[:8])}); "
+              "check kaggle-secret and re-run warm.", file=sys.stderr)
         sys.exit(1)

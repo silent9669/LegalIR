@@ -65,13 +65,16 @@ def preflight_huggingface_access(
 ) -> tuple[bool, str]:
     """Require verified write access before spending GPU time on a release.
 
-    New repos are created private. Pushing to an existing PUBLIC repo requires
-    explicit opt-in (allow_public_repo=True); the override is recorded in the
-    run manifest so releases never go public by accident.
+    Read-only first: whoami, repo existence, visibility, then write permission
+    on THIS repo (a non-expired token alone proves nothing). The repo must
+    already exist — a missing repo fails closed WITHOUT creating anything
+    (creation needs separate approval). Visibility is never changed here.
+    Pushing to the intentional PUBLIC release repo requires explicit opt-in
+    (allow_public_repo=True); the override is recorded in the run manifest
+    so releases never go public by accident.
 
-    NOTE: this preflight is potentially mutating because it invokes
-    create_repo(repo_id, private=True, exist_ok=True); do not describe it as
-    a read-only audit.
+    NOTE: this preflight never calls create_repo and never uploads; do not
+    run it "just to check" unless even read-only Hub access is acceptable.
     """
     token = resolve_hf_token(token)
     if not token:
@@ -80,21 +83,31 @@ def preflight_huggingface_access(
         from huggingface_hub import HfApi
         api = HfApi(token=token)
         user = api.whoami().get("name", "unknown")
-        api.create_repo(repo_id=repo_id, repo_type="model", private=True, exist_ok=True)
-        api.auth_check(repo_id=repo_id, repo_type="model", write=True)
-        # Enforce private visibility: exist_ok=True does not flip a public repo
-        # back to private, so an accidentally-public release repo must fail fast
-        # unless the operator explicitly opts in. Unknown metadata or lookup
-        # failure blocks preflight (fail closed).
         try:
             info = api.repo_info(repo_id=repo_id, repo_type="model")
+        except Exception as exc:  # noqa: BLE001 - missing/invisible repo
+            return False, (
+                f"HF repo {repo_id} does not exist or is not visible "
+                f"({type(exc).__name__}); will not create it — creation needs "
+                "separate approval. Blocking release."
+            )
+        try:
+            api.auth_check(repo_id=repo_id, repo_type="model", write=True)
+        except Exception as exc:  # noqa: BLE001 - no write on this repo
+            return False, (
+                f"Token has no WRITE permission on {repo_id} ({type(exc).__name__}); "
+                "a valid non-expired token is not enough. Blocking release."
+            )
+        # Intentional-public policy: exist_ok creation is gone, so visibility
+        # can only be what the repo already is. Unknown metadata still blocks.
+        try:
             private = getattr(info, "private", None)
             if private is not True and private is not False:
                 return False, "Cannot verify Hugging Face repository visibility; blocking release."
             if private is False and not allow_public_repo:
-                return False, f"HF repo {repo_id} exists but is PUBLIC; release requires a private repo (or explicit opt-in)."
+                return False, f"HF repo {repo_id} is PUBLIC; production requires explicit opt-in (--hf-allow-public-repo)."
             if private is False:
-                print(f"[!] OPERATOR OVERRIDE: pushing release artifacts to PUBLIC repo {repo_id}.", flush=True)
+                print(f"[!] OPERATOR OVERRIDE: pushing release artifacts to intentional PUBLIC repo {repo_id}.", flush=True)
                 return True, f"authenticated as @{user}; verified write access to {repo_id} (public)"
             return True, f"authenticated as @{user}; verified write access to {repo_id} (private)"
         except Exception as exc:
@@ -144,6 +157,29 @@ def failed_upload_record(
     }
 
 
+def _freeze_drift_keys(freeze_data: dict, runtime_sha: str,
+                       manifest_sha256: str | None, algo_sha256: str | None) -> list[str]:
+    """Keys where a freeze tuple drifts from the current run (test hook).
+
+    Empty list means the freeze matches this run and may be recorded as
+    provenance; non-empty means historical attachment only under policy A
+    (strict mode raises on any drift).
+    """
+    drift: list[str] = []
+    if not isinstance(freeze_data, dict):
+        return ["unreadable-freeze"]
+    if str(freeze_data.get("git_sha", "")).lower() != str(runtime_sha or "").lower():
+        drift.append("git_sha")
+    dataset_val = freeze_data.get("dataset")
+    if not isinstance(dataset_val, dict):
+        drift.append("dataset")
+    elif dataset_val.get("manifest_sha256") != manifest_sha256:
+        drift.append("dataset.manifest_sha256")
+    if freeze_data.get("algorithm_config_sha256") != algo_sha256:
+        drift.append("algorithm_config_sha256")
+    return drift
+
+
 def upload_artifacts_to_huggingface(
     output_dir: Path,
     repo_id: str = "dangphuc2109/legalir-task1-reranker",
@@ -171,22 +207,29 @@ def upload_artifacts_to_huggingface(
     try:
         from huggingface_hub import HfApi
         api = HfApi(token=token)
-        api.create_repo(repo_id=repo_id, repo_type="model", private=True, exist_ok=True)
         try:
             _info = api.repo_info(repo_id=repo_id, repo_type="model")
-            private = getattr(_info, "private", None)
-            if private is not True and private is not False:
-                raise RuntimeError("Cannot verify Hugging Face repository visibility")
-            if private is False and not allow_public_repo:
-                raise RuntimeError(f"HF repo {repo_id} is PUBLIC; release requires a private repo (or explicit opt-in).")
-            if private is False:
-                print(f"[!] OPERATOR OVERRIDE: pushing release artifacts to PUBLIC repo {repo_id}.", flush=True)
-        except RuntimeError:
-            raise
         except Exception as lookup_exc:
             raise RuntimeError(
-                f"Hugging Face upload failed ({type(lookup_exc).__name__}); artifacts remain at {output_dir}."
+                f"Hugging Face upload failed ({type(lookup_exc).__name__}): "
+                f"HF repo {repo_id} does not exist or is not visible; "
+                f"will not create it — creation needs separate approval. Artifacts remain at {output_dir}."
             ) from None
+        try:
+            api.auth_check(repo_id=repo_id, repo_type="model", write=True)
+        except Exception as auth_exc:
+            raise RuntimeError(
+                f"Hugging Face upload failed ({type(auth_exc).__name__}): "
+                f"Token has no WRITE permission on {repo_id}; "
+                f"blocking upload. Artifacts remain at {output_dir}."
+            ) from None
+        private = getattr(_info, "private", None)
+        if private is not True and private is not False:
+            raise RuntimeError("Cannot verify Hugging Face repository visibility")
+        if private is False and not allow_public_repo:
+            raise RuntimeError(f"Hugging Face upload failed: HF repo {repo_id} is PUBLIC; release requires explicit opt-in (--hf-allow-public-repo).")
+        if private is False:
+            print(f"[!] OPERATOR OVERRIDE: pushing release artifacts to intentional PUBLIC repo {repo_id}.", flush=True)
         commit = api.upload_folder(
             repo_id=repo_id,
             repo_type="model",
@@ -200,6 +243,8 @@ def upload_artifacts_to_huggingface(
             raise RuntimeError("Hub did not return an immutable commit SHA")
         print(f"[+] Artifacts uploaded: https://huggingface.co/{repo_id}/tree/{commit_sha}/runs/{run_id}", flush=True)
         return commit_sha
+    except RuntimeError:
+        raise
     except Exception as exc:
         raise RuntimeError(f"Hugging Face upload failed ({type(exc).__name__}); artifacts remain at {output_dir}.") from None
 
@@ -335,9 +380,20 @@ def run_a100_production_gate(
     resolved_cfg = validate_runtime_overrides(algo_cfg, runtime_cfg)
     (output_dir / "resolved_config.yaml").write_text(yaml.safe_dump(resolved_cfg, sort_keys=True), encoding="utf-8")
 
-    # Resolve frozen runtime vs release checkout (two-commit model) BEFORE the
-    # gate chain: GPU evidence binds to the runtime commit, which must equal
-    # HEAD or be its ancestor with evidence-only diffs.
+    # Policy-A provenance (CI-only release policy): this run is anchored on
+    # CURRENT-run evidence only — the exact Git SHA, canonical dataset
+    # fingerprint, pinned model revisions and config hashes verified above.
+    # Legacy Kaggle dual-T4 reports and production-freeze tuples are OPTIONAL
+    # historical attachments: verified and recorded when present and
+    # consistent, warned and skipped otherwise. They NEVER gate a policy-A
+    # run. Set LEGALIR_STRICT_GATES=1 to restore the old fail-closed lineage
+    # behavior (missing/stale Kaggle/freeze evidence raises).
+    def _policy_a_strict() -> bool:
+        return str(os.environ.get("LEGALIR_STRICT_GATES", "")).strip() == "1"
+
+    _strict_gate = _policy_a_strict()
+    runtime_sha = actual_sha.lower()
+
     freeze_cands_early = [
         Path(freeze_file_path) if freeze_file_path else None,
         Path("/content/production_freeze.json"),
@@ -345,85 +401,167 @@ def run_a100_production_gate(
         REPO_ROOT / "artifacts" / "task1" / "freeze" / "production_freeze.json",
     ]
     freeze_path_early = next((p for p in freeze_cands_early if p and p.is_file()), None)
+    freeze_status = "absent"
     if freeze_path_early is not None and not mock:
-        _freeze_early = json.loads(freeze_path_early.read_text(encoding="utf-8"))
-        _runtime_candidate = str(_freeze_early.get("git_sha", "")).lower()
-        if not _runtime_candidate:
-            raise RuntimeError("Production freeze is missing git_sha!")
-        if _runtime_candidate != actual_sha.lower():
-            from src.release.provenance import validate_runtime_release_lineage
-            _lineage_ok, _lineage_errors = validate_runtime_release_lineage(
-                _runtime_candidate, actual_sha, REPO_ROOT
-            )
-            if not _lineage_ok:
-                raise RuntimeError(f"Production freeze lineage rejected: {'; '.join(_lineage_errors)}")
-            print(f"[+] Two-commit lineage OK: runtime {_runtime_candidate[:7]} -> release {actual_sha[:7]} (evidence-only diff)")
-        runtime_sha = _runtime_candidate
-    else:
-        runtime_sha = actual_sha.lower()
+        _runtime_candidate = None
+        try:
+            _freeze_early = json.loads(freeze_path_early.read_text(encoding="utf-8"))
+            if not isinstance(_freeze_early, dict):
+                raise ValueError("Freeze file is not a JSON object")
+            _runtime_candidate = str(_freeze_early.get("git_sha", "")).lower()
+            if not _runtime_candidate:
+                raise ValueError("Production freeze is missing git_sha")
+        except Exception as exc:
+            if _strict_gate:
+                raise RuntimeError(f"Production freeze unreadable/invalid ({type(exc).__name__}: {exc}) (strict mode).") from exc
+            print(f"[!] Policy A: freeze file unreadable/invalid ({type(exc).__name__}); ignored.", flush=True)
+            _freeze_early = None
+            freeze_status = "malformed-not-used"
 
-    # 5. Upstream Gate Chain Verification (Kaggle Dual-T4 sole pre-A100 gate)
+        if _runtime_candidate:
+            if _runtime_candidate != actual_sha.lower():
+                if _strict_gate:
+                    from src.release.provenance import validate_runtime_release_lineage
+                    _lineage_ok, _lineage_errors = validate_runtime_release_lineage(
+                        _runtime_candidate, actual_sha, REPO_ROOT
+                    )
+                    if not _lineage_ok:
+                        raise RuntimeError(f"Production freeze lineage rejected: {'; '.join(_lineage_errors)}")
+                    print(f"[+] Two-commit lineage OK (strict): runtime {_runtime_candidate[:7]} -> release {actual_sha[:7]} (evidence-only diff)")
+                    freeze_status = "lineage-accepted-strict"
+                else:
+                    print(f"[!] Policy A: freeze git_sha {_runtime_candidate[:12]} != run SHA {actual_sha[:12]}; "
+                          "freeze is NOT run provenance (kept as historical attachment only).", flush=True)
+                    freeze_status = "mismatched-not-used"
+            else:
+                freeze_status = "matched-current-run"
+    elif freeze_path_early is not None and mock:
+        freeze_status = "present-mock-unchecked"
+
+    # 5. Upstream Kaggle report (optional under policy A, required under strict).
+    kaggle_gate: dict[str, Any] = {"verdict": "SKIPPED_POLICY_A", "report_sha256": None,
+                                   "reason": "not-required"}
     if kaggle_report_path:
         k_p = Path(kaggle_report_path)
         if k_p.is_file():
             k_path = k_p
         elif str(k_p) not in (str(REPO_ROOT / "artifacts" / "task1" / "gates" / "kaggle_t4x2_report.json"), "artifacts/task1/gates/kaggle_t4x2_report.json"):
-            raise RuntimeError(f"Kaggle T4x2 report missing: {k_p}. Upstream Gate B1.1 required before A100.")
+            if _strict_gate:
+                raise RuntimeError(f"Kaggle T4x2 report missing: {k_p}. Strict mode requires upstream evidence.")
+            print(f"[!] Policy A: explicit Kaggle report path missing ({k_p}); continuing without it.", flush=True)
+            k_path = None
         else:
             k_cands = [
                 Path("/content/kaggle_t4x2_report.json"),
                 Path("/content/LegalIR/artifacts/task1/gates/kaggle_t4x2_report.json"),
                 REPO_ROOT / "artifacts" / "task1" / "gates" / "kaggle_t4x2_report.json",
             ]
-            k_path = next((p for p in k_cands if p and p.is_file()), k_p)
+            k_path = next((p for p in k_cands if p and p.is_file()), None)
+            if k_path is None and _strict_gate:
+                raise RuntimeError(f"Kaggle T4x2 report missing: {k_p}. Strict mode requires upstream evidence (Gate B1.1).")
     else:
-        k_path = REPO_ROOT / "artifacts" / "task1" / "gates" / "kaggle_t4x2_report.json"
+        k_path = None
+        if _strict_gate:
+            k_path = REPO_ROOT / "artifacts" / "task1" / "gates" / "kaggle_t4x2_report.json"
 
-    if not k_path.is_file():
-        raise RuntimeError(f"Kaggle T4x2 report missing: {k_path}. Upstream Gate B1.1 required before A100.")
-
-    kaggle_report = json.loads(k_path.read_text(encoding="utf-8"))
-
-    if not mock:
-        gate_chain_res = verify_prior_gate_reports(
-            kaggle_report=kaggle_report,
-            expected_sha=runtime_sha,
-            expected_dataset_hash=manifest_sha256,
-            expected_config_hash=algo_sha256,
-        )
-        k_rep_hash = gate_chain_res.kaggle_report_sha256
+    if k_path is not None and Path(k_path).is_file():
+        k_path = Path(k_path)
+        try:
+            kaggle_report = json.loads(k_path.read_text(encoding="utf-8"))
+            if not isinstance(kaggle_report, dict):
+                raise ValueError("Kaggle report is not a JSON object")
+        except Exception as exc:
+            if _strict_gate:
+                raise RuntimeError(f"Kaggle report unreadable/invalid ({type(exc).__name__}: {exc}) (strict mode).") from exc
+            print(f"[!] Policy A: Kaggle report unreadable/invalid ({type(exc).__name__}); skipping.", flush=True)
+            kaggle_report = None
+            k_path = None
+        if not mock:
+            try:
+                gate_chain_res = verify_prior_gate_reports(
+                    kaggle_report=kaggle_report,
+                    expected_sha=runtime_sha,
+                    expected_dataset_hash=manifest_sha256,
+                    expected_config_hash=algo_sha256,
+                )
+                k_rep_hash = gate_chain_res.kaggle_report_sha256
+                kaggle_gate = {"verdict": "PASS", "report_sha256": k_rep_hash,
+                               "reason": "matches-current-run"}
+            except Exception as exc:
+                if _strict_gate:
+                    raise
+                from src.release.fingerprints import compute_canonical_json_hash as _chash
+                try:
+                    k_rep_hash = _chash(kaggle_report)
+                except Exception:
+                    k_rep_hash = None
+                kaggle_gate = {"verdict": "SKIPPED_POLICY_A", "report_sha256": k_rep_hash,
+                               "reason": f"stale-or-unmatched-for-current-run ({type(exc).__name__})"}
+                print(f"[!] Policy A: Kaggle report not bound to this run ({type(exc).__name__}); "
+                      "recorded as historical attachment, not a gate.", flush=True)
+        else:
+            k_rep_hash = "mock_k_hash"
     else:
-        k_rep_hash = "mock_k_hash"
+        kaggle_report = {}
+        if _strict_gate:
+            raise RuntimeError(f"Kaggle T4x2 report missing. Strict mode requires upstream evidence (Gate B1.1).")
+        if not mock:
+            print("[!] Policy A: no Kaggle report present; continuing without upstream evidence.", flush=True)
+        k_rep_hash = "mock_k_hash" if mock else None
+        kaggle_gate = {"verdict": "SKIPPED_POLICY_A", "report_sha256": k_rep_hash,
+                       "reason": "report-absent"}
 
     # Copy upstream reports into output directory for full provenance
+    # (best-effort attachments; absence never fails a policy-A run).
     try:
-        shutil.copyfile(k_path, output_dir / "kaggle_t4x2_report.json")
+        if k_path is not None and Path(k_path).is_file():
+            shutil.copyfile(k_path, output_dir / "kaggle_t4x2_report.json")
         ds_manifest_src = dataset_dir / "dataset_manifest.json"
         if ds_manifest_src.is_file():
             shutil.copyfile(ds_manifest_src, output_dir / "dataset_manifest.json")
     except Exception:
         pass
 
-    # Cross-verify and copy production_freeze.json if present
+    # Attach production_freeze.json when present. Under policy A its hashes are
+    # advisory (warn on drift, never fail); strict mode re-asserts them.
     freeze_cands = [
         Path(freeze_file_path) if freeze_file_path else None,
         Path("/content/production_freeze.json"),
         Path("/content/LegalIR/artifacts/task1/freeze/production_freeze.json"),
         REPO_ROOT / "artifacts" / "task1" / "freeze" / "production_freeze.json",
     ]
-    freeze_path = next((p for p in freeze_cands if p and p.is_file()), Path(freeze_file_path))
+    freeze_path = next((p for p in freeze_cands if p and p.is_file()), Path(freeze_file_path) if freeze_file_path else REPO_ROOT / "artifacts" / "task1" / "freeze" / "production_freeze.json")
     if freeze_path.is_file():
-        freeze_data = json.loads(freeze_path.read_text(encoding="utf-8"))
-        if not mock:
-            # Runtime/release lineage already resolved above; re-assert hashes.
-            if str(freeze_data.get("git_sha", "")).lower() != runtime_sha:
-                raise RuntimeError("Production freeze changed between preflight and execution!")
-            if freeze_data.get("dataset", {}).get("manifest_sha256") != manifest_sha256:
-                raise RuntimeError("Production freeze dataset hash mismatch!")
-            if freeze_data.get("algorithm_config_sha256") != algo_sha256:
-                raise RuntimeError("Production freeze algorithm config hash mismatch!")
-        shutil.copyfile(freeze_path, output_dir / "production_freeze.json")
-        print(f"[+] Verified and attached production freeze tuple: {freeze_path.name}")
+        try:
+            freeze_data = json.loads(freeze_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            if _strict_gate:
+                raise RuntimeError(f"Production freeze unreadable ({type(exc).__name__}) (strict mode).") from exc
+            print(f"[!] Policy A: freeze file unreadable ({type(exc).__name__}); ignored.", flush=True)
+            freeze_data = None
+            freeze_status = "malformed-not-used"
+        if freeze_data is not None and not mock:
+            try:
+                _drift = _freeze_drift_keys(freeze_data, runtime_sha, manifest_sha256, algo_sha256)
+                if _drift:
+                    if _strict_gate:
+                        raise RuntimeError(f"Production freeze drift on {','.join(_drift)} (strict mode).")
+                    print(f"[!] Policy A: freeze drift on {','.join(_drift)}; kept as attachment only.", flush=True)
+                    freeze_status = "drift-not-used"
+                elif freeze_status in ("absent", "mismatched-not-used"):
+                    freeze_status = "matched-current-run"
+            except Exception as exc:
+                if _strict_gate:
+                    raise
+                print(f"[!] Policy A: freeze analysis failed ({type(exc).__name__}); ignored.", flush=True)
+                freeze_status = "malformed-not-used"
+        try:
+            shutil.copyfile(freeze_path, output_dir / "production_freeze.json")
+            print(f"[+] Attached production freeze tuple: {freeze_path.name} (status={freeze_status})")
+        except Exception:
+            pass
+    elif _strict_gate and not mock:
+        raise RuntimeError("Production freeze missing (strict mode requires it).")
 
     # Capture system and hardware environment
     try:
@@ -510,9 +648,10 @@ def run_a100_production_gate(
         except Exception as mirror_exc:
             print(f"[!] Warning: failed mirroring pipeline submission ({mirror_exc})", flush=True)
 
-    # 7. Validate Submission.zip (dict API)
+    # 7. Validate Submission.zip (dict API). FULL production requires exactly
+    # 5 doc IDs per query; mock debug artifacts are exempt (synthetic 3-packs).
     print(f"[*] Validating submission package: {submission_zip} ...", flush=True)
-    zip_val = validate_submission_zip(submission_zip)
+    zip_val = validate_submission_zip(submission_zip, exact_answer_count=None if mock else 5)
     is_sub_valid = bool(zip_val.get("is_valid"))
     sub_msg = "; ".join(zip_val.get("errors", [])) or "OK: submission.zip contains only submission.json"
     if not is_sub_valid:
@@ -543,7 +682,7 @@ def run_a100_production_gate(
         "status": mock_status,
         "verdict": mock_verdict,
         "git_sha": actual_sha,
-        "runtime_sha": runtime_sha if not mock else actual_sha,
+        "runtime_sha": runtime_sha,
         "dataset": {
             "slug": "phucdangg/legalir-task1-clean-data",
             "logical_version": "v2",
@@ -556,8 +695,12 @@ def run_a100_production_gate(
             "reranker_revision": "953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e",
             "dense_id": "CODE4LIFEOFFICIAL/huydang-dek21-embedding-v2",
         },
+        "provenance_policy": "A-ci-only",
+        "freeze_status": freeze_status,
         "gates": {
-            "kaggle_t4x2": {"verdict": mock_verdict, "report_sha256": k_rep_hash},
+            "kaggle_t4x2": {"verdict": mock_verdict if mock else kaggle_gate["verdict"],
+                            "report_sha256": k_rep_hash,
+                            "reason": "mock-debug" if mock else kaggle_gate.get("reason")},
         },
         "hardware": {
             "gpu": gpu_name,

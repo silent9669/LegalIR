@@ -238,7 +238,8 @@ def collect_report(args, repo_root: Path = REPO_ROOT) -> tuple[dict, int]:
     elif head and origin == head:
         add("git-origin-main", "PASS", origin)
     else:
-        add("git-origin-main", "FAIL", f"origin={origin} local={head}")
+        blocked = True
+        add("git-origin-main", "BLOCKED", f"mismatch: origin={origin} local={head} (remote clones origin; push/pull first)")
     report["origin_sha"] = origin
     clean, dirty = git_clean(repo_root)
     if clean:
@@ -280,8 +281,9 @@ def collect_report(args, repo_root: Path = REPO_ROOT) -> tuple[dict, int]:
     add("model-revisions", "PASS" if all("revision" in m and m["revision"] for m in report["models"]) else "FAIL",
         "; ".join(f"{m.get('id')}@{str(m.get('revision'))[:8]}" for m in report["models"]))
     report["freeze"] = freeze_info(repo_root)
-    add("freeze-file", "PASS" if report["freeze"].get("present") else "FAIL",
-        f"git_sha={report['freeze'].get('git_sha', 'n/a')}")
+    freeze_pres = report["freeze"].get("present")
+    add("freeze-file", "PASS" if freeze_pres else "OPTIONAL_ABSENT",
+        f"git_sha={report['freeze'].get('git_sha', 'n/a')} (optional under policy A)")
 
     # HF target (fail-closed).
     allow_default = bool(args.allow_default_hf_repo or default_allowed())
@@ -317,7 +319,8 @@ def collect_report(args, repo_root: Path = REPO_ROOT) -> tuple[dict, int]:
                         f"check failed: exists={live.get('exists')} visibility={live.get('visibility')} "
                         f"write={live.get('write_access')}")
             except Exception as exc:  # noqa: BLE001 - class only, never token
-                add("hf-write-visibility", "UNVERIFIED", f"live check unreachable ({type(exc).__name__})")
+                blocked = True
+                add("hf-write-visibility", "BLOCKED", f"live check unreachable ({type(exc).__name__}: cannot verify write access)")
     report["hf_allow_public_repo"] = bool(args.hf_allow_public_repo)
 
     # Quota/budget: no local source — always UNVERIFIED with instructions.

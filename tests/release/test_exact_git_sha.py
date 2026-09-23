@@ -26,13 +26,18 @@ def test_sha_match_passes():
         assert actual == VALID_SHA
 
 
-def test_advisory_mode_returns_head_without_release(monkeypatch):
-    """Default (strict off): mismatches warn and continue instead of raising."""
+def test_policy_a_enforces_exact_sha_without_strict_gates(monkeypatch):
+    """Policy A: exact SHA is required independently of LEGALIR_STRICT_GATES."""
     monkeypatch.delenv("LEGALIR_STRICT_GATES", raising=False)
     with patch("src.release.fingerprints.get_git_head_sha", return_value=VALID_SHA):
-        assert assert_exact_git_sha(DIFFERENT_SHA, is_production=True) == VALID_SHA
-        assert assert_exact_git_sha("", is_production=True) == VALID_SHA
-        assert assert_exact_git_sha("main", is_production=True) == VALID_SHA
+        with pytest.raises(ShaMismatchError, match="Git SHA mismatch"):
+            assert_exact_git_sha(DIFFERENT_SHA, is_production=True)
+        with pytest.raises(ShaMismatchError, match="Expected Git SHA must be provided"):
+            assert_exact_git_sha("", is_production=True)
+        with pytest.raises(ShaMismatchError, match="Literal branch"):
+            assert_exact_git_sha("main", is_production=True)
+        # Non-production with empty expected SHA passes through HEAD.
+        assert assert_exact_git_sha("", is_production=False) == VALID_SHA
 
 
 def test_sha_mismatch_fails_closed(monkeypatch):

@@ -34,26 +34,15 @@ def _strict() -> bool:
     return str(os.environ.get("LEGALIR_STRICT_GATES", "")).strip() == "1"
 
 
-def verify_launch(expected_sha, kaggle_report, freeze_file, repo_root=REPO_ROOT):
+def verify_launch(expected_sha, kaggle_report=None, freeze_file=None, repo_root=REPO_ROOT):
     """Pre-GPU launch check: SHA + freeze/report integrity.
 
     Default (LEGALIR_STRICT_GATES unset): advisory — SHA mismatches and
-    freeze/report digest drift only warn, so teammates can iterate without a
-    new release per edit. Missing freeze/report files still fail (nothing to
-    run against). Set LEGALIR_STRICT_GATES=1 to restore fail-closed release
-    behavior before allocating an expensive GPU VM.
+    freeze/report digest drift or absence only warn, so teammates can iterate
+    without a new release per edit. Set LEGALIR_STRICT_GATES=1 to restore
+    fail-closed release behavior before allocating an expensive GPU VM.
     """
     sha = assert_exact_git_sha(expected_sha, repo_root=repo_root)
-    # No fallback: an explicit missing file is a hard failure.
-    freeze_path = Path(freeze_file)
-    if not freeze_path.is_file():
-        raise RuntimeError(f"Production freeze missing: {freeze_path}")
-    report_path = Path(kaggle_report)
-    if not report_path.is_file():
-        raise RuntimeError(f"Kaggle T4x2 report missing: {report_path}")
-    freeze = json.loads(freeze_path.read_text(encoding="utf-8"))
-    report = json.loads(report_path.read_text(encoding="utf-8"))
-    runtime_sha = str(freeze.get("git_sha", "")).strip().lower()
 
     def _warn(msg: str) -> None:
         print(f"[!] launch advisory (strict off): {msg}", flush=True)
@@ -63,70 +52,109 @@ def verify_launch(expected_sha, kaggle_report, freeze_file, repo_root=REPO_ROOT)
             raise RuntimeError(msg)
         _warn(msg)
 
-    if not runtime_sha:
-        raise RuntimeError("Production freeze is missing git_sha!")
-    if runtime_sha != sha.lower():
-        # Two-commit model: release checkout may descend from the frozen runtime
-        # with evidence-only diffs (gate reports, freeze, notebooks).
-        from src.release.provenance import validate_runtime_release_lineage
-        lineage_ok, lineage_errors = validate_runtime_release_lineage(runtime_sha, sha, repo_root)
-        if not lineage_ok:
-            _fail(
-                "Production freeze is for another runtime. Run the Kaggle T4 gate for this SHA and refresh approval before A100. "
-                f"Details: {'; '.join(lineage_errors)}"
-            )
+    # Required model revisions check from registry.
+    from src.models.bootstrap import MODEL_REGISTRY as _REG
+    for mid, meta in (_REG or {}).items():
+        if not meta or not meta.get("revision"):
+            raise RuntimeError(f"Model registry missing pinned revision for {mid}")
+
     config_hash = fingerprint_structured_config(Path(repo_root) / "configs/algorithm/legalir_v2.yaml")
-    if not freeze.get("algorithm_config_sha256"):
-        raise RuntimeError("Production freeze is missing algorithm_config_sha256")
-    if freeze.get("algorithm_config_sha256") != config_hash:
-        _fail("Production freeze algorithm config mismatch")
-    if not freeze.get("dataset", {}).get("manifest_sha256"):
-        raise RuntimeError("Production freeze is missing dataset.manifest_sha256")
-    try:
-        gate_res = verify_prior_gate_reports(
-            kaggle_report=report,
-            expected_sha=runtime_sha,
-            expected_dataset_hash=freeze["dataset"]["manifest_sha256"],
-            expected_config_hash=config_hash,
-        )
-    except Exception as exc:
-        _fail(f"Prior gate reports unverifiable: {type(exc).__name__}: {exc}")
-        if _strict():
-            raise
-        # Advisory: build a best-effort digest so downstream checks degrade
-        # to warnings instead of crashing on missing attributes.
-        from types import SimpleNamespace as _NS
 
-        from src.release.fingerprints import compute_canonical_json_hash as _chash
+    freeze_path = Path(freeze_file) if freeze_file else None
+    if freeze_path is None or not freeze_path.is_file():
+        _fail(f"Production freeze missing: {freeze_path}")
+        freeze = {}
+    else:
+        try:
+            freeze = json.loads(freeze_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            _fail(f"Production freeze unreadable: {exc}")
+            freeze = {}
 
-        gate_res = _NS(kaggle_report_sha256=_chash(report))
-    # Canonical report digest must match the freeze (fail on absent, not just mismatch).
-    expected_report_sha = freeze.get("gates", {}).get("kaggle_t4x2", {}).get("report_sha256")
-    if not expected_report_sha:
-        raise RuntimeError("Production freeze is missing gates.kaggle_t4x2.report_sha256")
-    if gate_res.kaggle_report_sha256 != expected_report_sha:
-        _fail(
-            f"Kaggle report digest mismatch: freeze has '{expected_report_sha}', "
-            f"computed '{gate_res.kaggle_report_sha256}'"
+    report_path = Path(kaggle_report) if kaggle_report else None
+    if report_path is None or not report_path.is_file():
+        _fail(f"Kaggle T4x2 report missing: {report_path}")
+        report = {}
+    else:
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            _fail(f"Kaggle T4x2 report unreadable: {exc}")
+            report = {}
+
+    freeze_data = freeze if isinstance(freeze, dict) else {}
+    f_dataset = freeze_data.get("dataset") if isinstance(freeze_data.get("dataset"), dict) else {}
+    f_gates = freeze_data.get("gates") if isinstance(freeze_data.get("gates"), dict) else {}
+    f_k_gate = f_gates.get("kaggle_t4x2") if isinstance(f_gates.get("kaggle_t4x2"), dict) else {}
+
+    runtime_sha = str(freeze_data.get("git_sha", "")).strip().lower() if freeze_data else sha.lower()
+
+    if freeze_data:
+        if not runtime_sha:
+            _fail("Production freeze is missing git_sha!")
+        elif runtime_sha != sha.lower():
+            # Two-commit model: release checkout may descend from the frozen runtime
+            # with evidence-only diffs (gate reports, freeze, notebooks).
+            from src.release.provenance import validate_runtime_release_lineage
+            lineage_ok, lineage_errors = validate_runtime_release_lineage(runtime_sha, sha, repo_root)
+            if not lineage_ok:
+                _fail(
+                    "Production freeze is for another runtime. Run the Kaggle T4 gate for this SHA and refresh approval before A100. "
+                    f"Details: {'; '.join(lineage_errors)}"
+                )
+        if not freeze_data.get("algorithm_config_sha256"):
+            _fail("Production freeze is missing algorithm_config_sha256")
+        elif freeze_data.get("algorithm_config_sha256") != config_hash:
+            _fail("Production freeze algorithm config mismatch")
+        if not f_dataset.get("manifest_sha256"):
+            _fail("Production freeze is missing dataset.manifest_sha256")
+
+    if report:
+        try:
+            gate_res = verify_prior_gate_reports(
+                kaggle_report=report,
+                expected_sha=runtime_sha,
+                expected_dataset_hash=f_dataset.get("manifest_sha256"),
+                expected_config_hash=config_hash,
+            )
+        except Exception as exc:
+            _fail(f"Prior gate reports unverifiable: {type(exc).__name__}: {exc}")
+            if _strict():
+                raise
+            # Advisory: build a best-effort digest so downstream checks degrade
+            # to warnings instead of crashing on missing attributes.
+            from types import SimpleNamespace as _NS
+
+            from src.release.fingerprints import compute_canonical_json_hash as _chash
+
+            gate_res = _NS(kaggle_report_sha256=_chash(report))
+        # Canonical report digest must match the freeze (fail on absent, not just mismatch).
+        expected_report_sha = f_k_gate.get("report_sha256")
+        if freeze_data and not expected_report_sha:
+            _fail("Production freeze is missing gates.kaggle_t4x2.report_sha256")
+        if freeze_data and expected_report_sha and getattr(gate_res, "kaggle_report_sha256", None) != expected_report_sha:
+            _fail(
+                f"Kaggle report digest mismatch: freeze has '{expected_report_sha}', "
+                f"computed '{getattr(gate_res, 'kaggle_report_sha256', None)}'"
+            )
+        # Report's runtime-profile hash must match the actual Kaggle T4x2 YAML
+        # fingerprint (not the A100 profile). Fail on absent.
+        profile_in_report = report.get("runtime_profile_sha256")
+        if not profile_in_report:
+            _fail("Kaggle report is missing runtime_profile_sha256")
+            return freeze
+        expected_profile = fingerprint_structured_config(
+            Path(repo_root) / "configs/runtime/kaggle_t4x2.yaml"
         )
-    # Report's runtime-profile hash must match the actual Kaggle T4x2 YAML
-    # fingerprint (not the A100 profile). Fail on absent.
-    profile_in_report = report.get("runtime_profile_sha256")
-    if not profile_in_report:
-        _fail("Kaggle report is missing runtime_profile_sha256")
-        return freeze
-    expected_profile = fingerprint_structured_config(
-        Path(repo_root) / "configs/runtime/kaggle_t4x2.yaml"
-    )
-    if profile_in_report != expected_profile:
-        _fail(
-            f"Kaggle runtime-profile mismatch: report has '{profile_in_report}', "
-            f"expected '{expected_profile}' from configs/runtime/kaggle_t4x2.yaml"
-        )
+        if profile_in_report != expected_profile:
+            _fail(
+                f"Kaggle runtime-profile mismatch: report has '{profile_in_report}', "
+                f"expected '{expected_profile}' from configs/runtime/kaggle_t4x2.yaml"
+            )
     return freeze
 
 
-def prepare_dataset(dataset_dir: Path, freeze_file: Path | None = None) -> Path:
+def prepare_dataset(dataset_dir: Path | str, freeze_file: Path | str | None = None) -> Path:
     dataset_dir = Path(dataset_dir)
     configure_kaggle_credentials()
     if not all((dataset_dir / name).is_file() for name in REQUIRED_FILES):
@@ -138,11 +166,39 @@ def prepare_dataset(dataset_dir: Path, freeze_file: Path | None = None) -> Path:
     missing = [name for name in REQUIRED_FILES if not (dataset_dir / name).is_file()]
     if missing:
         raise RuntimeError(f"Canonical Kaggle dataset is incomplete: {missing}")
-    freeze = json.loads(Path(freeze_file).read_text(encoding="utf-8")) if freeze_file else {}
+    freeze_path = Path(freeze_file) if freeze_file else None
+    freeze = {}
+    if freeze_path and freeze_path.is_file():
+        try:
+            freeze = json.loads(freeze_path.read_text(encoding="utf-8"))
+        except Exception:
+            freeze = {}
+
+    expected_manifest_hash = None
+    critical_files_expected = None
+    if _strict() and freeze:
+        expected_manifest_hash = freeze.get("dataset", {}).get("manifest_sha256")
+        critical_files_expected = freeze.get("dataset", {}).get("critical_files")
+    elif freeze:
+        f_hash = freeze.get("dataset", {}).get("manifest_sha256")
+        f_crit = freeze.get("dataset", {}).get("critical_files")
+        d_manifest = dataset_dir / "dataset_manifest.json"
+        disk_hash = None
+        if d_manifest.is_file():
+            try:
+                disk_hash = json.loads(d_manifest.read_text(encoding="utf-8")).get("manifest_sha256")
+            except Exception:
+                disk_hash = None
+        if f_hash and disk_hash and f_hash != disk_hash:
+            print(f"[!] Policy A: freeze dataset hash drifts from canonical ({f_hash[:12]} != {disk_hash[:12]}); verifying against disk manifest.", flush=True)
+        else:
+            expected_manifest_hash = f_hash
+            critical_files_expected = f_crit
+
     verify_dataset_fingerprint(
         dataset_dir,
-        expected_manifest_hash=freeze.get("dataset", {}).get("manifest_sha256"),
-        critical_files_expected=freeze.get("dataset", {}).get("critical_files"),
+        expected_manifest_hash=expected_manifest_hash,
+        critical_files_expected=critical_files_expected,
     )
     return dataset_dir
 

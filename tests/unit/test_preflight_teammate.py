@@ -158,6 +158,24 @@ def test_origin_unreachable_is_unverified(tmp_path, monkeypatch):
     assert _statuses(report)["git-origin-main"] == "UNVERIFIED"
 
 
+def test_origin_mismatch_blocked(tmp_path, monkeypatch):
+    _pass_probes(monkeypatch, tmp_path)
+    monkeypatch.setattr(pf, "git_origin_main", lambda *a, **k: "b" * 40)
+    report, code = pf.collect_report(_args(), tmp_path)
+    assert code == 2
+    assert _statuses(report)["git-origin-main"] == "BLOCKED"
+
+
+def test_hf_unreachable_blocks_dispatch(tmp_path, monkeypatch):
+    _pass_probes(monkeypatch, tmp_path)
+    def _boom(*a, **k):
+        raise ConnectionError("Hub unreachable")
+    monkeypatch.setattr(pf, "hf_live_check", _boom)
+    report, code = pf.collect_report(_args(), tmp_path)
+    assert code == 2
+    assert _statuses(report)["hf-write-visibility"] == "BLOCKED"
+
+
 def test_hf_live_verdict_mapping():
     assert pf.hf_live_check.__doc__ and "Never creates" in pf.hf_live_check.__doc__
 
