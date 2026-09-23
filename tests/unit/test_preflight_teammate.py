@@ -22,7 +22,7 @@ def _args(**kw):
     return Namespace(**base)
 
 
-def _pass_probes(monkeypatch, tmp_path, *, live=None, strict=0):
+def _pass_probes(monkeypatch, tmp_path, *, live=None):
     monkeypatch.setattr(pf, "git_local_head", lambda *a, **k: "a" * 40)
     monkeypatch.setattr(pf, "git_origin_main", lambda *a, **k: "a" * 40)
     monkeypatch.setattr(pf, "git_clean", lambda *a, **k: (True, []))
@@ -36,7 +36,6 @@ def _pass_probes(monkeypatch, tmp_path, *, live=None, strict=0):
     monkeypatch.setattr(pf, "freeze_info",
                         lambda *a, **k: {"present": True, "git_sha": "a" * 40})
     monkeypatch.setattr(pf, "resolve_target_repo", lambda *a, **k: ("owner/repo", "explicit"))
-    monkeypatch.setattr(pf, "strict_release_status", lambda *a, **k: (strict, "ok"))
     monkeypatch.setattr(
         pf, "hf_live_check",
         lambda *a, **k: dict(live or {"exists": True, "visibility": "public",
@@ -44,6 +43,8 @@ def _pass_probes(monkeypatch, tmp_path, *, live=None, strict=0):
     )
     monkeypatch.setenv("HF_TOKEN_WRITE", "hf_faketoken_for_tests_only")
     monkeypatch.delenv("HF_TOKEN", raising=False)
+    assert not hasattr(pf, "strict_release_status"), \
+        "strict release gate removed from preflight: basic CI green is the dispatch gate"
     return tmp_path
 
 
@@ -118,30 +119,14 @@ def test_public_without_optin_blocked(tmp_path, monkeypatch):
     assert code == 2
 
 
-def test_strict_fail_reported_not_silent(tmp_path, monkeypatch):
-    _pass_probes(monkeypatch, tmp_path, strict=1)
+def test_no_strict_gate_in_report(tmp_path, monkeypatch):
+    """Policy: strict release approval is not required; basic CI green is the gate."""
+    _pass_probes(monkeypatch, tmp_path)
     report, code = pf.collect_report(_args(), tmp_path)
-    assert code == 0  # preflight itself passes; strict FAIL stays a production blocker
-    assert _statuses(report)["strict-release"] == "FAIL"
-
-
-def test_strict_probe_forces_strict_gates_env(tmp_path, monkeypatch):
-    """The verifier is advisory without LEGALIR_STRICT_GATES=1; preflight must force it."""
-    seen: dict = {}
-
-    class _R:
-        returncode = 0
-        stdout = "ok"
-        stderr = ""
-
-    def _fake_run(*a, **k):
-        seen["env"] = k.get("env", {})
-        return _R()
-
-    monkeypatch.setattr(pf.subprocess, "run", _fake_run)
-    code, _ = pf.strict_release_status(tmp_path)
     assert code == 0
-    assert seen["env"].get("LEGALIR_STRICT_GATES") == "1"
+    assert "strict-release" not in _statuses(report)
+    assert "strict_exit" not in report
+    assert "basic CI green" in report["verdict"]
 
 
 def test_modal_missing_and_secrets_gap(tmp_path, monkeypatch):

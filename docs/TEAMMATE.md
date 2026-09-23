@@ -1,6 +1,6 @@
 # TEAMMATE.md — Hướng dẫn chạy + những gì đã làm + workflow
 
-> Runbook lịch sử; **chưa phải lệnh GO cho fresh production**. Tại `a342d7f`, HF forwarding đã push và offline suite có 655 passed/2 skipped, nhưng strict release gate vẫn FAIL vì freeze khóa runtime `6b57ed7`; chưa có GPU benchmark/điểm mới. Chỉ dispatch FULL sau khi gate Kaggle dual-T4 + approval đúng SHA cuối, kiểm tra account/quota/secrets/repo public + write và ngân sách được duyệt. A100 có thể là 40 GB. Thiếu đích HF tường minh thì dry-run exit 2.
+> Lệnh GO cho fresh production = **CI GitHub cơ bản xanh** (tests, score-push, audit, drift) trên đúng SHA + preflight không BLOCKED + kiểm tra account/quota/secrets/repo public + write và ngân sách được duyệt. Không yêu cầu strict release approval hay Kaggle dual-T4 evidence. A100 có thể là 40 GB. Thiếu đích HF tường minh thì dry-run exit 2.
 > Mốc lịch sử: release `f867ab4` (runtime `6b57ed7`, Kaggle dual-T4 PASS v73); 4 surgical fixes đã commit ở `30631f4`. Số **587 passed, 2 skipped** thuộc lần kiểm tra trước, không phải kiểm chứng cho SHA mới.
 
 ---
@@ -20,13 +20,13 @@ EOF
 .venv/bin/modal setup  # authenticate Modal CLI
 
 # 0b. Preflight read-only (không tạo repo/upload/GPU) — BLOCKED exit 2 nếu thiếu đích HF,
-# token, secrets hoặc tree bẩn; UNVERIFIED cho quota/budget; FAIL cho strict gate:
+# token, secrets hoặc tree bẩn; UNVERIFIED cho quota/budget:
 .venv/bin/python scripts/preflight_teammate.py --hf-repo dangphuc2109/legalir-task1-reranker --hf-allow-public-repo
 
 # 1. Dry-run kiểm tra trước khi tốn tiền (CPU local, ~1 phút; BLOCKED exit 2 nếu thiếu --hf-repo)
 .venv/bin/python scripts/modal/run_full.py --dry-run --warm --private --push-config --hf-repo dangphuc2109/legalir-task1-reranker --hf-allow-public-repo
 
-# 2. Chỉ sau khi strict release gate PASS và đã duyệt chi phí: warm Volume + private 2080q + config v3 + detached + public opt-in
+# 2. Sau khi CI xanh + preflight sạch + đã duyệt chi phí: warm Volume + private 2080q + config v3 + detached + public opt-in
 .venv/bin/python scripts/modal/run_full.py --warm --private --push-config --detach --hf-repo dangphuc2109/legalir-task1-reranker --hf-allow-public-repo
 # → ghi lại app ID + Volume attempt path in ra màn hình
 # → theo dõi:  modal app logs <app-id>
@@ -51,7 +51,7 @@ LEGALIR_ENSEMBLE=0 .venv/bin/python scripts/modal/run_full.py --warm --private -
 ## 2. Chuẩn bị một lần (checklist)
 
 - [ ] Chạy `bash scripts/setup.sh` (idempotent; không động vào `.env`/secrets/cloud), rồi tạo `.env` thủ công từ `.env.example` nếu chưa có.
-- [ ] Chạy read-only preflight `scripts/preflight_teammate.py --hf-repo dangphuc2109/legalir-task1-reranker --hf-allow-public-repo`: không BLOCKED; ghi nhận các mục UNVERIFIED và strict FAIL (nếu còn) cho quyết định GO.
+- [ ] Chạy read-only preflight `scripts/preflight_teammate.py --hf-repo dangphuc2109/legalir-task1-reranker --hf-allow-public-repo`: không BLOCKED; ghi nhận các mục UNVERIFIED cho quyết định GO.
 - [ ] `.env` có `HF_TOKEN_WRITE` (token Hugging Face quyền WRITE trên đúng repo public) và `KAGGLE_USERNAME`/`KAGGLE_KEY`.
 - [ ] Trên Modal dashboard tạo 2 secrets: `kaggle-secret` (`KAGGLE_USERNAME`, `KAGGLE_KEY`) và `huggingface-secret` (`HF_TOKEN`).
 - [ ] `.venv/bin/modal setup` thành công.

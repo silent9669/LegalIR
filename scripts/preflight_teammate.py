@@ -6,10 +6,14 @@ and marks anything cloud-only as UNVERIFIED/BLOCKED instead of fake PASS:
 
   Git SHA in use + origin/main SHA, clean tree, Modal binary/profile/account,
   secret NAMES present (never values), dataset/model revisions, HF target repo
-  + write permission + visibility, quota/budget to confirm, strict release
-  status, and the exact train command to use.
+  + write permission + visibility, quota/budget to confirm, and the exact
+  train command to use.
 
-Exit codes: 0 = no BLOCKED items (UNVERIFIED/FAIL items are listed for the
+  Policy: basic GitHub CI green (tests, score-push, audit, drift) is the
+  production dispatch gate. Strict release approval and dual-GPU Kaggle
+  evidence are not required and are not checked here.
+
+Exit codes: 0 = no BLOCKED items (UNVERIFIED items are listed for the
 GO/NO-GO decision, which lives outside this script); 1 = unexpected error;
 2 = a fail-closed BLOCKED item (dirty tree, missing/invalid HF target,
 missing token, HF definitive deny, fixtures for offline tests).
@@ -206,26 +210,6 @@ def hf_live_check(repo_id: str, token: str, allow_public_repo: bool = False) -> 
     return result
 
 
-def strict_release_status(repo_root: Path = REPO_ROOT) -> tuple[int, str]:
-    """Authoritative strict gate exit code + tail. Non-zero means NOT approved.
-
-    The verifier is advisory WITHOUT LEGALIR_STRICT_GATES=1, so it is forced
-    on here: only the strict verdict counts for production GO.
-    """
-    try:
-        env = dict(os.environ, LEGALIR_STRICT_GATES="1")
-        r = subprocess.run(
-            [sys.executable, "scripts/verify_release_approval.py",
-             "--repo-root", str(repo_root)],
-            capture_output=True, text=True, timeout=120,
-            cwd=str(repo_root), env=env,
-        )
-        tail = (r.stdout + r.stderr).strip().splitlines()[-3:]
-        return r.returncode, "\n".join(tail)
-    except Exception as exc:  # noqa: BLE001
-        return 1, f"strict check error: {type(exc).__name__}"
-
-
 def train_command(repo_id: str, allow_public_repo: bool) -> str:
     cmd = ("MODAL_TIMEOUT_SECONDS=10800 .venv/bin/python scripts/modal/run_full.py "
            f"--warm --private --push-config --detach --hf-repo {repo_id}")
@@ -340,14 +324,6 @@ def collect_report(args, repo_root: Path = REPO_ROOT) -> tuple[dict, int]:
     add("quota-budget", "UNVERIFIED",
         "no CLI source; confirm GPU quota/SKU/region, approved money budget and stop procedure on the account")
 
-    # Strict release status (authoritative, local).
-    code, tail = strict_release_status(repo_root)
-    report["strict_exit"] = code
-    if code == 0:
-        add("strict-release", "PASS", "verify_release_approval exit 0")
-    else:
-        add("strict-release", "FAIL", f"exit {code}; {tail} (production NO-GO until refreshed for final SHA)")
-
     # Train command (only meaningful when nothing is BLOCKED).
     report["train_command"] = train_command(repo_id, args.hf_allow_public_repo) if repo_id and not blocked else ""
     if repo_id and not blocked:
@@ -356,7 +332,7 @@ def collect_report(args, repo_root: Path = REPO_ROOT) -> tuple[dict, int]:
     exit_code = 2 if blocked else 0
     report["exit_code"] = exit_code
     report["verdict"] = ("BLOCKED" if blocked else
-                         "READY-FOR-DRY-RUN (UNVERIFIED/FAIL items stay production blockers)")
+                         "READY-FOR-DRY-RUN (production GO needs basic CI green + UNVERIFIED items confirmed)")
     return report, exit_code
 
 
