@@ -379,12 +379,16 @@ def test_attach_rejects_revision_mismatch_and_falls_back(tmp_path, monkeypatch):
         "BAAI/bge-reranker-v2-m3": {"path": str(snap_r), "revision": "STALE"},
         "CODE4LIFEOFFICIAL/huydang-dek21-embedding-v2": {"path": str(snap_d), "revision": "STALE"},
     }), encoding="utf-8")
+    # Source gate passes so the revision check is what rejects.
+    (vol / "shared" / "warm_manifest.json").write_text(_json.dumps({
+        "requested_label": "a" * 40, "source_sha": "a" * 40, "hf_repo": "someone/repo",
+    }), encoding="utf-8")
     repo = tmp_path / "repo"
     repo.mkdir()
     for var in ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE", "TRANSFORMERS_CACHE",
                 "HF_HOME", "LEGALIR_MODAL_DATASET_DIR"):
         monkeypatch.delenv(var, raising=False)
-    out = mod.attach_warmed_cache(vol, repo)
+    out = mod.attach_warmed_cache(vol, repo, expected_sha="a" * 40)
     assert out["models_attached"] is False
     assert "revision-mismatch" in str(out.get("models_detail", ""))
     assert "HF_HUB_CACHE" not in os.environ
@@ -399,9 +403,9 @@ def test_attach_records_fallback_summary_keys(tmp_path, monkeypatch):
     for var in ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE", "TRANSFORMERS_CACHE",
                 "HF_HOME", "LEGALIR_MODAL_DATASET_DIR"):
         monkeypatch.delenv(var, raising=False)
-    out = mod.attach_warmed_cache(vol, repo)
+    out = mod.attach_warmed_cache(vol, repo, expected_sha="a" * 40)
     assert out["models_attached"] is False and out["dataset_reused"] is False
-    assert out["models_detail"] == "missing-manifest"
+    assert out["models_detail"] == "source-gate:warm-manifest-missing"
     assert "dataset_detail" in out and "warm_source_sha" in out
 
 
@@ -447,12 +451,16 @@ def test_attach_requires_every_registry_model(tmp_path, monkeypatch):
     (models / "manifest.json").write_text(_json.dumps({
         first: {"path": str(snap), "revision": _REG[first]["revision"]},
     }), encoding="utf-8")
+    # Source gate passes so the missing-model check is what rejects.
+    (vol / "shared" / "warm_manifest.json").write_text(_json.dumps({
+        "requested_label": "a" * 40, "source_sha": "a" * 40, "hf_repo": "someone/repo",
+    }), encoding="utf-8")
     repo = tmp_path / "repo"
     repo.mkdir()
     for var in ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE", "TRANSFORMERS_CACHE",
                 "HF_HOME", "LEGALIR_MODAL_DATASET_DIR"):
         monkeypatch.delenv(var, raising=False)
-    out = mod.attach_warmed_cache(vol, repo)
+    out = mod.attach_warmed_cache(vol, repo, expected_sha="a" * 40)
     assert out["models_attached"] is False
     assert "absent" in str(out.get("models_detail", ""))
 
@@ -498,6 +506,7 @@ def _write_fakes(bin_dir: Path):
         f"echo \"$@\" >> \"{log}\"\n"
         "echo \"ENV_SHA:$LEGALIR_COMMIT_SHA\" >> \"" + str(log) + "\"\n"
         "echo \"ENV_HF_REPO:$HF_REPO_ID\" >> \"" + str(log) + "\"\n"
+        "echo \"ENV_RERANKER_CFG:$LEGALIR_RERANKER_CONFIG\" >> \"" + str(log) + "\"\n"
         "exit 0\n",
         encoding="utf-8",
     )
@@ -619,3 +628,25 @@ def test_cli_warm_forwards_same_repo(tmp_path):
     assert "warm_volume.py" in text
     assert "fresh-user/fresh-repo" in text
     assert "run_modal_a100.py" not in text
+
+
+def test_cli_push_config_exports_v3_and_forwards_flag(tmp_path):
+    """Production must select the v3 push config, never silently base r32."""
+    repo = _make_repo(tmp_path)
+    _init_git_repo(repo)
+    res, log = _run(repo, tmp_path / "bin",
+                    args=("--push-config", "--hf-repo", "fresh-user/fresh-repo"))
+    assert res.returncode == 0, res.stderr
+    text = log.read_text(encoding="utf-8")
+    assert "--push-config" in text
+    assert "ENV_RERANKER_CFG:configs/experiments/reranker_lora_v3_push.yaml" in text
+
+
+def test_cli_default_config_does_not_select_v3(tmp_path):
+    repo = _make_repo(tmp_path)
+    _init_git_repo(repo)
+    res, log = _run(repo, tmp_path / "bin", args=("--hf-repo", "fresh-user/fresh-repo"))
+    assert res.returncode == 0, res.stderr
+    text = log.read_text(encoding="utf-8")
+    assert "--push-config" not in text
+    assert "reranker_lora_v3_push" not in text

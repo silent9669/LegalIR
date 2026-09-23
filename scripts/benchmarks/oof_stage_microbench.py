@@ -71,6 +71,66 @@ def _synthetic_queries(num_queries: int) -> list[tuple[str, str]]:
     return out
 
 
+def _training_probe_section() -> dict:
+    """One real optimizer step on a tiny CPU model (methodology, not GPU evidence)."""
+    try:
+        import tempfile
+        from transformers import BertConfig, BertForSequenceClassification, BertTokenizerFast
+
+        from src.training.samplers import MicrobatchFactorization, probe_factorization_step
+
+        config = BertConfig(vocab_size=300, hidden_size=32, num_attention_heads=2,
+                            num_hidden_layers=2, max_position_embeddings=128, num_labels=1)
+        model = BertForSequenceClassification(config)
+        tmp_vocab = Path(tempfile.gettempdir()) / "microbench_probe_vocab.txt"
+        if not tmp_vocab.exists():
+            vocab_tokens = ["[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]"] + [f"tok_{i}" for i in range(295)]
+            tmp_vocab.write_text("\n".join(vocab_tokens) + "\n", encoding="utf-8")
+        tokenizer = BertTokenizerFast(vocab_file=str(tmp_vocab))
+        res = probe_factorization_step(
+            model=model,
+            tokenizer=tokenizer,
+            factorization=MicrobatchFactorization(microbatch_size=2, gradient_accumulation_steps=8),
+            sample_pairs=[("câu hỏi minh họa", "văn bản minh họa", 1.0),
+                          ("câu hỏi khác", "văn bản khác", 0.0)],
+            device="cpu",
+            max_length=64,
+        )
+        sps = float(res.get("seconds_per_step", 0.0) or 0.0)
+        return {
+            "status": res.get("status"),
+            "device": "cpu",
+            "effective_batch_size": res.get("effective_batch_size"),
+            "seconds_per_step": round(sps, 4),
+            "steps_per_second": round(1.0 / sps, 3) if sps > 0 else 0.0,
+            "note": "CPU tiny-model probe; GPU optimizer steps/s must be read from fold training logs.",
+        }
+    except Exception as exc:  # noqa: BLE001 - methodology probe only
+        return {"status": "SKIPPED", "reason": type(exc).__name__}
+
+
+def _host_memory_section() -> dict:
+    """RSS/VRAM snapshot scaffolding (CPU values real; GPU requires CUDA pilot)."""
+    out: dict = {}
+    try:
+        import psutil
+
+        out["rss_mb"] = round(float(psutil.Process().memory_info().rss) / (1024 ** 2), 1)
+    except Exception as exc:  # noqa: BLE001
+        out["rss_mb"] = f"unavailable:{type(exc).__name__}"
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            out["cuda_allocated_mb"] = round(float(torch.cuda.memory_allocated()) / (1024 ** 2), 1)
+            out["cuda_peak_mb"] = round(float(torch.cuda.max_memory_allocated()) / (1024 ** 2), 1)
+        else:
+            out["cuda"] = "n/a (no CUDA on this machine; VRAM only measurable on GPU pilot)"
+    except Exception as exc:  # noqa: BLE001
+        out["cuda"] = f"unavailable:{type(exc).__name__}"
+    return out
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--queries", type=int, default=20)
@@ -104,42 +164,34 @@ def main(argv: list[str] | None = None) -> int:
                 "text_norm": "",
             })
 
-    # --- Evidence parity + qinfo cache ---
-    builder = EvidencePackBuilder(macro_chunks=chunks, max_chunks=2, max_chars=1200)
+    # --- Evidence parity + qinfo cache (same workload, both branches timed) ---
+    # NOCACHE branch: cache genuinely disabled (qinfo_cache_size=0), so every
+    # pair recomputes query info. CACHED branch: one untimed warm pass, then
+    # timed all-hits passes. Parity requires identical packs.
+    builder_nc = EvidencePackBuilder(macro_chunks=chunks, max_chunks=2, max_chars=1200,
+                                     qinfo_cache_size=0)
     t0 = time.perf_counter()
-    packs_first: dict[str, str] = {}
+    packs_nocache: dict[str, str] = {}
     for _ in range(args.repeats):
         for qid, qtext in queries:
             for did in doc_ids:
-                packs_first[f"{qtext}||{did}"] = builder.build_pack(qtext, did)
-    uncached_seconds = time.perf_counter() - t0
-    stats_after_first = builder.get_qinfo_cache_stats()
+                packs_nocache[f"{qtext}||{did}"] = builder_nc.build_pack(qtext, did)
+    nocache_seconds = time.perf_counter() - t0
+    stats_nocache = builder_nc.get_qinfo_cache_stats()
 
-    # Second pass over the SAME workload must hit the cache and match exactly.
-    builder2 = EvidencePackBuilder(macro_chunks=chunks, max_chunks=2, max_chars=1200,
-                                   qinfo_cache_size=0)  # no cache baseline
-    ref: dict[str, str] = {}
-    for qid, qtext in queries:
+    builder_c = EvidencePackBuilder(macro_chunks=chunks, max_chunks=2, max_chars=1200)
+    for qid, qtext in queries:  # untimed warm: one miss per distinct query
         for did in doc_ids:
-            ref[f"{qtext}||{did}"] = builder2.build_pack(qtext, did)
-    mismatches = sum(1 for k, v in packs_first.items() if ref.get(k) != v)
-    # Timed cached pass (fresh builder, warm then measure).
-    builder3 = EvidencePackBuilder(macro_chunks=chunks, max_chunks=2, max_chars=1200)
-    for qid, qtext in queries:  # warm
-        for did in doc_ids:
-            builder3.build_pack(qtext, did)
-    builder3.clear_qinfo_cache()
-    # Re-warm once, then time the all-hits pass deterministically.
-    for qid, qtext in queries:
-        for did in doc_ids:
-            builder3.build_pack(qtext, did)
+            builder_c.build_pack(qtext, did)
     t1 = time.perf_counter()
+    packs_cached: dict[str, str] = {}
     for _ in range(args.repeats):
         for qid, qtext in queries:
             for did in doc_ids:
-                builder3.build_pack(qtext, did)
+                packs_cached[f"{qtext}||{did}"] = builder_c.build_pack(qtext, did)
     cached_seconds = time.perf_counter() - t1
-    stats_cached = builder3.get_qinfo_cache_stats()
+    stats_cached = builder_c.get_qinfo_cache_stats()
+    mismatches = sum(1 for k, v in packs_cached.items() if packs_nocache.get(k) != v)
 
     # --- Reranker stage clocks with deterministic mock scoring ---
     def _mock_score(pairs, batch_size=None, max_length=None):
@@ -157,7 +209,7 @@ def main(argv: list[str] | None = None) -> int:
     pairs: list[tuple[str, str]] = []
     for qid, qtext in queries:
         for did in doc_ids[: min(10, n_c)]:
-            recs = builder.build(qtext, did)
+            recs = builder_c.build(qtext, did)
             passage = recs[0].get("reranker_text", "") if recs else did
             pairs.append((qtext, passage))
     t2 = time.perf_counter()
@@ -185,11 +237,11 @@ def main(argv: list[str] | None = None) -> int:
         "workload": {"queries": n_q, "candidates_per_query": n_c, "pairs_scored": len(pairs),
                      "repeats": args.repeats, "seed": args.seed, "workload_hash": workload_hash},
         "evidence": {
-            "uncached_pass_seconds": round(uncached_seconds, 4),
+            "nocache_pass_seconds": round(nocache_seconds, 4),
             "cached_pass_seconds": round(cached_seconds, 4),
-            "cache_speedup_cpu_only": round(uncached_seconds / max(1e-9, cached_seconds), 3),
+            "cache_speedup_cpu_only": round(nocache_seconds / max(1e-9, cached_seconds), 3),
             "pack_mismatches_cached_vs_nocache": mismatches,
-            "qinfo_first_pass": stats_after_first,
+            "qinfo_nocache_pass": stats_nocache,
             "qinfo_cached_pass": stats_cached,
         },
         "reranker_mock": {
@@ -207,6 +259,23 @@ def main(argv: list[str] | None = None) -> int:
         "parity": {
             "evidence_packs_identical": mismatches == 0,
             "ensemble_mean_identical": ens_mismatch == 0,
+        },
+        "training_probe_cpu_only": _training_probe_section(),
+        "host_memory": _host_memory_section(),
+        "metric_taxonomy": {
+            "optimizer_steps_per_second": "train_reranker logs (optimizer_steps / training wall time); pilot reads fold metrics reranker_optimizer_steps + reranker_training_seconds. CPU probe below is methodology only.",
+            "inference_queries_per_second": "fold metrics heldout_queries_per_second + retrieval_seconds/rerank_seconds/post_rerank_seconds split; mock pairs_per_second above is NOT GPU throughput.",
+            "cold_end_to_end_time_to_valid_submission": (
+                "Only measurable on a GPU run from EXTERNAL markers: dispatch time "
+                "through warm (warm_manifest) + image build + clone/checkout + index "
+                "build (stage_timings) + mining (pair_mining_seconds) + 5 folds (OOF "
+                "report) + doc-disjoint + final train + private ensemble inference + "
+                "delivery incl. HF upload receipt, plus billing. run_manifest "
+                "elapsed_seconds is NOT the total: its clock starts inside "
+                "run_a100_production_gate (after container start/clone/warm/preflight/"
+                "dataset) and is recorded BEFORE the HF upload (§10). Never "
+                "extrapolate from CPU/mock."
+            ),
         },
     }
     print(json.dumps(report, indent=2))

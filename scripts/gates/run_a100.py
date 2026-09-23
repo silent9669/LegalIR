@@ -113,6 +113,37 @@ def preflight_huggingface_access(
         return False, f"Cannot verify Hugging Face write access ({type(exc).__name__}); check token scopes, network, and huggingface_hub version."
 
 
+def _hf_visibility_best_effort(repo_id: str, token: str | None = None) -> str:
+    """Read-only visibility lookup; 'unknown' when unknowable. Never raises."""
+    try:
+        from huggingface_hub import HfApi
+        info = HfApi(token=token).repo_info(repo_id=repo_id, repo_type="model")
+        private = getattr(info, "private", None)
+        if private is True:
+            return "private"
+        if private is False:
+            return "public"
+        return "unknown"
+    except Exception:
+        return "unknown"
+
+
+def failed_upload_record(
+    repo_id: str,
+    allow_public_repo: bool = False,
+    token: str | None = None,
+) -> dict:
+    """Manifest entry for a failed upload: repo ID, opt-in consent, and
+    visibility when knowable (best-effort read-only lookup). Never includes
+    token material."""
+    return {
+        "repo_id": repo_id,
+        "uploaded": False,
+        "public_repo_override": bool(allow_public_repo),
+        "visibility": _hf_visibility_best_effort(repo_id, token),
+    }
+
+
 def upload_artifacts_to_huggingface(
     output_dir: Path,
     repo_id: str = "dangphuc2109/legalir-task1-reranker",
@@ -552,7 +583,12 @@ def run_a100_production_gate(
         try:
             hf_commit = upload_artifacts_to_huggingface(output_dir=output_dir, repo_id=target_hf_repo, token=hf_token, allow_public_repo=hf_allow_public_repo)
         except RuntimeError:
-            manifest["huggingface"] = {"repo_id": target_hf_repo, "uploaded": False}
+            # Record repo ID + public opt-in + visibility even on failure, so a
+            # failed delivery never loses its destination/consent provenance.
+            manifest["huggingface"] = failed_upload_record(
+                target_hf_repo, allow_public_repo=hf_allow_public_repo,
+                token=resolve_hf_token(hf_token),
+            )
             run_manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
             raise
     if hf_commit:

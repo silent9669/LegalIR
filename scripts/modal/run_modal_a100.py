@@ -209,6 +209,40 @@ def _looks_like_full_sha(value: object) -> bool:
     return bool(re.fullmatch(r"[0-9a-f]{40}", str(value or "").strip()))
 
 
+def _check_warm_source_sha(
+    expected_sha: str | None,
+    *,
+    warm_manifest_present: bool,
+    warm_source_sha: str,
+) -> tuple[bool, str]:
+    """Fail-closed source gate for warm-cache reuse.
+
+    The cache attaches ONLY when the training SHA is a full verifiable SHA
+    AND the warm manifest records the same full SHA. Every other case —
+    missing/unpinned training SHA, missing manifest, missing/unknown/
+    malformed warm SHA, or mismatch — returns ``(False, reason)`` and the
+    caller falls back to downloading. ``reason`` is a stable code; the full
+    values stay in the persisted summary, never in exception text.
+    """
+    exp = str(expected_sha or "").strip()
+    if not exp:
+        return False, "training-sha-missing"
+    if not _looks_like_full_sha(exp):
+        return False, f"training-sha-unpinned:{exp[:24]}"
+    if not warm_manifest_present:
+        return False, "warm-manifest-missing"
+    warm = str(warm_source_sha or "").strip()
+    if not warm:
+        return False, "warm-source-sha-missing"
+    if warm.lower() == "unknown":
+        return False, "warm-source-sha-unknown"
+    if not _looks_like_full_sha(warm):
+        return False, f"warm-source-sha-malformed:{warm[:24]}"
+    if exp.lower() != warm.lower():
+        return False, f"warm-source-sha-mismatch:warm={warm[:12]} training={exp[:12]}"
+    return True, "sha-verified"
+
+
 def attach_warmed_cache(
     volume_root: str | Path,
     repo_dir: str | Path,
@@ -226,13 +260,14 @@ def attach_warmed_cache(
     - Dataset: when every REQUIRED_FILES entry exists warmed, pins
       LEGALIR_MODAL_DATASET_DIR at it so prepare_dataset skips the download.
       Fingerprint verification still runs inside prepare_dataset.
-    - Source identity: ``expected_sha`` is the training job's SHA. When both
-      it and the warm manifest's ``source_sha`` are full 40-char SHAs and they
-      differ, the cache is NOT attached (warm-source-sha-mismatch) — a stale
-      checkout's cache is never treated as valid for another SHA. Short/dev
-      labels stay advisory.
+    - Source identity: ``expected_sha`` is the training job's SHA. The cache
+      attaches ONLY when it is a full 40-char SHA and the warm manifest
+      records the same full SHA (verified match). Missing, unpinned,
+      unknown, malformed, or mismatched SHAs fail closed to downloading with
+      a machine-readable reason — a stale or unverified checkout's cache is
+      never treated as valid.
 
-    Never raises; missing/partial/stale cache simply falls back to
+    Never raises; missing/partial/stale/unverified cache simply falls back to
     downloading. Returns a summary dict (models_attached, dataset_reused,
     models_detail, dataset_detail, warm_source_sha, warm_requested_label,
     warm_hf_repo) so the caller can persist how the A100 actually resolved
@@ -249,9 +284,11 @@ def attach_warmed_cache(
     }
     try:
         # Record warm provenance first so even a fallback decision is auditable.
+        warm_manifest_present = False
         try:
             warm_manifest = Path(volume_root) / "shared" / "warm_manifest.json"
             if warm_manifest.is_file():
+                warm_manifest_present = True
                 warm_data = json.loads(warm_manifest.read_text(encoding="utf-8"))
                 if isinstance(warm_data, dict):
                     summary["warm_source_sha"] = str(warm_data.get("source_sha", "unknown"))
@@ -259,10 +296,11 @@ def attach_warmed_cache(
                     summary["warm_hf_repo"] = str(warm_data.get("hf_repo", "unknown"))
         except Exception:
             pass
-        warm_sha_ok = True
-        if _looks_like_full_sha(expected_sha) and _looks_like_full_sha(summary.get("warm_source_sha")):
-            if str(expected_sha).strip().lower() != str(summary["warm_source_sha"]).strip().lower():
-                warm_sha_ok = False
+        sha_ok, sha_reason = _check_warm_source_sha(
+            expected_sha,
+            warm_manifest_present=warm_manifest_present,
+            warm_source_sha=str(summary.get("warm_source_sha", "unknown")),
+        )
         models_dir = warmed_models_dir(volume_root)
         manifest = models_dir / "manifest.json"
         try:
@@ -318,14 +356,22 @@ def attach_warmed_cache(
                 detail = f"unreadable:{type(exc).__name__}"
                 ok = False
         summary["models_detail"] = detail
-        if not warm_sha_ok:
-            summary["models_detail"] = (
-                f"warm-source-sha-mismatch:warm={summary['warm_source_sha']} "
-                f"training={str(expected_sha).strip()}"
-            )
-            print(f"[*] Warm cache from another source ({summary['models_detail']}); "
-                  "A100 will download weights.", flush=True)
-        elif ok:
+        attached_models = bool(sha_ok and ok)
+        if not sha_ok:
+            summary["models_detail"] = f"source-gate:{sha_reason}"
+            print(f"[*] Warm models not attached ({sha_reason}); A100 will download weights.", flush=True)
+        if not attached_models:
+            # Preset cache env pointing elsewhere must not silently govern the
+            # fallback: downloaders resolve it, but the operator is warned.
+            preset = [v for v in ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE",
+                                  "TRANSFORMERS_CACHE", "HF_HOME")
+                      if os.environ.get(v, "").strip()
+                      and os.environ.get(v, "").strip() != str(models_dir)]
+            if preset:
+                print(f"[!] Cache env already set ({', '.join(preset)}); falling back to "
+                      "download, not the warmed snapshots. Unset them to reuse warm cache.",
+                      flush=True)
+        if attached_models:
             for var in ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE", "TRANSFORMERS_CACHE", "HF_HOME"):
                 os.environ.setdefault(var, str(models_dir))
             # Mirror into the repo-local manifest path read by model loaders.
@@ -344,12 +390,10 @@ def attach_warmed_cache(
 
         ds_dir = warmed_dataset_dir(volume_root)
         missing_ds = [n for n in REQUIRED_FILES if not (ds_dir / n).is_file()]
-        if not missing_ds and not warm_sha_ok:
-            summary["dataset_detail"] = (
-                f"warm-source-sha-mismatch:warm={summary['warm_source_sha']} "
-                f"training={str(expected_sha).strip()}"
-            )
-            print(f"[*] Warm dataset from another source; A100 will download it.", flush=True)
+        reuse_dataset = bool(not missing_ds and sha_ok)
+        if not missing_ds and not sha_ok:
+            summary["dataset_detail"] = f"source-gate:{sha_reason}"
+            print(f"[*] Warm dataset not reused ({sha_reason}); A100 will download it.", flush=True)
         elif not missing_ds:
             os.environ.setdefault("LEGALIR_MODAL_DATASET_DIR", str(ds_dir))
             summary["dataset_reused"] = True
@@ -358,6 +402,11 @@ def attach_warmed_cache(
         else:
             summary["dataset_detail"] = f"missing:{','.join(missing_ds[:5])}"
             print(f"[*] No complete warmed dataset (missing {len(missing_ds)} files); A100 will download it.", flush=True)
+        if not reuse_dataset:
+            preset_ds = str(os.environ.get("LEGALIR_MODAL_DATASET_DIR", "")).strip()
+            if preset_ds and preset_ds != str(ds_dir):
+                print("[!] LEGALIR_MODAL_DATASET_DIR already set elsewhere; falling back to "
+                      "download + fingerprint verification, not the warmed dataset.", flush=True)
     except Exception as exc:  # noqa: BLE001
         print(f"[!] Warm cache attach skipped: {type(exc).__name__}", flush=True)
         summary["models_detail"] = f"error:{type(exc).__name__}"

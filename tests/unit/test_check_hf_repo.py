@@ -125,6 +125,32 @@ def test_main_blocks_without_write_access(monkeypatch, capsys):
     assert "BLOCKED" in err and "write" in err
 
 
+def _public_write_hub(monkeypatch):
+    import huggingface_hub as hub
+
+    hub.HfApi = type("A", (), {
+        "__init__": lambda self, token=None: None,
+        "whoami": lambda self: {"name": "testuser"},
+        "repo_info": lambda self, repo_id=None, repo_type=None: types.SimpleNamespace(private=False),
+        "auth_check": lambda self, repo_id=None, repo_type=None, write=False: None,
+    })
+    monkeypatch.setenv("HF_TOKEN_WRITE", "hf_testtoken")
+
+
+def test_main_blocks_public_repo_without_opt_in(monkeypatch, capsys):
+    """Exit 0 must never mean 'public repo with write access is fine'."""
+    _install_fake_hub(monkeypatch, exists=True, private=False, write=True)
+    _public_write_hub(monkeypatch)
+    assert chk.main(["--repo", "owner/repo"]) == 1
+    assert "PUBLIC" in capsys.readouterr().err
+
+
+def test_main_accepts_public_repo_only_with_explicit_opt_in(monkeypatch, capsys):
+    _install_fake_hub(monkeypatch, exists=True, private=False, write=True)
+    _public_write_hub(monkeypatch)
+    assert chk.main(["--repo", "owner/repo", "--allow-public-repo"]) == 0
+
+
 def test_token_never_printed(monkeypatch, capsys):
     _install_fake_hub(monkeypatch, exists=True)
     monkeypatch.setenv("HF_TOKEN_WRITE", "hf_supersecret_token_xyz")

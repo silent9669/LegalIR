@@ -12,10 +12,13 @@ create_repo and therefore MUTATES by creating a private repo), this script
 never creates, uploads, or changes visibility. Do not run the real preflight
 "just to check" unless repo creation is approved. Never prints token values.
 
-Exit codes: 0 = repo exists, visibility known, AND write access confirmed
-(ready for preflight/upload); 1 = anything else (missing token, repo absent,
-unknown visibility, NO write access, network) — an automated gate must treat
-1 as BLOCKED, never as pass; 2 = invalid repo ID.
+Exit codes: 0 = repo EXISTS, visibility KNOWN (private, or PUBLIC with explicit
+opt-in), AND write access confirmed (ready for preflight/upload). 1 = anything
+else (missing token, repo absent, unknown visibility, PUBLIC repo without
+explicit opt-in, NO write access, network) — an automated gate must treat 1 as
+BLOCKED, never as pass. 2 = invalid repo ID. Always read the printed
+visibility field: exit 0 on a public repo means "public + opt-in + write",
+never "private".
 
 Example:
     HF_TOKEN_WRITE=hf_... .venv/bin/python scripts/check_hf_repo.py --repo OWNER/REPO
@@ -84,6 +87,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--repo", required=True, help="HF repo 'owner/repo' to inspect (read-only).")
     ap.add_argument("--token", default=None, help="HF token (default: HF_TOKEN_WRITE/HF_TOKEN env).")
     ap.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
+    ap.add_argument("--allow-public-repo", action="store_true",
+                    help="Explicit operator opt-in: accept an existing PUBLIC repo. "
+                         "Without it, a public repo is BLOCKED (exit 1) even with write access.")
     args = ap.parse_args(argv)
 
     token = resolve_token(args.token)
@@ -111,6 +117,14 @@ def main(argv: list[str] | None = None) -> int:
     if result.get("exists") is not True:
         return 1
     if result.get("visibility") == "unknown":
+        return 1
+    # The LegalIR release repo is intentionally PUBLIC (judges verify it).
+    # A public repo passes visibility/write checks but still needs the
+    # operator's explicit opt-in: BLOCK it without --allow-public-repo
+    # (mirrors the production --hf-allow-public-repo flag, recorded not assumed).
+    if result.get("visibility") == "public" and not args.allow_public_repo:
+        print(f"[!] BLOCKED: {result.get('repo_id')} is PUBLIC; production requires "
+              "explicit --allow-public-repo opt-in (recorded in the manifest).", file=sys.stderr)
         return 1
     # Write access is required: without it the upload step fails AFTER hours
     # of GPU billing, so absence of write must never exit 0.

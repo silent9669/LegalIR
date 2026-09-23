@@ -105,14 +105,16 @@ def main(argv: list[str] | None = None) -> int:
         "live_verify_checklist_new_account": [
             "modal profile active = YOUR account; GPU quota/SKU/region confirmed; approved money budget + stop procedure recorded",
             "dashboard secrets kaggle-secret + huggingface-secret belong to YOUR account (values never printed)",
-            "scripts/check_hf_repo.py --repo OWNER/REPO exits 0 (exists + private + write); else BLOCKED",
+            "scripts/check_hf_repo.py --repo dangphuc2109/legalir-task1-reranker --allow-public-repo exits 0 (exists + public-intentional + write); else BLOCKED",
             "warm manifest source_sha / revisions / dataset fingerprint match the dispatch SHA",
             "monitor modal app logs every 15 min; stop with modal app stop <id> --yes; confirm termination",
         ],
         "plumbing_commands": [
-            "python scripts/modal/run_full.py --warm-only --hf-repo OWNER/REPO",
-            "python scripts/modal/run_full.py --warm --private --push-config --detach --hf-repo OWNER/REPO --dry-run",
-            "MODAL_TIMEOUT_SECONDS=10800 python scripts/modal/run_full.py --private --push-config --detach --warm --hf-repo OWNER/REPO",
+            "bash scripts/setup.sh",
+            "python scripts/modal/run_full.py --warm-only --hf-repo dangphuc2109/legalir-task1-reranker --hf-allow-public-repo",
+            "python scripts/preflight_teammate.py --hf-repo dangphuc2109/legalir-task1-reranker --hf-allow-public-repo",
+            "python scripts/modal/run_full.py --warm --private --push-config --detach --hf-repo dangphuc2109/legalir-task1-reranker --hf-allow-public-repo --dry-run",
+            "MODAL_TIMEOUT_SECONDS=10800 python scripts/modal/run_full.py --private --push-config --detach --warm --hf-repo dangphuc2109/legalir-task1-reranker --hf-allow-public-repo",
         ],
         "go_criteria": [
             "Remote logs show 'HF repo: OWNER/REPO (source=flag)' on warm AND training jobs.",
