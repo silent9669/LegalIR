@@ -105,6 +105,10 @@ while [ "$#" -gt 0 ]; do
         echo "[!] Duplicate --hf-repo flag." >&2
         exit 2
       fi
+      if [ -z "${arg#*=}" ]; then
+        echo "[!] --hf-repo requires a non-empty value 'owner/repo'." >&2
+        exit 2
+      fi
       HF_REPO_FLAG="${arg#*=}"
       HF_REPO_SOURCE="flag"
       shift
@@ -200,8 +204,8 @@ unless LEGALIR_STRICT_GATES=1).
                            uses configs/experiments/reranker_lora.yaml.
                            LEGALIR_RERANKER_CONFIG env overrides both.
   --warm                   Warm the shared Volume first (CPU-cheap:
-                           models + dataset), then dispatch A100. Recommended:
-                           A100 bills zero download seconds.
+                            models + dataset), then dispatch A100. Recommended:
+                            the A100 reuses verified cache instead of downloading.
   --warm-only              Only warm the shared Volume (no A100 dispatch).
   --hf-repo owner/repo     Explicit HF repo for artifacts. Wins over
                             HF_REPO_ID env and .env. REQUIRED: without it the

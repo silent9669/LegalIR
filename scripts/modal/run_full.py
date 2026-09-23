@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Single-command teammate entrypoint for the Modal A100-80GB full run.
+"""Single-command teammate entrypoint for the Modal A100 full run.
 
 No release required. No time/quality gates. Example:
 
-    python scripts/modal/run_full.py --private --push-config --detach
+    python scripts/modal/run_full.py --private --push-config --detach --hf-repo OWNER/REPO
 
 Flags are forwarded to scripts/modal/run_modal_cli.sh:
     --private      2,080 private queries (default: 1,000 public)
@@ -12,8 +12,9 @@ Flags are forwarded to scripts/modal/run_modal_cli.sh:
                    LEGALIR_RERANKER_CONFIG env overrides both.
     --detach       app survives client disconnect (record app ID, watch
                    `modal app logs <id>`, stop with `modal app stop <id> --yes`)
-    --warm          warm shared Volume on CPU first (models + dataset),
-                   then dispatch A100. Recommended: A100 bills zero downloads.
+    --warm          warm shared Volume on CPU first (recommended: the A100
+                   reuses verified cache instead of downloading),
+                   then dispatch A100.
     --warm-only     only warm the shared Volume (no A100 dispatch).
     --hf-allow-public-repo  opt-in to push to an existing PUBLIC HF repo
     --hf-repo OWNER/REPO    explicit HF repo for artifacts (flag > HF_REPO_ID

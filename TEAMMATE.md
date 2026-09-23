@@ -8,14 +8,17 @@
 ## 1. Chạy trong 3 lệnh (TL;DR)
 
 ```bash
-# 0. Chuẩn bị 1 lần duy nhất (xem §2)
+# 0. Chuẩn bị 1 lần duy nhất (xem §2). MÁY MỚI: .venv không nằm trong git — tự tạo:
+python3.11 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+.venv/bin/pip install "modal>=1.0" "kaggle>=1.8,<3"  # CLI dispatch + dataset (ngoài requirements)
 cat > .env <<'EOF'
 HF_TOKEN_WRITE=hf_token_write_cua_ban
 KAGGLE_USERNAME=username_cua_ban
 KAGGLE_KEY=kaggle_key_cua_ban
 HF_REPO_ID=username_cua_ban/legalir-task1-reranker
 EOF
-.venv/bin/modal setup  # authenticate Modal CLI (đã có .venv sẵn trong repo)
+.venv/bin/modal setup  # authenticate Modal CLI
 
 # 1. Dry-run kiểm tra trước khi tốn tiền (CPU local, ~1 phút; BLOCKED exit 2 nếu thiếu --hf-repo)
 .venv/bin/python scripts/modal/run_full.py --dry-run --warm --private --push-config --hf-repo username_cua_ban/legalir-task1-reranker
@@ -44,9 +47,10 @@ LEGALIR_ENSEMBLE=0 .venv/bin/python scripts/modal/run_full.py --warm --private -
 
 ## 2. Chuẩn bị một lần (checklist)
 
+- [ ] Tạo `.venv` riêng (không có trong git): `python3.11 -m venv .venv && .venv/bin/pip install -r requirements.txt && .venv/bin/pip install "modal>=1.0" "kaggle>=1.8,<3"`.
 - [ ] `.env` có `HF_TOKEN_WRITE` (token Hugging Face quyền WRITE) và `KAGGLE_USERNAME`/`KAGGLE_KEY`.
 - [ ] Trên Modal dashboard tạo 2 secrets: `kaggle-secret` (`KAGGLE_USERNAME`, `KAGGLE_KEY`) và `huggingface-secret` (`HF_TOKEN`).
-- [ ] `.venv/bin/modal setup` thành công (CLI trong repo: `.venv/bin/modal`).
+- [ ] `.venv/bin/modal setup` thành công.
 - [ ] Chạy `--warm-only` 1 lần: nạp sẵn 3 pinned models (`MODEL_REGISTRY`) + dataset + manifest vào Volume `legalir-production:shared/`. Mọi run sau tái dùng khi manifest verified (đủ model + đúng revision + SHA nguồn khớp); thiếu/lệch thì A100 tự download và ghi nhận fallback trong `warm_cache_summary.json`.
 - [ ] Chạy `--dry-run` xanh (preflight §4) trước mỗi lần dispatch. Dry-run cũng certify đích HF: thiếu repo explicit là BLOCKED exit 2, không phải OK.
 - [ ] Tài khoản riêng: `--hf-repo` (hoặc `HF_REPO_ID` env/`.env`) trỏ repo của bạn — xem `scripts/check_hf_repo.py --repo OWNER/REPO` để kiểm tra read-only trước (chi tiết §8).

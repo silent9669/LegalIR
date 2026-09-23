@@ -484,9 +484,9 @@ def run_production_training(
         os.chdir(repo_dir)
 
         # 1b. Attach pre-warmed Volume cache (models + dataset) so the A100
-        # bills zero download seconds. Falls back to downloading when absent
+        # can reuse verified downloads. Falls back to downloading when absent
         # or stale; the summary records cache-hit vs download-fallback so
-        # operators can verify zero-download claims instead of assuming them.
+        # operators verify instead of assuming zero-download.
         # Run scripts/modal/warm_volume.py (CPU-cheap) before dispatch.
         _update_state("warm_cache")
         _warm_summary = attach_warmed_cache(_resolve_volume_mount(), repo_dir, expected_sha=sha)
@@ -710,7 +710,7 @@ def main(
     print(f"[*] HF repo: {resolved_repo} (source={resolved_source})", flush=True)
     if resolved_source == "default":
         print("[!] Fresh accounts should pass --hf-repo owner/repo; default targets the previous owner's repo.", flush=True)
-    print(f"[*] Remote timeout: {TIMEOUT_SECONDS}s (no quality/time gate; set MODAL_TIMEOUT_SECONDS only to cap spend).")
+    print(f"[*] Remote timeout: {TIMEOUT_SECONDS}s (caps duration, not spend; set MODAL_TIMEOUT_SECONDS only to bound job length).")
     print("[*] Durable outputs use /root/legalir_volume/<label>/attempts/<id>/ on the 'legalir-production' Volume.")
     print("[*] Supervision: default `modal run` is ATTACHED — client disconnect terminates")
     print("    remote tasks even with a persistent Volume. Keep the client connected (stable")

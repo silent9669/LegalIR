@@ -6,6 +6,7 @@ Reviewed 2026-09-22. Historical execution guide for LegalIR Task 1 on Modal A100
 ## Pre-Launch Requirements
 
 1. HEAD `f867ab4` (runtime `6b57ed7`, Kaggle dual-T4 PASS v73) or newer; full test suite green (587 passed).
+2. Fresh venv (`.venv` is gitignored, not cloned): `python3.11 -m venv .venv && .venv/bin/pip install -r requirements.txt && .venv/bin/pip install "modal>=1.0" "kaggle>=1.8,<3"`.
 2. `.env` with `HF_TOKEN_WRITE` + Kaggle credentials; Modal secrets `kaggle-secret` and `huggingface-secret` on the dashboard; `.venv/bin/modal setup` done. Explicit `--hf-repo OWNER/REPO` (or `HF_REPO_ID` env/`.env`) — dispatch without it exits 2 BLOCKED.
 3. Canonical dataset resolvable (warm Volume or Kaggle download); pinned base-model revisions unchanged.
 4. Run `--dry-run` green before every dispatch. Dry-run certifies the HF destination too: `source=default` is a BLOCKED failure, not OK. Read-only repo check (no creation): `scripts/check_hf_repo.py --repo OWNER/REPO`.

@@ -597,6 +597,8 @@ def test_cli_rejects_invalid_hf_repo(tmp_path):
     res, _ = _run(repo, tmp_path / "bin2",
                   extra_env={"HF_REPO_ID": "also bad!!"})
     assert res.returncode == 2
+    res, _ = _run(repo, tmp_path / "bin3", args=("--hf-repo=",))
+    assert res.returncode == 2
 
 
 def test_cli_rejects_duplicate_hf_repo(tmp_path):
