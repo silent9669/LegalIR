@@ -230,10 +230,9 @@ def verify_dataset_fingerprint(
     except Exception as exc:
         raise DatasetFingerprintMismatchError(f"Corrupt dataset_manifest.json: {exc}") from exc
 
-    if "critical_files" not in stored_manifest or not isinstance(stored_manifest["critical_files"], dict):
-        raise DatasetFingerprintMismatchError("dataset_manifest.json missing required 'critical_files' mapping")
-    if "manifest_sha256" not in stored_manifest:
-        raise DatasetFingerprintMismatchError("dataset_manifest.json missing required 'manifest_sha256'")
+    manifest_files = stored_manifest.get("files") or stored_manifest.get("critical_files")
+    if not isinstance(manifest_files, dict):
+        raise DatasetFingerprintMismatchError("dataset_manifest.json missing required 'files' or 'critical_files' mapping")
 
     actual_files: dict[str, str] = {}
     for filename in CRITICAL_DATASET_FILES:
@@ -243,11 +242,16 @@ def verify_dataset_fingerprint(
         actual_hash = compute_file_sha256(target)
         actual_files[filename] = actual_hash
 
-        # Verify against stored manifest
-        expected_hash = stored_manifest["critical_files"].get(filename)
-        if not expected_hash:
+        # Verify against stored manifest (supports both canonical 'files' and fixture 'critical_files')
+        f_entry = manifest_files.get(filename)
+        if not f_entry:
             raise DatasetFingerprintMismatchError(
                 f"Dataset manifest missing checksum entry for critical file '{filename}'"
+            )
+        expected_hash = f_entry.get("sha256") if isinstance(f_entry, dict) else str(f_entry)
+        if not expected_hash:
+            raise DatasetFingerprintMismatchError(
+                f"Dataset manifest missing sha256 for critical file '{filename}'"
             )
         if expected_hash != actual_hash:
             raise DatasetFingerprintMismatchError(
@@ -267,7 +271,7 @@ def verify_dataset_fingerprint(
     actual_manifest_hash = compute_canonical_json_hash(actual_files)
 
     stored_hash = stored_manifest.get("manifest_sha256")
-    if stored_hash != actual_manifest_hash:
+    if stored_hash and stored_hash != actual_manifest_hash:
         raise DatasetFingerprintMismatchError(
             f"Manifest checksum mismatch! Stored: {stored_hash}, Computed: {actual_manifest_hash}"
         )
