@@ -1,7 +1,7 @@
 # TEAMMATE.md — Hướng dẫn chạy + những gì đã làm + workflow
 
-> Dành cho teammate lần đầu chạm vào repo. Đọc file này là đủ để chạy run private max-score trên Modal A100-80GB.
-> Tình trạng: HEAD `f867ab4` (runtime `6b57ed7`, Kaggle dual-T4 PASS v73) + 4 surgical fixes đã review APPROVED trên working tree. Full suite **587 passed, 2 skipped**.
+> Runbook của lần trước; **chưa đủ để khởi chạy fresh run trên tài khoản mới cho đến khi bản fix được commit/push**. Xem [kế hoạch fresh-account](docs/TASK1_FRESH_RUN_TIME_AND_SCORE_PLAN.md) trước: GPU A100 có thể là 40 GB. `HF_REPO_ID` được forward tường minh theo thứ tự flag `--hf-repo` > env > `.env` > (BLOCKED); thiếu repo explicit thì dry-run exit 2 chứ không âm thầm nhắm repo owner cũ.
+> Mốc lịch sử: release `f867ab4` (runtime `6b57ed7`, Kaggle dual-T4 PASS v73); 4 surgical fixes đã commit ở `30631f4`, không còn là sửa đổi working tree. Số **587 passed, 2 skipped** thuộc lần kiểm tra trước, không xác nhận HEAD hiện tại.
 
 ---
 
@@ -17,11 +17,11 @@ HF_REPO_ID=username_cua_ban/legalir-task1-reranker
 EOF
 .venv/bin/modal setup  # authenticate Modal CLI (đã có .venv sẵn trong repo)
 
-# 1. Dry-run kiểm tra trước khi tốn tiền (CPU local, ~1 phút)
-.venv/bin/python scripts/modal/run_full.py --dry-run --warm --private --push-config
+# 1. Dry-run kiểm tra trước khi tốn tiền (CPU local, ~1 phút; BLOCKED exit 2 nếu thiếu --hf-repo)
+.venv/bin/python scripts/modal/run_full.py --dry-run --warm --private --push-config --hf-repo username_cua_ban/legalir-task1-reranker
 
 # 2. Run thật: warm Volume (CPU rẻ) + private 2080q + config v3 + detached
-.venv/bin/python scripts/modal/run_full.py --warm --private --push-config --detach
+.venv/bin/python scripts/modal/run_full.py --warm --private --push-config --detach --hf-repo username_cua_ban/legalir-task1-reranker
 # → ghi lại app ID + Volume attempt path in ra màn hình
 # → theo dõi:  modal app logs <app-id>
 # → dừng:     modal app stop <app-id> --yes
@@ -31,13 +31,13 @@ Các biến thể:
 
 ```bash
 # Chỉ warm Volume, không bật A100 (nên chạy 1 lần trước run đầu tiên)
-.venv/bin/python scripts/modal/run_full.py --warm-only
+.venv/bin/python scripts/modal/run_full.py --warm-only --hf-repo username_cua_ban/legalir-task1-reranker
 
 # Smoke public 1000q cho rẻ (validate pipeline, không phải bản nộp)
-.venv/bin/python scripts/modal/run_full.py --warm --detach
+.venv/bin/python scripts/modal/run_full.py --warm --detach --hf-repo username_cua_ban/legalir-task1-reranker
 
 # Tắt ensemble (nhanh hơn, điểm thấp hơn) — xem §5
-LEGALIR_ENSEMBLE=0 .venv/bin/python scripts/modal/run_full.py --warm --private --push-config --detach
+LEGALIR_ENSEMBLE=0 .venv/bin/python scripts/modal/run_full.py --warm --private --push-config --detach --hf-repo username_cua_ban/legalir-task1-reranker
 ```
 
 ---
@@ -47,9 +47,9 @@ LEGALIR_ENSEMBLE=0 .venv/bin/python scripts/modal/run_full.py --warm --private -
 - [ ] `.env` có `HF_TOKEN_WRITE` (token Hugging Face quyền WRITE) và `KAGGLE_USERNAME`/`KAGGLE_KEY`.
 - [ ] Trên Modal dashboard tạo 2 secrets: `kaggle-secret` (`KAGGLE_USERNAME`, `KAGGLE_KEY`) và `huggingface-secret` (`HF_TOKEN`).
 - [ ] `.venv/bin/modal setup` thành công (CLI trong repo: `.venv/bin/modal`).
-- [ ] Chạy `--warm-only` 1 lần: nạp sẵn 2 pinned models + dataset 616MB + manifest vào Volume `legalir-production:shared/`. Mọi run sau tái dùng, A100 không tốn giây nào để download.
-- [ ] Chạy `--dry-run` xanh (preflight §4) trước mỗi lần dispatch.
-- [ ] Tài khoản riêng: `HF_REPO_ID` trong `.env` trỏ repo của bạn (chi tiết §8).
+- [ ] Chạy `--warm-only` 1 lần: nạp sẵn 3 pinned models (`MODEL_REGISTRY`) + dataset + manifest vào Volume `legalir-production:shared/`. Mọi run sau tái dùng khi manifest verified (đủ model + đúng revision + SHA nguồn khớp); thiếu/lệch thì A100 tự download và ghi nhận fallback trong `warm_cache_summary.json`.
+- [ ] Chạy `--dry-run` xanh (preflight §4) trước mỗi lần dispatch. Dry-run cũng certify đích HF: thiếu repo explicit là BLOCKED exit 2, không phải OK.
+- [ ] Tài khoản riêng: `--hf-repo` (hoặc `HF_REPO_ID` env/`.env`) trỏ repo của bạn — xem `scripts/check_hf_repo.py --repo OWNER/REPO` để kiểm tra read-only trước (chi tiết §8).
 
 ---
 
@@ -118,12 +118,12 @@ Muốn chạy tay từng cái (CPU local, không GPU):
 ## 6. Workflow của một run (chuyện gì xảy ra trên cloud)
 
 ```text
-run_full.py (local preflight)
-  → run_modal_cli.sh (local provenance check + MODAL_ARGS)
-    → run_modal_a100.py :: main() (local entrypoint, forward private/reranker_config)
-      → run_production_training.remote() trên A100-80GB:
-          checkout SHA → warm cache (models+dataset từ Volume shared/)
-          → verify_launch (advisory) → HF preflight → prepare_dataset
+run_full.py (local preflight, HF repo fail-closed khi thiếu explicit)
+  → run_modal_cli.sh (HF repo resolve flag>env>.env, local provenance check + MODAL_ARGS)
+    → run_modal_a100.py :: main() (local entrypoint, forward private/reranker_config/hf_repo)
+      → run_production_training.remote() trên A100 (SKU không đảm bảo 80GB — report mới nhất thấy 40GB):
+          checkout SHA → warm cache attach (models+dataset từ Volume shared/, verified hoặc fallback download)
+          → verify_launch (advisory) → HF preflight (fail trước khi tốn dataset) → prepare_dataset
           → 5-fold OOF (mỗi fold train LoRA riêng, cold-start,brochure)
           → doc-disjoint eval → final train 7000q → ensemble resolve
           → private inference 2080q → submission.json/zip (exact 5, unique, đúng corpus)
@@ -159,12 +159,12 @@ cd LegalIR
 
 Mỗi tài khoản Modal/HF/Kaggle là không gian riêng — không chia sẻ gì ngoài code:
 
-1. **Modal (tài khoản của bạn):** `modal setup` bằng account bạn → tự tạo secrets `kaggle-secret`, `huggingface-secret` trong dashboard của bạn. Volume `legalir-production` tự tạo mới (rỗng) trong workspace của bạn → **bắt buộc chạy `--warm-only` 1 lần** trước run đầu tiên để nạp cache.
-2. **Hugging Face (token của bạn):** token WRITE của bạn không có quyền đẩy vào repo owner → đặt trong `.env`: `HF_REPO_ID=<username-của-bạn>/legalir-task1-reranker`. Preflight tự `create_repo(private=True)` nên không cần tạo tay; fail-closed nếu không verify được write access.
-3. **Kaggle (key của bạn):** dataset canonical public — down bằng key của bạn, không cần share.
-4. Còn lại chạy **y hệt** §1 (`--dry-run` trước, rồi `--warm --private --push-config --detach`). Attempt path/Volume/app ID của bạn độc lập hoàn toàn với owner.
+1. **Modal (tài khoản của bạn):** `modal setup` bằng account bạn → tự tạo secrets `kaggle-secret`, `huggingface-secret` trong dashboard của bạn. Volume `legalir-production` tự tạo mới (rỗng) trong workspace của bạn → **khuyến nghị chạy `--warm-only` 1 lần** trước run đầu tiên để nạp cache (không bắt buộc: thiếu cache thì A100 tự download + ghi nhận fallback, nhưng tốn GPU idle).
+2. **Hugging Face (repo của bạn):** mọi lệnh dispatch **bắt buộc** `--hf-repo <username-của-bạn>/legalir-task1-reranker` (hoặc `HF_REPO_ID` env/`.env`); thiếu là dry-run exit 2 BLOCKED chứ không âm thầm đẩy vào repo owner cũ. Kiểm tra read-only (không tạo repo) bằng `scripts/check_hf_repo.py --repo OWNER/REPO`. Preflight thật có `create_repo(private=True)` — là thao tác ghi ra ngoài, cần chấp thuận trước khi chạy. Repo public cho competition vẫn được, nhưng phải opt-in tường minh `--hf-allow-public-repo` (mặc định private-only fail-closed).
+3. **Kaggle (key của bạn):** dataset canonical dùng credential của bạn; không chia sẻ secret trong log.
+4. **Chưa chạy y hệt §1** trên account mới: trước hết giải quyết blocker repo đích, xác minh Modal profile, Volume/secrets riêng và kiểm định SHA trên GitHub. Attempt path/Volume/app ID độc lập hoàn toàn với owner.
 
-Checklist teammate sẵn sàng: clone được + `--dry-run` xanh + `--warm-only` xong + `HF_REPO_ID` trỏ repo của mình + hiểu §7 (lấy kết quả) và cách stop app.
+Checklist teammate sẵn sàng: clone đúng SHA đã push + `--dry-run` xanh **và** kiểm chứng remote profile/secrets/repo ID/visibility thật + warm asset fingerprint đúng + budget/stop được duyệt. Xem [fresh-run plan](docs/TASK1_FRESH_RUN_TIME_AND_SCORE_PLAN.md) để biết GO/NO-GO.
 
 ## 9. Rủi ro nói thẳng
 

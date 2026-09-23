@@ -63,6 +63,11 @@ def _run(repo: Path, bin_dir: Path, args=(), extra_env=None):
     env["PYTHON_BIN"] = str(py_stub)
     env["MODAL_BIN"] = str(modal_fake)
     env["GIT_CEILING_DIRECTORIES"] = str(repo.parent)
+    # These contract tests cover non-repo behavior; allow the owner-default HF
+    # repo here so the fresh-account gate (tested in
+    # test_hf_repo_forwarding.py) does not interfere. Never set HF_REPO_ID.
+    env["LEGALIR_ALLOW_DEFAULT_HF_REPO"] = "1"
+    env.pop("HF_REPO_ID", None)
     if extra_env and "LEGALIR_COMMIT_SHA" in extra_env:
         env["LEGALIR_COMMIT_SHA"] = extra_env["LEGALIR_COMMIT_SHA"]
     else:

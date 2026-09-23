@@ -56,6 +56,10 @@ def _run(repo: Path, bin_dir: Path, args=()):
     env["PYTHON_BIN"] = str(py_stub)
     env["MODAL_BIN"] = str(modal_fake)
     env.pop("LEGALIR_COMMIT_SHA", None)
+    # Detach tests are orthogonal to the fresh-account repo gate; allow the
+    # owner default here (the gate itself is covered in test_hf_repo_forwarding.py).
+    env["LEGALIR_ALLOW_DEFAULT_HF_REPO"] = "1"
+    env.pop("HF_REPO_ID", None)
     res = subprocess.run(
         [str(repo / "scripts/modal/run_modal_cli.sh"), *args],
         cwd=str(repo), env=env, capture_output=True, text=True, timeout=20,

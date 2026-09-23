@@ -74,6 +74,48 @@ def _strict() -> bool:
     return str(os.environ.get("LEGALIR_STRICT_GATES", "")).strip() == "1"
 
 
+def _resolve_hf_repo(explicit: str | None, allow_default: bool = True) -> tuple[str, str]:
+    """Resolve HF repo ID inside local or remote process (no token logging).
+
+    Precedence: explicit arg > HF_REPO_ID env > <repo>/.env > owner default.
+    Non-default sources are validated; invalid values raise ValueError.
+    With ``allow_default=False``, falling back to the previous owner's
+    default raises ValueError so dispatch fails loudly (local gate).
+    """
+    import sys as _sys
+
+    DEFAULT = "dangphuc2109/legalir-task1-reranker"
+    try:
+        from src.release.hf_repo import resolve_hf_repo_id as _resolve
+    except Exception:
+        # Minimal fallback when src is unavailable (e.g. bare container pre-clone):
+        # explicit > env > default with a light pattern check.
+        import re as _re
+
+        cand = str(explicit or "").strip() or str(os.environ.get("HF_REPO_ID", "")).strip()
+        src = "explicit" if str(explicit or "").strip() else ("env" if cand else "default")
+        repo = cand or DEFAULT
+        if not _re.fullmatch(r"[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+", repo):
+            raise ValueError(f"Invalid HF repo ID '{repo}' (source={src}; expected 'owner/repo').")
+        if src == "default" and not allow_default:
+            raise ValueError(
+                "HF repo ID is not set explicitly; refusing the previous owner's default repo. "
+                "Pass --hf-repo owner/repo."
+            )
+        return repo, src
+    # Local processes can read <repo>/.env; remote resolves after chdir so the
+    # checkout's .env is used. Pass the current repo dir when known.
+    repo_root = None
+    try:
+        mod = _sys.modules.get(__name__)
+        _ = mod  # keep hook for tests that monkeypatch module attrs
+        repo_root = _resolve_repo_dir()
+    except Exception:
+        repo_root = None
+    return _resolve(explicit=explicit, env=os.environ, repo_root=repo_root,
+                    default=DEFAULT, allow_default=allow_default)
+
+
 def _normalize_sha_label(expected_sha: str) -> str:
     """Accept any run label; strict mode still requires an exact 40-char SHA."""
     sha = str(expected_sha or "").strip()
@@ -163,37 +205,127 @@ def warmed_dataset_dir(volume_root: str | Path) -> Path:
     return Path(volume_root) / "shared" / "dataset"
 
 
-def attach_warmed_cache(volume_root: str | Path, repo_dir: str | Path) -> dict:
+def _looks_like_full_sha(value: object) -> bool:
+    return bool(re.fullmatch(r"[0-9a-f]{40}", str(value or "").strip()))
+
+
+def attach_warmed_cache(
+    volume_root: str | Path,
+    repo_dir: str | Path,
+    expected_sha: str | None = None,
+) -> dict:
     """Attach pre-warmed Volume cache so the A100 never downloads.
 
     - HF snapshot cache: sets HF_HUB_CACHE/HUGGINGFACE_HUB_CACHE/TRANSFORMERS_CACHE
       (+HF_HOME) at the warmed dir and mirrors its manifest.json into the repo
-      artifacts path consumed by train_reranker/CrossEncoderReranker.
+      artifacts path consumed by train_reranker/CrossEncoderReranker. The
+      manifest must list every registry model id with a non-empty existing
+      snapshot path AND the pinned revision from
+      src.models.bootstrap.MODEL_REGISTRY; a missing/empty/mismatched entry
+      fails closed to downloading (never silently reuses stale weights).
     - Dataset: when every REQUIRED_FILES entry exists warmed, pins
       LEGALIR_MODAL_DATASET_DIR at it so prepare_dataset skips the download.
+      Fingerprint verification still runs inside prepare_dataset.
+    - Source identity: ``expected_sha`` is the training job's SHA. When both
+      it and the warm manifest's ``source_sha`` are full 40-char SHAs and they
+      differ, the cache is NOT attached (warm-source-sha-mismatch) — a stale
+      checkout's cache is never treated as valid for another SHA. Short/dev
+      labels stay advisory.
 
-    Never raises; missing/partial cache simply falls back to downloading.
-    Returns a summary dict (models_attached, dataset_reused).
+    Never raises; missing/partial/stale cache simply falls back to
+    downloading. Returns a summary dict (models_attached, dataset_reused,
+    models_detail, dataset_detail, warm_source_sha, warm_requested_label,
+    warm_hf_repo) so the caller can persist how the A100 actually resolved
+    its inputs (cache hit vs download fallback).
     """
-    summary: dict[str, object] = {"models_attached": False, "dataset_reused": False}
+    summary: dict[str, object] = {
+        "models_attached": False,
+        "dataset_reused": False,
+        "models_detail": "missing",
+        "dataset_detail": "missing",
+        "warm_source_sha": "unknown",
+        "warm_requested_label": "unknown",
+        "warm_hf_repo": "unknown",
+    }
     try:
+        # Record warm provenance first so even a fallback decision is auditable.
+        try:
+            warm_manifest = Path(volume_root) / "shared" / "warm_manifest.json"
+            if warm_manifest.is_file():
+                warm_data = json.loads(warm_manifest.read_text(encoding="utf-8"))
+                if isinstance(warm_data, dict):
+                    summary["warm_source_sha"] = str(warm_data.get("source_sha", "unknown"))
+                    summary["warm_requested_label"] = str(warm_data.get("requested_label", warm_data.get("label", "unknown")))
+                    summary["warm_hf_repo"] = str(warm_data.get("hf_repo", "unknown"))
+        except Exception:
+            pass
+        warm_sha_ok = True
+        if _looks_like_full_sha(expected_sha) and _looks_like_full_sha(summary.get("warm_source_sha")):
+            if str(expected_sha).strip().lower() != str(summary["warm_source_sha"]).strip().lower():
+                warm_sha_ok = False
         models_dir = warmed_models_dir(volume_root)
         manifest = models_dir / "manifest.json"
-        required_ids = (
-            "BAAI/bge-reranker-v2-m3",
-            "CODE4LIFEOFFICIAL/huydang-dek21-embedding-v2",
-        )
-        ok = manifest.is_file()
-        if ok:
+        try:
+            from src.models.bootstrap import MODEL_REGISTRY as _REG
+        except Exception:
+            _REG = {}
+        # Every registry model must be present: a partial cache is not a hit.
+        # (The registry is the source of truth; a hardcoded subset silently
+        # blessed incomplete caches, and empty path/revision strings slipped
+        # through because Path("") resolves to "." which is_dir().)
+        if isinstance(_REG, dict) and len(_REG) > 0:
+            required_ids = tuple(_REG.keys())
+        else:
+            required_ids = ()
+        ok = manifest.is_file() and len(required_ids) > 0
+        if not manifest.is_file():
+            detail = "missing-manifest"
+        elif len(required_ids) == 0:
+            detail = "registry-unavailable"
+            ok = False
+        else:
             try:
                 data = json.loads(manifest.read_text(encoding="utf-8"))
-                ok = all(
-                    isinstance(data.get(mid), dict) and Path(str(data[mid].get("path", ""))).is_dir()
-                    for mid in required_ids
-                )
-            except Exception:
+                problems: list[str] = []
+                for mid in required_ids:
+                    entry = data.get(mid)
+                    if not isinstance(entry, dict):
+                        problems.append(f"{mid}:absent")
+                        continue
+                    raw_path = entry.get("path", "")
+                    snap = str(raw_path).strip() if isinstance(raw_path, str) else str(raw_path or "").strip()
+                    if not snap:
+                        problems.append(f"{mid}:path-empty")
+                        continue
+                    if not Path(snap).is_dir():
+                        problems.append(f"{mid}:missing-path")
+                        continue
+                    pinned = (_REG.get(mid) or {}).get("revision") if isinstance(_REG, dict) else None
+                    recorded = entry.get("revision", "")
+                    recorded = str(recorded).strip() if isinstance(recorded, str) else str(recorded or "").strip()
+                    if pinned and recorded != str(pinned).strip():
+                        # Empty recorded revision can never equal a pinned one:
+                        # fail closed to downloading instead of blessing it.
+                        problems.append(f"{mid}:revision-mismatch")
+                    elif not pinned and not recorded:
+                        problems.append(f"{mid}:revision-empty")
+                if problems:
+                    detail = "stale:" + ",".join(problems)
+                    ok = False
+                else:
+                    detail = "pinned-revisions-verified"
+            except Exception as exc:  # noqa: BLE001
+                detail = f"unreadable:{type(exc).__name__}"
                 ok = False
-        if ok:
+        summary["models_detail"] = detail
+        if not warm_sha_ok:
+            summary["models_detail"] = (
+                f"warm-source-sha-mismatch:warm={summary['warm_source_sha']} "
+                f"training={str(expected_sha).strip()}"
+            )
+            print(f"[*] Warm cache from another source ({summary['models_detail']}); "
+                  "A100 will download weights.", flush=True)
+        elif ok:
             for var in ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE", "TRANSFORMERS_CACHE", "HF_HOME"):
                 os.environ.setdefault(var, str(models_dir))
             # Mirror into the repo-local manifest path read by model loaders.
@@ -206,19 +338,29 @@ def attach_warmed_cache(volume_root: str | Path, repo_dir: str | Path) -> dict:
             summary["models_attached"] = True
             print(f"[*] Warmed models attached from {models_dir} (no HF download on A100).", flush=True)
         else:
-            print("[*] No complete warmed model cache; A100 will download weights.", flush=True)
+            print(f"[*] No complete warmed model cache ({detail}); A100 will download weights.", flush=True)
 
         from scripts.colab.bootstrap import REQUIRED_FILES
 
         ds_dir = warmed_dataset_dir(volume_root)
-        if all((ds_dir / name).is_file() for name in REQUIRED_FILES):
+        missing_ds = [n for n in REQUIRED_FILES if not (ds_dir / n).is_file()]
+        if not missing_ds and not warm_sha_ok:
+            summary["dataset_detail"] = (
+                f"warm-source-sha-mismatch:warm={summary['warm_source_sha']} "
+                f"training={str(expected_sha).strip()}"
+            )
+            print(f"[*] Warm dataset from another source; A100 will download it.", flush=True)
+        elif not missing_ds:
             os.environ.setdefault("LEGALIR_MODAL_DATASET_DIR", str(ds_dir))
             summary["dataset_reused"] = True
+            summary["dataset_detail"] = f"all-{len(REQUIRED_FILES)}-files-present"
             print(f"[*] Warmed dataset reused from {ds_dir} (no Kaggle download on A100).", flush=True)
         else:
-            print("[*] No complete warmed dataset; A100 will download it.", flush=True)
+            summary["dataset_detail"] = f"missing:{','.join(missing_ds[:5])}"
+            print(f"[*] No complete warmed dataset (missing {len(missing_ds)} files); A100 will download it.", flush=True)
     except Exception as exc:  # noqa: BLE001
         print(f"[!] Warm cache attach skipped: {type(exc).__name__}", flush=True)
+        summary["models_detail"] = f"error:{type(exc).__name__}"
     return summary
 
 # NOTE: CPU/RAM are Modal defaults (no explicit cpu/memory reservation).
@@ -242,6 +384,7 @@ def run_production_training(
     hf_allow_public_repo: bool = False,
     private: bool = False,
     reranker_config: str | None = None,
+    hf_repo: str | None = None,
 ):
     """
     Executes the A100 production training pipeline within a Modal container.
@@ -341,10 +484,33 @@ def run_production_training(
         os.chdir(repo_dir)
 
         # 1b. Attach pre-warmed Volume cache (models + dataset) so the A100
-        # bills zero download seconds. Falls back to downloading when absent.
+        # bills zero download seconds. Falls back to downloading when absent
+        # or stale; the summary records cache-hit vs download-fallback so
+        # operators can verify zero-download claims instead of assuming them.
         # Run scripts/modal/warm_volume.py (CPU-cheap) before dispatch.
         _update_state("warm_cache")
-        _warm_summary = attach_warmed_cache(_resolve_volume_mount(), repo_dir)
+        _warm_summary = attach_warmed_cache(_resolve_volume_mount(), repo_dir, expected_sha=sha)
+        try:
+            (attempt_dir / "warm_cache_summary.json").write_text(
+                json.dumps(
+                    {
+                        "models_attached": bool(_warm_summary.get("models_attached")),
+                        "dataset_reused": bool(_warm_summary.get("dataset_reused")),
+                        "models_detail": str(_warm_summary.get("models_detail", "")),
+                        "dataset_detail": str(_warm_summary.get("dataset_detail", "")),
+                        "warm_source_sha": str(_warm_summary.get("warm_source_sha", "unknown")),
+                        "warm_requested_label": str(_warm_summary.get("warm_requested_label", "unknown")),
+                        "warm_hf_repo": str(_warm_summary.get("warm_hf_repo", "unknown")),
+                        "training_sha": str(sha),
+                        "recorded_utc": _utc_now_iso(),
+                    },
+                    indent=2,
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[!] warm_cache_summary write skipped: {type(exc).__name__}", flush=True)
         _try_commit_best_effort()
 
         # Set test phase in remote environment
@@ -369,13 +535,22 @@ def run_production_training(
         _try_commit_best_effort()
 
         # 3. Preflight Hugging Face Access BEFORE expensive dataset acquisition.
+        # Explicit --hf-repo (local flag) wins over the container HF_REPO_ID env;
+        # both beat the owner default. The resolved ID is echoed (not a secret)
+        # so `modal app logs` confirms the destination account. New repos stay
+        # private; public requires the explicit operator override.
         from scripts.gates.run_a100 import preflight_huggingface_access
-        hf_repo = os.environ.get("HF_REPO_ID", "dangphuc2109/legalir-task1-reranker")
+        try:
+            resolved_hf_repo, hf_source = _resolve_hf_repo(hf_repo)
+        except ValueError as exc:
+            raise RuntimeError(f"Hugging Face repo ID rejected: {exc}") from None
         _update_state("hf_preflight")
-        print(f"[*] Verifying Hugging Face write access to {hf_repo}...")
+        print(f"[*] HF repo: {resolved_hf_repo} (source={hf_source}); verifying write access...")
+        if hf_source == "default":
+            print("[!] Using owner-default HF repo; fresh accounts should pass --hf-repo owner/repo.", flush=True)
         if hf_allow_public_repo:
             print("[!] OPERATOR OVERRIDE: public HF repos permitted for this launch (recorded in manifest).", flush=True)
-        hf_ok, hf_detail = preflight_huggingface_access(hf_repo, allow_public_repo=hf_allow_public_repo)
+        hf_ok, hf_detail = preflight_huggingface_access(resolved_hf_repo, allow_public_repo=hf_allow_public_repo)
         if not hf_ok:
             raise RuntimeError(f"Hugging Face preflight failed: {hf_detail}")
         print(f"[+] {hf_detail}")
@@ -415,7 +590,7 @@ def run_production_training(
             precision="bf16",
             allow_non_a100=False,
             mock=False,
-            hf_repo=hf_repo,
+            hf_repo=resolved_hf_repo,
             freeze_file_path=freeze_file,
             run_mode="full",
             hf_allow_public_repo=hf_allow_public_repo,
@@ -464,6 +639,8 @@ def main(
     private: bool = False,
     push_config: bool = False,
     reranker_config: str = "",
+    hf_repo: str = "",
+    allow_default_hf_repo: bool = False,
 ):
     import sys
     # Try to grab the SHA from local git if we are in the repo, or from env.
@@ -508,6 +685,31 @@ def main(
     print(f"[*] Evaluation Phase: {test_phase.upper()} ({'2,080 queries' if test_phase == 'private' else '1,000 queries'})")
     if cfg_to_send:
         print(f"[*] Reranker Config: {cfg_to_send}")
+    try:
+        from src.release.hf_repo import default_allowed as _default_allowed
+        from src.release.hf_repo import resolve_hf_repo_id as _resolve_repo
+
+        _local_root = Path(__file__).resolve().parents[2]
+        _allow = bool(allow_default_hf_repo or _default_allowed())
+        resolved_repo, resolved_source = _resolve_repo(
+            explicit=str(hf_repo or "").strip() or None,
+            env=os.environ,
+            repo_root=_local_root,
+            allow_default=_allow,
+        )
+        if resolved_source == "default" and not _allow:
+            raise ValueError(
+                "HF repo ID is not set explicitly; refusing the previous owner's default. "
+                "Pass --hf-repo owner/repo."
+            )
+    except ValueError as exc:
+        print(f"[!] BLOCKED: {exc}", file=sys.stderr)
+        sys.exit(2)
+    # Repo ID is not a secret; echo it so the operator can confirm the
+    # destination account before GPU billing starts. Tokens are never printed.
+    print(f"[*] HF repo: {resolved_repo} (source={resolved_source})", flush=True)
+    if resolved_source == "default":
+        print("[!] Fresh accounts should pass --hf-repo owner/repo; default targets the previous owner's repo.", flush=True)
     print(f"[*] Remote timeout: {TIMEOUT_SECONDS}s (no quality/time gate; set MODAL_TIMEOUT_SECONDS only to cap spend).")
     print("[*] Durable outputs use /root/legalir_volume/<label>/attempts/<id>/ on the 'legalir-production' Volume.")
     print("[*] Supervision: default `modal run` is ATTACHED — client disconnect terminates")
@@ -526,5 +728,6 @@ def main(
         hf_allow_public_repo=hf_allow_public_repo,
         private=(test_phase == "private"),
         reranker_config=cfg_to_send,
+        hf_repo=resolved_repo,
     )
     print(f"[*] Remote job finished with result: {result}")

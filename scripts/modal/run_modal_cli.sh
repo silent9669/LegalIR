@@ -56,8 +56,33 @@ SHOW_HELP=0
 PUSH_CONFIG=""
 WARM_MODE=0
 WARM_ONLY=0
+HF_REPO_FLAG=""
+HF_REPO_SOURCE="default"
+ALLOW_DEFAULT_HF_REPO=0
 
-for arg in "$@"; do
+dotenv_hf_repo() {
+  # Extract HF_REPO_ID from .env without sourcing secrets (never echo tokens).
+  _env_file="$REPO_ROOT/.env"
+  if [ ! -f "$_env_file" ]; then
+    return 1
+  fi
+  _line="$(grep -E '^[[:space:]]*(export[[:space:]]+)?HF_REPO_ID[[:space:]]*=' "$_env_file" 2>/dev/null | tail -n 1 || true)"
+  if [ -z "$_line" ]; then
+    return 1
+  fi
+  _val="$(printf '%s' "$_line" | sed -E 's/^[[:space:]]*(export[[:space:]]+)?HF_REPO_ID[[:space:]]*=[[:space:]]*//' | sed -E "s/[[:space:]]+#.*$//" | sed -E "s/^'(.*)'\$/\1/" | sed -E 's/^"(.*)"$/\1/' | tr -d '[:space:]')"
+  if [ -z "$_val" ]; then
+    return 1
+  fi
+  printf '%s' "$_val"
+}
+
+valid_hf_repo() {
+  printf '%s' "$1" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'
+}
+
+while [ "$#" -gt 0 ]; do
+  arg="$1"
   case "$arg" in
     --hf-allow-public-repo)
       if [ -n "$HF_PUBLIC_FLAG" ]; then
@@ -65,6 +90,7 @@ for arg in "$@"; do
         exit 2
       fi
       HF_PUBLIC_FLAG="--hf-allow-public-repo"
+      shift
       ;;
     --no-hf-allow-public-repo)
       if [ -n "$HF_PUBLIC_FLAG" ]; then
@@ -72,6 +98,37 @@ for arg in "$@"; do
         exit 2
       fi
       HF_PUBLIC_FLAG="--no-hf-allow-public-repo"
+      shift
+      ;;
+    --hf-repo=*|--hf-repo-id=*)
+      if [ -n "$HF_REPO_FLAG" ]; then
+        echo "[!] Duplicate --hf-repo flag." >&2
+        exit 2
+      fi
+      HF_REPO_FLAG="${arg#*=}"
+      HF_REPO_SOURCE="flag"
+      shift
+      ;;
+    --hf-repo|--hf-repo-id)
+      if [ -n "$HF_REPO_FLAG" ]; then
+        echo "[!] Duplicate --hf-repo flag." >&2
+        exit 2
+      fi
+      if [ "$#" -lt 2 ]; then
+        echo "[!] --hf-repo requires a value 'owner/repo'." >&2
+        exit 2
+      fi
+      HF_REPO_FLAG="$2"
+      HF_REPO_SOURCE="flag"
+      shift 2
+      ;;
+    --allow-default-hf-repo)
+      if [ "$ALLOW_DEFAULT_HF_REPO" -ne 0 ]; then
+        echo "[!] Duplicate --allow-default-hf-repo flag." >&2
+        exit 2
+      fi
+      ALLOW_DEFAULT_HF_REPO=1
+      shift
       ;;
     --private)
       if [ -n "$PRIVATE_FLAG" ]; then
@@ -80,6 +137,7 @@ for arg in "$@"; do
       fi
       PRIVATE_FLAG="--private"
       export LEGALIR_TEST_PHASE="private"
+      shift
       ;;
     --push-config)
       if [ -n "$PUSH_CONFIG" ]; then
@@ -88,6 +146,7 @@ for arg in "$@"; do
       fi
       PUSH_CONFIG="configs/experiments/reranker_lora_v3_push.yaml"
       export LEGALIR_RERANKER_CONFIG="$PUSH_CONFIG"
+      shift
       ;;
     --detach)
       if [ "$DETACH_MODE" -ne 0 ]; then
@@ -95,6 +154,7 @@ for arg in "$@"; do
         exit 2
       fi
       DETACH_MODE=1
+      shift
       ;;
     --warm)
       if [ "$WARM_MODE" -ne 0 ] || [ "$WARM_ONLY" -ne 0 ]; then
@@ -102,6 +162,7 @@ for arg in "$@"; do
         exit 2
       fi
       WARM_MODE=1
+      shift
       ;;
     --warm-only)
       if [ "$WARM_MODE" -ne 0 ] || [ "$WARM_ONLY" -ne 0 ]; then
@@ -109,12 +170,14 @@ for arg in "$@"; do
         exit 2
       fi
       WARM_ONLY=1
+      shift
       ;;
     -h|--help)
       SHOW_HELP=1
+      shift
       ;;
     *)
-      echo "[!] Unknown argument: $arg (expected --hf-allow-public-repo, --detach, --private, --push-config, --warm, --warm-only)" >&2
+      echo "[!] Unknown argument: $arg (expected --hf-allow-public-repo, --allow-default-hf-repo, --detach, --private, --push-config, --warm, --warm-only, --hf-repo owner/repo)" >&2
       exit 2
       ;;
   esac
@@ -122,7 +185,7 @@ done
 
 if [ "$SHOW_HELP" -eq 1 ]; then
   cat <<'EOF'
-Usage: scripts/modal/run_modal_cli.sh [--hf-allow-public-repo] [--detach] [--private] [--push-config] [--warm] [--warm-only]
+Usage: scripts/modal/run_modal_cli.sh [--hf-allow-public-repo] [--allow-default-hf-repo] [--detach] [--private] [--push-config] [--warm] [--warm-only] [--hf-repo owner/repo]
 
 Recommended Modal entrypoint (no release required; SHA/tree checks advisory
 unless LEGALIR_STRICT_GATES=1).
@@ -140,6 +203,16 @@ unless LEGALIR_STRICT_GATES=1).
                            models + dataset), then dispatch A100. Recommended:
                            A100 bills zero download seconds.
   --warm-only              Only warm the shared Volume (no A100 dispatch).
+  --hf-repo owner/repo     Explicit HF repo for artifacts. Wins over
+                            HF_REPO_ID env and .env. REQUIRED: without it the
+                            wrapper exits 2 instead of silently targeting the
+                            previous owner's repo (opt out with
+                            --allow-default-hf-repo, offline/dev only).
+                            The ID is echoed (not a secret); tokens
+                            are never printed.
+  --allow-default-hf-repo    Explicit opt-out for offline/dev runs: permit the
+                            owner-default HF repo. Never use for a fresh-account
+                            production run.
   --detach                 Explicit opt-in to `modal run --detach` (app survives
                            client disconnect). Default is attached: client
                            disconnect terminates remote tasks even with a
@@ -161,6 +234,37 @@ if [ ! -x "$MODAL_BIN" ] && [ ! -f "$MODAL_BIN" ]; then
   echo "[!] MODAL_BIN not found: $MODAL_BIN (install modal CLI and authenticate)" >&2
   exit 2
 fi
+
+# Resolve HF repo ID explicitly BEFORE any cloud/preflight work so a typo
+# fails fast: flag > env > .env > owner default. The ID is not a secret;
+# echoing it confirms the destination account.
+HF_REPO_DEFAULT="dangphuc2109/legalir-task1-reranker"
+if [ -z "$HF_REPO_FLAG" ]; then
+  if [ -n "${HF_REPO_ID:-}" ]; then
+    HF_REPO_FLAG="$HF_REPO_ID"
+    HF_REPO_SOURCE="env"
+  else
+    if _dotenv_val="$(dotenv_hf_repo)"; then
+      HF_REPO_FLAG="$_dotenv_val"
+      HF_REPO_SOURCE="dotenv"
+    else
+      HF_REPO_FLAG="$HF_REPO_DEFAULT"
+      HF_REPO_SOURCE="default"
+    fi
+  fi
+fi
+if ! valid_hf_repo "$HF_REPO_FLAG"; then
+  echo "[!] Invalid HF repo ID '$HF_REPO_FLAG' (source=$HF_REPO_SOURCE; expected 'owner/repo')." >&2
+  exit 2
+fi
+if [ "$HF_REPO_SOURCE" = "default" ] && [ "$ALLOW_DEFAULT_HF_REPO" -ne 1 ] && [ "${LEGALIR_ALLOW_DEFAULT_HF_REPO:-}" != "1" ]; then
+  echo "[!] BLOCKED: HF repo $HF_REPO_FLAG is the previous owner's default (source=default)." >&2
+  echo "    Fresh accounts must pass --hf-repo owner/repo (or set HF_REPO_ID env/.env)." >&2
+  echo "    Opt out explicitly with --allow-default-hf-repo only for offline/dev runs." >&2
+  exit 2
+fi
+export HF_REPO_ID="$HF_REPO_FLAG"
+echo "[*] HF repo: $HF_REPO_FLAG (source=$HF_REPO_SOURCE)"
 
 # Run label from env or exact local HEAD (advisory unless LEGALIR_STRICT_GATES=1).
 if [ -n "${LEGALIR_COMMIT_SHA:-}" ]; then
@@ -217,6 +321,7 @@ fi
 if [ -n "$PUSH_CONFIG" ]; then
   MODAL_ARGS+=("--push-config")
 fi
+MODAL_ARGS+=("--hf-repo" "$HF_REPO_FLAG")
 
 DETACH_OPT=""
 if [ "$DETACH_MODE" -eq 1 ]; then
@@ -224,9 +329,11 @@ if [ "$DETACH_MODE" -eq 1 ]; then
 fi
 
 # CPU-cheap Volume warm (models + dataset) before any A100 billing.
+# Warm and training jobs receive the same explicit HF repo so adapter warm
+# (when enabled) and the final upload target the same account.
 if [ "$WARM_MODE" -eq 1 ] || [ "$WARM_ONLY" -eq 1 ]; then
   echo "[*] Warming shared Volume cache on CPU (no GPU billed)..."
-  if ! LEGALIR_COMMIT_SHA="$EXPECTED_SHA" "$MODAL_BIN" run scripts/modal/warm_volume.py; then
+  if ! HF_REPO_ID="$HF_REPO_FLAG" LEGALIR_COMMIT_SHA="$EXPECTED_SHA" "$MODAL_BIN" run scripts/modal/warm_volume.py --hf-repo "$HF_REPO_FLAG"; then
     echo "[!] Volume warm failed; aborting before A100 dispatch." >&2
     exit 1
   fi
@@ -256,7 +363,7 @@ else
   echo "    termination via Modal, not just client exit. No automatic relaunch."
 fi
 if [ -n "$DETACH_OPT" ]; then
-  LEGALIR_COMMIT_SHA="$EXPECTED_SHA" "$MODAL_BIN" run --detach scripts/modal/run_modal_a100.py "${MODAL_ARGS[@]}"
+  HF_REPO_ID="$HF_REPO_FLAG" LEGALIR_COMMIT_SHA="$EXPECTED_SHA" "$MODAL_BIN" run --detach scripts/modal/run_modal_a100.py "${MODAL_ARGS[@]}"
 else
-  LEGALIR_COMMIT_SHA="$EXPECTED_SHA" "$MODAL_BIN" run scripts/modal/run_modal_a100.py "${MODAL_ARGS[@]}"
+  HF_REPO_ID="$HF_REPO_FLAG" LEGALIR_COMMIT_SHA="$EXPECTED_SHA" "$MODAL_BIN" run scripts/modal/run_modal_a100.py "${MODAL_ARGS[@]}"
 fi

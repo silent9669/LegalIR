@@ -114,13 +114,16 @@ def test_attach_warmed_cache_attaches_and_reuses(tmp_path, monkeypatch):
     vol = tmp_path / "volume"
     models = vol / "shared" / "models" / "huggingface"
     models.mkdir(parents=True)
-    snap_r = models / "snap-reranker"
-    snap_d = models / "snap-dense"
-    snap_r.mkdir()
-    snap_d.mkdir()
+    from src.models.bootstrap import MODEL_REGISTRY as _REG
+
+    snaps = {}
+    for mid in _REG:
+        d = models / ("snap-" + mid.split("/")[-1].replace("-", "_"))
+        d.mkdir()
+        snaps[mid] = d
     (models / "manifest.json").write_text(json.dumps({
-        "BAAI/bge-reranker-v2-m3": {"path": str(snap_r), "revision": "r"},
-        "CODE4LIFEOFFICIAL/huydang-dek21-embedding-v2": {"path": str(snap_d), "revision": "r"},
+        mid: {"path": str(snaps[mid]), "revision": _REG[mid]["revision"]}
+        for mid in _REG
     }), encoding="utf-8")
     ds = vol / "shared" / "dataset"
     ds.mkdir(parents=True)
@@ -135,12 +138,13 @@ def test_attach_warmed_cache_attaches_and_reuses(tmp_path, monkeypatch):
                 "HF_HOME", "LEGALIR_MODAL_DATASET_DIR"):
         monkeypatch.delenv(var, raising=False)
     out = mod.attach_warmed_cache(vol, repo)
-    assert out == {"models_attached": True, "dataset_reused": True}
+    assert out["models_attached"] is True and out["dataset_reused"] is True
+    assert out.get("models_detail") == "pinned-revisions-verified"
     assert os.environ["HF_HUB_CACHE"] == str(models)
     assert os.environ["LEGALIR_MODAL_DATASET_DIR"] == str(ds)
     mirrored = repo / "artifacts" / "local" / "models" / "huggingface" / "manifest.json"
     assert mirrored.is_file()
-    assert json.loads(mirrored.read_text(encoding="utf-8"))["BAAI/bge-reranker-v2-m3"]["path"] == str(snap_r)
+    assert json.loads(mirrored.read_text(encoding="utf-8"))["BAAI/bge-reranker-v2-m3"]["path"] == str(snaps["BAAI/bge-reranker-v2-m3"])
 
 
 def test_attach_warmed_cache_falls_back_when_absent(tmp_path, monkeypatch, capsys):
@@ -153,7 +157,8 @@ def test_attach_warmed_cache_falls_back_when_absent(tmp_path, monkeypatch, capsy
                 "HF_HOME", "LEGALIR_MODAL_DATASET_DIR"):
         monkeypatch.delenv(var, raising=False)
     out = mod.attach_warmed_cache(vol, repo)
-    assert out == {"models_attached": False, "dataset_reused": False}
+    assert out["models_attached"] is False and out["dataset_reused"] is False
+    assert "models_detail" in out and "dataset_detail" in out
     for var in ("HF_HUB_CACHE", "LEGALIR_MODAL_DATASET_DIR"):
         assert var not in os.environ
 
@@ -175,3 +180,108 @@ def test_attach_warmed_cache_partial_models_falls_back(tmp_path, monkeypatch):
     out = mod.attach_warmed_cache(vol, repo)
     assert out["models_attached"] is False
     assert "HF_HUB_CACHE" not in os.environ
+
+
+def _write_valid_model_cache(vol: Path) -> Path:
+    from src.models.bootstrap import MODEL_REGISTRY as _REG
+
+    models = vol / "shared" / "models" / "huggingface"
+    models.mkdir(parents=True, exist_ok=True)
+    for mid in _REG:
+        d = models / ("snap-" + mid.split("/")[-1].replace("-", "_"))
+        d.mkdir(exist_ok=True)
+    (models / "manifest.json").write_text(json.dumps({
+        mid: {"path": str(models / ("snap-" + mid.split("/")[-1].replace("-", "_"))),
+              "revision": _REG[mid]["revision"]}
+        for mid in _REG
+    }), encoding="utf-8")
+    return models
+
+
+def _write_dataset_files(vol: Path) -> Path:
+    from scripts.colab.bootstrap import REQUIRED_FILES
+
+    ds = vol / "shared" / "dataset"
+    ds.mkdir(parents=True, exist_ok=True)
+    for name in REQUIRED_FILES:
+        (ds / name).write_bytes(b"")
+    return ds
+
+
+def test_checkout_requested_sha_fails_closed_on_full_sha_mismatch(tmp_path):
+    import subprocess
+
+    w = _load_warm()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    env = dict(__import__("os").environ, GIT_CONFIG_NOSYSTEM="1")
+    subprocess.run(["git", "init", "-q"], cwd=str(repo), env=env, check=True)
+    subprocess.run(["git", "config", "user.email", "t@t.t"], cwd=str(repo), env=env, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=str(repo), env=env, check=True)
+    (repo / "f.txt").write_text("x\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=str(repo), env=env, check=True)
+    subprocess.run(["git", "commit", "-qm", "init"], cwd=str(repo), env=env, check=True)
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=str(repo), env=env, text=True).strip()
+    assert w._checkout_requested_sha(repo, head) == head
+    # Advisory labels never raise.
+    assert w._checkout_requested_sha(repo, "dev")
+    # A definitive full-SHA mismatch fails closed.
+    import pytest as _pytest
+
+    with _pytest.raises(RuntimeError, match="mismatch"):
+        w._checkout_requested_sha(repo, "0" * 40)
+
+
+def test_checkout_requested_sha_never_asserts_unreadable_head(tmp_path):
+    """Unverifiable provenance: 'unknown', never the requested string."""
+    import pytest as _pytest
+
+    w = _load_warm()
+    plain = tmp_path / "not-a-repo"
+    plain.mkdir()
+    assert w._checkout_requested_sha(plain, "dev") == "unknown"
+    with _pytest.raises(RuntimeError, match="unverifiable|failed"):
+        w._checkout_requested_sha(plain, "a" * 40)
+
+
+def test_attach_rejects_cache_from_another_source_sha(tmp_path, monkeypatch):
+    mod = _load_launcher()
+    vol = tmp_path / "vol"
+    _write_valid_model_cache(vol)
+    _write_dataset_files(vol)
+    (vol / "shared" / "warm_manifest.json").write_text(json.dumps({
+        "requested_label": "b" * 40,
+        "source_sha": "b" * 40,
+        "hf_repo": "someone/repo",
+    }), encoding="utf-8")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    for var in ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE", "TRANSFORMERS_CACHE",
+                "HF_HOME", "LEGALIR_MODAL_DATASET_DIR"):
+        monkeypatch.delenv(var, raising=False)
+    out = mod.attach_warmed_cache(vol, repo, expected_sha="a" * 40)
+    assert out["models_attached"] is False and out["dataset_reused"] is False
+    assert "warm-source-sha-mismatch" in str(out["models_detail"])
+    assert out["warm_source_sha"] == "b" * 40
+    assert "HF_HUB_CACHE" not in os.environ
+    assert "LEGALIR_MODAL_DATASET_DIR" not in os.environ
+
+
+def test_attach_accepts_cache_with_matching_source_sha(tmp_path, monkeypatch):
+    mod = _load_launcher()
+    vol = tmp_path / "vol"
+    _write_valid_model_cache(vol)
+    _write_dataset_files(vol)
+    (vol / "shared" / "warm_manifest.json").write_text(json.dumps({
+        "requested_label": "a" * 40,
+        "source_sha": "a" * 40,
+        "hf_repo": "someone/repo",
+    }), encoding="utf-8")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    for var in ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE", "TRANSFORMERS_CACHE",
+                "HF_HOME", "LEGALIR_MODAL_DATASET_DIR"):
+        monkeypatch.delenv(var, raising=False)
+    out = mod.attach_warmed_cache(vol, repo, expected_sha="a" * 40)
+    assert out["models_attached"] is True and out["dataset_reused"] is True
+    assert out["warm_source_sha"] == "a" * 40

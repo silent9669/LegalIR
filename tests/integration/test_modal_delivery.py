@@ -490,14 +490,29 @@ def test_modal_forwards_explicit_consent(launcher, monkeypatch):
 
     monkeypatch.setattr(boot, "verify_launch", lambda *a, **k: {"ok": True})
     monkeypatch.setenv("LEGALIR_COMMIT_SHA", VALID_SHA)
-    launcher.main(hf_allow_public_repo=True)
+    monkeypatch.delenv("HF_REPO_ID", raising=False)
+    monkeypatch.delenv("LEGALIR_ALLOW_DEFAULT_HF_REPO", raising=False)
+    # Hermetic: ignore any developer-checkout .env so the gate sees "default".
+    import src.release.hf_repo as _hfrepo
+
+    monkeypatch.setattr(_hfrepo, "dotenv_hf_repo_id", lambda *a, **k: None)
+    # Fresh-account gate: main() without an explicit repo is BLOCKED, not dispatched.
+    with pytest.raises(SystemExit) as blocked:
+        launcher.main(hf_allow_public_repo=True)
+    assert blocked.value.code == 2
+    assert forwarded == {}
+    launcher.main(hf_allow_public_repo=True, hf_repo="fresh-user/fresh-repo")
     assert forwarded["consent"] is True
     assert forwarded["sha"] == VALID_SHA
-    launcher.main(hf_allow_public_repo=False)
+    assert forwarded["hf_repo"] == "fresh-user/fresh-repo"
+    launcher.main(hf_allow_public_repo=False, hf_repo="fresh-user/fresh-repo")
     assert forwarded["consent"] is False
+    assert forwarded["hf_repo"] == "fresh-user/fresh-repo"
 
     # Verify forwarding of private phase and push_config
-    launcher.main(hf_allow_public_repo=True, private=True, push_config=True)
+    launcher.main(hf_allow_public_repo=True, private=True, push_config=True,
+                  hf_repo="fresh-user/fresh-repo")
     assert forwarded["consent"] is True
     assert forwarded["private"] is True
     assert forwarded["reranker_config"] == "configs/experiments/reranker_lora_v3_push.yaml"
+    assert forwarded["hf_repo"] == "fresh-user/fresh-repo"

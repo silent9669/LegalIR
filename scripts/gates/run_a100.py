@@ -413,7 +413,17 @@ def run_a100_production_gate(
     print(f"  • Precision          : {prec_norm}", flush=True)
 
     # Hugging Face release preflight (fail fast on rejected tokens, before GPU burn)
-    target_hf_repo_early = hf_repo or os.environ.get("HF_REPO_ID", "dangphuc2109/legalir-task1-reranker")
+    # Explicit hf_repo wins over HF_REPO_ID env over the owner default; the ID
+    # is validated locally so a fresh-account typo fails here, not after hours
+    # of GPU billing. The ID itself is not a secret; tokens are never logged.
+    target_hf_repo_early = (hf_repo or os.environ.get("HF_REPO_ID", "dangphuc2109/legalir-task1-reranker") or "").strip()
+    try:
+        from src.release.hf_repo import validate_hf_repo_id as _validate_repo
+
+        target_hf_repo_early = _validate_repo(target_hf_repo_early)
+    except ValueError as exc:
+        raise RuntimeError(f"Hugging Face repo ID rejected: {exc}") from None
+    print(f"  • Hugging Face repo  : {target_hf_repo_early}", flush=True)
     if not mock:
         hf_ok, hf_detail = preflight_huggingface_access(target_hf_repo_early, hf_token, allow_public_repo=hf_allow_public_repo)
         print(f"  • Hugging Face       : {hf_detail}", flush=True)
@@ -531,7 +541,8 @@ def run_a100_production_gate(
 
     # 10. Hugging Face Release Upload & Immutable Revision Capture
     # Mock mode never touches the release repo: artifacts are synthetic.
-    target_hf_repo = hf_repo or os.environ.get("HF_REPO_ID", "dangphuc2109/legalir-task1-reranker")
+    # Reuse the validated early repo so preflight and upload cannot diverge.
+    target_hf_repo = target_hf_repo_early
     if mock:
         print("[*] Mock mode: skipping Hugging Face upload (no release commit).", flush=True)
         manifest["huggingface"] = {"repo_id": target_hf_repo, "uploaded": False, "reason": "mock mode"}

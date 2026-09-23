@@ -624,6 +624,15 @@ class OOFRunner:
         t0 = time.time()
         window_size = min(32, max(1, self.reranker_batch_size))
         val_id_batches = [val_ids[i : i + window_size] for i in range(0, len(val_ids), window_size)]
+        # Held-out stage clocks (durations/counts only; never query/doc text).
+        # Existing fold reports lump retrieval+rerank+features into one
+        # elapsed number; splitting them lets a pilot rank the bottleneck by
+        # measurement instead of guessing.
+        retrieval_seconds = 0.0
+        rerank_seconds = 0.0
+        post_rerank_seconds = 0.0
+        rerank_query_windows = 0
+        rerank_candidate_docs = 0
 
         for batch_qids in tqdm(val_id_batches, desc=f"Fold {fold_idx} OOF Inference", leave=False):
             window_items: list[tuple[str, str, list[CandidateRecord], float]] = []
@@ -656,18 +665,22 @@ class OOFRunner:
                         "dense": cached_s.get("dense", []),
                     }
 
-                candidates: list[CandidateRecord] = hybrid_engine.search_candidates(
+                candidates: list[CandidateRecord] = []
+                t_ret0 = time.perf_counter()
+                candidates = hybrid_engine.search_candidates(
                     query=q_text,
                     top_k=self.candidate_k,
                     exclude_qid=str(qid),
                     q_emb=q_emb,
                     branch_candidates=branch_cands,
                 )
+                retrieval_seconds += time.perf_counter() - t_ret0
                 cand_ids = [str(c["doc_id"]) for c in candidates]
                 fold_candidates[qid] = cand_ids
                 window_items.append((qid, q_text, candidates, t_q0))
 
             # Rerank batch across the query window
+            t_rr0 = time.perf_counter()
             if reranker is not None and self.evidence_builder is not None:
                 q_cands = [(item[1], item[2]) for item in window_items]
                 if hasattr(reranker, "rerank_batch"):
@@ -692,8 +705,12 @@ class OOFRunner:
                     ]
             else:
                 reranked_list = [item[2] for item in window_items]
+            rerank_seconds += time.perf_counter() - t_rr0
+            rerank_query_windows += len(window_items)
+            rerank_candidate_docs += sum(len(item[2]) for item in window_items)
 
             for (qid, q_text, _, t_q0), candidates in zip(window_items, reranked_list):
+                t_post0 = time.perf_counter()
                 # Extract features for candidate union AFTER reranking
                 feat_df = extract_candidate_features(
                     query_id=qid,
@@ -719,6 +736,7 @@ class OOFRunner:
                 top5 = self.selector.select(ranked)
                 fold_preds[qid] = top5
                 fold_runtimes[qid] = time.time() - t_q0
+                post_rerank_seconds += time.perf_counter() - t_post0
 
         elapsed_total = time.time() - t0
 
@@ -734,6 +752,23 @@ class OOFRunner:
         fold_metrics["fold"] = fold_idx
         fold_metrics["val_queries"] = len(val_ids)
         fold_metrics["elapsed_seconds"] = elapsed_total
+        # Stage breakdown for bottleneck ranking (all derived from the same
+        # workload; no private text stored).
+        fold_metrics["retrieval_seconds"] = round(retrieval_seconds, 3)
+        fold_metrics["rerank_seconds"] = round(rerank_seconds, 3)
+        fold_metrics["post_rerank_seconds"] = round(post_rerank_seconds, 3)
+        fold_metrics["rerank_query_windows"] = int(rerank_query_windows)
+        fold_metrics["rerank_candidate_docs"] = int(rerank_candidate_docs)
+        try:
+            if reranker is not None and hasattr(reranker, "get_stage_timings"):
+                fold_metrics["reranker_stage_timings"] = reranker.get_stage_timings()
+        except Exception:
+            pass
+        try:
+            if self.evidence_builder is not None and hasattr(self.evidence_builder, "get_qinfo_cache_stats"):
+                fold_metrics["evidence_qinfo_cache"] = self.evidence_builder.get_qinfo_cache_stats()
+        except Exception:
+            pass
 
         # Verify exact Codabench official scorer equivalence
         assert_official_equivalence(fold_preds, fold_gold)

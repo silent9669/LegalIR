@@ -35,7 +35,13 @@ def _mean(scores_list: list[list[float]]) -> list[float]:
 def build_ensemble_score_fn(
     members: list[Any],
 ) -> Callable[..., list[float]]:
-    """Return a ``score_fn(pairs, batch_size, max_length)`` averaging members."""
+    """Return a ``score_fn(pairs, batch_size, max_length)`` averaging members.
+
+    The wrapper records lightweight per-member timing on
+    ``_score_fn.timings`` (durations/pair counts only; never pair text) so a
+    pilot can rank ensemble overhead by measurement. Scoring stays strictly
+    sequential and output-identical; no token/forward reuse is attempted here.
+    """
     if not members:
         raise ValueError("Ensemble needs at least one member reranker")
 
@@ -44,12 +50,30 @@ def build_ensemble_score_fn(
         batch_size: int | None = None,
         max_length: int | None = None,
     ) -> list[float]:
-        per_member = [
-            m.score_pairs(pairs, batch_size=batch_size, max_length=max_length)
-            for m in members
-        ]
+        import time as _time
+
+        per_member = []
+        timings = getattr(_score_fn, "timings", None)
+        if not isinstance(timings, dict):
+            timings = {"calls": 0, "pairs_scored": 0, "total_seconds": 0.0,
+                       "per_member_seconds": [0.0] * len(members)}
+            _score_fn.timings = timings  # type: ignore[attr-defined]
+        call_t0 = _time.perf_counter()
+        for i, m in enumerate(members):
+            t0 = _time.perf_counter()
+            per_member.append(m.score_pairs(pairs, batch_size=batch_size, max_length=max_length))
+            dt = _time.perf_counter() - t0
+            try:
+                timings["per_member_seconds"][i] += dt
+            except Exception:
+                pass
+        timings["calls"] += 1
+        timings["pairs_scored"] += len(pairs)
+        timings["total_seconds"] += _time.perf_counter() - call_t0
         return _mean(per_member)
 
+    _score_fn.timings = {"calls": 0, "pairs_scored": 0, "total_seconds": 0.0,  # type: ignore[attr-defined]
+                         "per_member_seconds": [0.0] * len(members)}
     return _score_fn
 
 

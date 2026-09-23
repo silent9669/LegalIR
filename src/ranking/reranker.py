@@ -54,6 +54,37 @@ class CrossEncoderReranker:
         self.initial_batch_size: int = self.batch_size
         self.min_successful_batch_size: int = self.batch_size
         self.last_successful_batch_size: int = self.batch_size
+        # Lightweight stage clocks (durations/counts only; never query/passage
+        # text). Split tokenizer vs host->device transfer vs GPU forward so a
+        # pilot can rank CPU-preprocess vs GPU-idle bottlenecks by measurement.
+        self.load_seconds: float = 0.0
+        self.stage_timings: dict[str, float] = {
+            "tokenize_seconds": 0.0,
+            "transfer_seconds": 0.0,
+            "forward_seconds": 0.0,
+        }
+        self.stage_counts: dict[str, int] = {"batches": 0, "pairs": 0}
+
+    def get_stage_timings(self) -> dict[str, float | int]:
+        """Copy of stage clocks (no private text, no secrets)."""
+        return {
+            "load_seconds": round(float(self.load_seconds), 4),
+            "tokenize_seconds": round(float(self.stage_timings.get("tokenize_seconds", 0.0)), 4),
+            "transfer_seconds": round(float(self.stage_timings.get("transfer_seconds", 0.0)), 4),
+            "forward_seconds": round(float(self.stage_timings.get("forward_seconds", 0.0)), 4),
+            "batches": int(self.stage_counts.get("batches", 0)),
+            "pairs": int(self.stage_counts.get("pairs", 0)),
+            "oom_events": int(self.oom_events),
+            "min_successful_batch_size": int(self.min_successful_batch_size),
+        }
+
+    def reset_stage_timings(self) -> None:
+        """Zero stage clocks (e.g. between isolated microbenchmarks)."""
+        self.load_seconds = 0.0
+        for k in self.stage_timings:
+            self.stage_timings[k] = 0.0
+        for k in self.stage_counts:
+            self.stage_counts[k] = 0
 
     def _resolve_model_path(
         self,
@@ -89,7 +120,11 @@ class CrossEncoderReranker:
 
     def ensure_loaded(self) -> None:
         """Explicitly instantiate and load tokenizer and model onto device."""
+        import time as _time
+
+        t0 = _time.perf_counter()
         self._load_model()
+        self.load_seconds += _time.perf_counter() - t0
 
     @staticmethod
     def _is_existing_local_dir(source: str) -> bool:
@@ -434,6 +469,9 @@ class CrossEncoderReranker:
             queries = [str(pair[0]) for pair in batch]
             passages = [str(pair[1]) for pair in batch]
             try:
+                import time as _time
+
+                t_tok0 = _time.perf_counter()
                 inputs = self.tokenizer(
                     queries,
                     passages,
@@ -442,11 +480,21 @@ class CrossEncoderReranker:
                     max_length=effective_max_length,
                     return_tensors="pt",
                 )
+                self.stage_timings["tokenize_seconds"] += _time.perf_counter() - t_tok0
+                t_tr0 = _time.perf_counter()
                 inputs = self._move_inputs_to_device(inputs)
+                self.stage_timings["transfer_seconds"] += _time.perf_counter() - t_tr0
+                t_fw0 = _time.perf_counter()
                 with torch.inference_mode(), autocast_ctx:
                     outputs = self.model(**inputs)
                 logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
+                # .cpu().tolist() synchronizes CUDA: the forward clock must stop
+                # AFTER it, otherwise GPU time is under-reported and bottleneck
+                # decisions misattribute GPU-idle vs CPU-preprocess.
                 batch_scores = logits.reshape(-1).float().cpu().tolist()
+                self.stage_timings["forward_seconds"] += _time.perf_counter() - t_fw0
+                self.stage_counts["batches"] += 1
+                self.stage_counts["pairs"] += len(batch)
                 if len(batch_scores) != len(batch):
                     raise ValueError(
                         f"model returned {len(batch_scores)} scores for {len(batch)} pairs"

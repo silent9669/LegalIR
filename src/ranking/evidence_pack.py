@@ -86,6 +86,7 @@ class EvidencePackBuilder:
         documents_path: str | Path | None = None,
         chunks_parquet: str | Path | None = None,
         documents_parquet: str | Path | None = None,
+        qinfo_cache_size: int = 10000,
     ):
         if max_chunks_per_doc is not None:
             max_chunks = max_chunks_per_doc
@@ -120,6 +121,39 @@ class EvidencePackBuilder:
             self.chunks_by_doc[did].append(processed)
 
         self.doc_metadata = self._metadata_from_source(doc_metadata)
+
+        # Output-equivalent query-info cache: _extract_query_info depends only
+        # on the raw query text (no labels, no fold state), but _select_chunks
+        # calls it once per (query, candidate) pair — i.e. ~200x per query at
+        # rerank_k=200. Caching by raw query text returns bit-identical dicts
+        # while removing the repeated clean/tokenize/signal work. Bounded FIFO
+        # eviction keeps RAM explicit; stats expose hit rate for profiling.
+        # Label-free, so cross-fold reuse cannot leak qrels.
+        try:
+            _qsize = int(qinfo_cache_size)
+        except (TypeError, ValueError):
+            _qsize = 10000
+        self.qinfo_cache_size = max(0, _qsize)
+        self._qinfo_cache: dict[str, dict[str, Any]] = {}
+        self._qinfo_cache_order: list[str] = []
+        self._qinfo_hits = 0
+        self._qinfo_misses = 0
+
+    def get_qinfo_cache_stats(self) -> dict[str, int]:
+        """Cache counters only (no query text, no labels)."""
+        return {
+            "hits": int(self._qinfo_hits),
+            "misses": int(self._qinfo_misses),
+            "size": int(len(self._qinfo_cache)),
+            "max_size": int(self.qinfo_cache_size),
+        }
+
+    def clear_qinfo_cache(self) -> None:
+        """Empty the query-info cache (e.g. for isolated microbenchmarks)."""
+        self._qinfo_cache.clear()
+        self._qinfo_cache_order.clear()
+        self._qinfo_hits = 0
+        self._qinfo_misses = 0
 
     @staticmethod
     def _validate_limit(value: int, name: str) -> int:
@@ -271,7 +305,18 @@ class EvidencePackBuilder:
         return ""
 
     def _extract_query_info(self, query: str) -> dict[str, Any]:
-        """Extract tokens, TF counter, and legal signals from query."""
+        """Extract tokens, TF counter, and legal signals from query.
+
+        Results are cached by raw query text (label-free, deterministic), so
+        repeated calls for the same query across its ~200 candidates return
+        the identical dict without recomputation. Callers only read the dict.
+        """
+        cache_key = str(query)
+        if self.qinfo_cache_size > 0:
+            cached = self._qinfo_cache.get(cache_key)
+            if cached is not None:
+                self._qinfo_hits += 1
+                return cached
         clean_q = clean_legal_text(query)
         signals = extract_legal_signals(clean_q)
         q_toks = tokenize(clean_q)
@@ -288,7 +333,7 @@ class EvidencePackBuilder:
             for i in range(len(q_toks) - 2):
                 q_ngrams.append(" ".join(q_toks[i : i + 3]))
 
-        return {
+        info = {
             "clean_query": clean_q,
             "tokens": q_toks,
             "tf": q_tf,
@@ -299,6 +344,14 @@ class EvidencePackBuilder:
             "years": year_set,
             "ngrams": q_ngrams,
         }
+        if self.qinfo_cache_size > 0:
+            self._qinfo_misses += 1
+            self._qinfo_cache[cache_key] = info
+            self._qinfo_cache_order.append(cache_key)
+            while len(self._qinfo_cache_order) > self.qinfo_cache_size:
+                oldest = self._qinfo_cache_order.pop(0)
+                self._qinfo_cache.pop(oldest, None)
+        return info
 
     def _score_chunk(
         self,

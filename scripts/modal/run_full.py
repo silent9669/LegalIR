@@ -16,6 +16,9 @@ Flags are forwarded to scripts/modal/run_modal_cli.sh:
                    then dispatch A100. Recommended: A100 bills zero downloads.
     --warm-only     only warm the shared Volume (no A100 dispatch).
     --hf-allow-public-repo  opt-in to push to an existing PUBLIC HF repo
+    --hf-repo OWNER/REPO    explicit HF repo for artifacts (flag > HF_REPO_ID
+                    env > .env > owner default). Fresh accounts must set this;
+                    setting .env alone never forwarded before this fix.
 
 Preflight (fast, local, CPU-only):
     - score-push coherence validator (configs, fusion, miner, ensemble, budget)
@@ -71,6 +74,53 @@ def _check_modal() -> str | None:
     return None
 
 
+def build_forward_args(args) -> list[str]:
+    """CLI flags forwarded to scripts/modal/run_modal_cli.sh (test hook)."""
+    fwd: list[str] = []
+    if getattr(args, "private", False):
+        fwd.append("--private")
+    if getattr(args, "push_config", False):
+        fwd.append("--push-config")
+    if getattr(args, "detach", False):
+        fwd.append("--detach")
+    if getattr(args, "warm", False):
+        fwd.append("--warm")
+    if getattr(args, "warm_only", False):
+        fwd.append("--warm-only")
+    if getattr(args, "hf_allow_public_repo", False):
+        fwd.append("--hf-allow-public-repo")
+    if getattr(args, "allow_default_hf_repo", False):
+        fwd.append("--allow-default-hf-repo")
+    hf_repo = str(getattr(args, "hf_repo", "") or "").strip()
+    if hf_repo:
+        fwd.extend(["--hf-repo", hf_repo])
+    return fwd
+
+
+def resolve_dispatch_hf_repo(explicit: str | None, allow_default: bool = True) -> tuple[str, str]:
+    """Resolve HF repo ID for dispatch (explicit flag > env > .env > default)."""
+    from src.release.hf_repo import resolve_hf_repo_id
+
+    return resolve_hf_repo_id(explicit=explicit, env=os.environ, repo_root=REPO_ROOT,
+                              allow_default=allow_default)
+
+
+def check_hf_repo_ready(repo_id: str, source: str, allow_default: bool) -> str | None:
+    """Fail-closed gate for fresh accounts: default repo is not a GO signal.
+
+    Returns an error message when the resolved repo is the previous owner's
+    default without an explicit opt-out, else None. Test hook (no I/O).
+    """
+    if source == "default" and not allow_default:
+        return (
+            f"HF repo {repo_id} is the previous owner's default (source=default); "
+            "fresh accounts must pass --hf-repo owner/repo (or set HF_REPO_ID env/.env). "
+            "Preflight is BLOCKED, not OK. Opt out explicitly with --allow-default-hf-repo "
+            "only for offline/dev runs."
+        )
+    return None
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--private", action="store_true")
@@ -81,6 +131,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--warm-only", action="store_true",
                     help="Only warm the shared Volume (no A100 dispatch).")
     ap.add_argument("--hf-allow-public-repo", action="store_true")
+    ap.add_argument("--hf-repo", "--hf-repo-id", dest="hf_repo", default=None,
+                    help="Explicit HF repo 'owner/repo' for artifacts. Wins over "
+                         "HF_REPO_ID env and .env. Required: without it (and without "
+                         "--allow-default-hf-repo) preflight FAILS instead of silently "
+                         "targeting the previous owner's repo.")
+    ap.add_argument("--allow-default-hf-repo", action="store_true",
+                    help="Explicit opt-out for offline/dev runs: permit the owner-default "
+                         "HF repo. Never use for a fresh-account production run.")
     ap.add_argument("--dry-run", action="store_true", help="Preflight only, do not dispatch.")
     args = ap.parse_args(argv)
 
@@ -136,23 +194,39 @@ def main(argv: list[str] | None = None) -> int:
         label = "dev"
     print(f"[+] Run label: {label} (used for Volume path only, not gated)")
 
+    from src.release.hf_repo import default_allowed
+
+    allow_default = bool(getattr(args, "allow_default_hf_repo", False) or default_allowed())
+    try:
+        hf_repo_id, hf_source = resolve_dispatch_hf_repo(getattr(args, "hf_repo", None),
+                                                         allow_default=allow_default)
+    except ValueError as exc:
+        print(f"[!] BLOCKED: {exc}", file=sys.stderr)
+        return 2
+    # Repo ID is not a secret; logging it confirms which account receives artifacts.
+    print(f"[*] HF repo: {hf_repo_id} (source={hf_source})")
+    gate_err = check_hf_repo_ready(hf_repo_id, hf_source, allow_default)
+    if gate_err is not None:
+        # Fail-closed BEFORE --dry-run success: a default repo is BLOCKED, not OK.
+        print(f"[!] BLOCKED: {gate_err}", file=sys.stderr)
+        return 2
+    if hf_source == "default":
+        print("[!] Proceeding with the owner-default HF repo via explicit opt-out "
+              "(--allow-default-hf-repo); never use this for a fresh-account production run.",
+              file=sys.stderr)
+    if getattr(args, "hf_repo", None):
+        # Normalize the forwarded flag to the validated ID.
+        args.hf_repo = hf_repo_id
+
     if args.dry_run:
         print("[*] --dry-run: preflight OK, not dispatching.")
         return 0
 
-    fwd = []
-    if args.private:
-        fwd.append("--private")
-    if args.push_config:
-        fwd.append("--push-config")
-    if args.detach:
-        fwd.append("--detach")
-    if args.warm:
-        fwd.append("--warm")
-    if args.warm_only:
-        fwd.append("--warm-only")
-    if args.hf_allow_public_repo:
-        fwd.append("--hf-allow-public-repo")
+    fwd = build_forward_args(args)
+    # Defense in depth: the shell wrapper also resolves flag > env > .env >
+    # default, but exporting the validated ID guarantees the same value even
+    # when the wrapper is invoked standalone.
+    os.environ["HF_REPO_ID"] = hf_repo_id
     cmd = ["bash", "scripts/modal/run_modal_cli.sh", *fwd]
     print(f"[*] Dispatching: {' '.join(cmd)}")
     os.environ.setdefault("PYTHON_BIN", ".venv/bin/python")
